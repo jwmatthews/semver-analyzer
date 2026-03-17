@@ -273,6 +273,8 @@ crates/ts/              TypeScript support
   extract/              OXC .d.ts extraction
   canon/                Type canonicalization
   diff_parser/          Git diff parsing
+  jsx_diff/             JSX render tree differ
+  css_scan/             CSS var/class scanner
   test_analyzer/        Test discovery
   call_graph/           Caller detection
   manifest/             package.json diff
@@ -314,7 +316,11 @@ Output (two sibling directories):
   breaking-changes.yaml
 ```
 
-Each breaking change maps to a Konveyor rule (`builtin.filecontent` or `builtin.json`) and a fix guidance entry with strategy, confidence, before/after, and suggested replacement.
+Each breaking change maps to a Konveyor rule and a fix guidance entry with strategy, confidence, before/after, and suggested replacement.
+
+Two provider modes:
+- `--provider builtin` (default): `builtin.filecontent` regex rules -- works with vanilla Konveyor
+- `--provider frontend`: `frontend.referenced` / `frontend.cssclass` / `frontend.cssvar` AST rules -- requires frontend-analyzer-provider
 
 ---
 
@@ -324,20 +330,22 @@ Each breaking change maps to a Konveyor rule (`builtin.filecontent` or `builtin.
 
 Each breaking change deterministically maps to a fix strategy and confidence level:
 
-| Change Type | Strategy | Confidence | Auto-fixable? |
-|---|---|---|:---:|
-| Renamed | `rename` | Exact | Yes |
-| Signature changed | `update_signature` | High | Yes |
-| Type changed | `update_type` | High | Yes |
-| Removed | `find_alternative` | Low | No (manual) |
-| Visibility reduced | `find_alternative` | Medium | No |
-| Behavioral | `manual_review` | Medium | No (LLM) |
-| CJS&rarr;ESM | `update_import` | High | Yes |
-| Peer dep changed | `update_dependency` | High | Yes |
+| Change Type | Strategy | Confidence | Source |
+|---|---|---|---|
+| Renamed | `rename` | Exact | Pattern |
+| Signature changed | `update_signature` | High | Pattern |
+| Type changed | `update_type` | High | Pattern |
+| Removed | `find_alternative` | Low | Manual |
+| DOM structure | `manual_review` | High | JSX differ |
+| Accessibility | `manual_review` | High | JSX differ |
+| CSS class | `manual_review` | High | JSX/CSS scan |
+| CSS variable | `manual_review` | High | CSS scan |
+| Behavioral (other) | `manual_review` | Medium | LLM |
+| CJS&rarr;ESM | `update_import` | High | Pattern |
 
 <div class="callout">
 
-Rename changes are **Exact confidence** -- safe for mechanical find-and-replace. Behavioral changes are flagged as `ai-generated` and require manual review.
+Rename changes are **Exact confidence** -- safe for mechanical find-and-replace. DOM/CSS/a11y changes are detected deterministically by the JSX differ and CSS scanner (High confidence). Generic behavioral changes rely on LLM (Medium confidence).
 
 </div>
 
@@ -354,10 +362,12 @@ Rename changes are **Exact confidence** -- safe for mechanical find-and-replace.
 (auto-generated from report)
 
 - Rules generated **automatically** from any analysis
-- Uses `builtin.filecontent` (regex) -- no custom provider needed
-- Fix guidance in separate YAML with strategy + confidence
-- Works for **any** library version diff, not just PatternFly
-- Trade-off: regex patterns may have false positives
+- `--provider builtin`: regex rules (vanilla Konveyor)
+- `--provider frontend`: `frontend.referenced` / `cssclass` / `cssvar` AST rules
+- **JSX differ**: deterministic DOM, a11y, CSS class, data attribute detection
+- **CSS scanner**: CSS variable and class prefix rename detection
+- Category-aware fix guidance (DOM, a11y, CSS get targeted advice)
+- Works for **any** library, not just PatternFly
 
 </div>
 <div>
@@ -377,8 +387,50 @@ Rename changes are **Exact confidence** -- safe for mechanical find-and-replace.
 
 <div class="callout">
 
-The auto-generated rules are a **fast path** -- generate rules for any library in seconds. The hand-crafted provider is the **deep path** -- precise AST analysis with direct fix application. Both feed into the Konveyor ecosystem.
+With `--provider frontend`, the auto-generated rules use the **same condition types** as the hand-crafted rules. The JSX differ and CSS scanner now close most of the "invisible gap" that previously required manual rule authoring.
 
+</div>
+
+---
+
+<!-- _class: compact -->
+
+# JSX Differ & CSS Scanner
+
+Deterministic detection of runtime/visual breaking changes -- no LLM needed.
+
+<div class="columns">
+<div>
+
+### JSX Differ (`jsx_diff`)
+
+Parses both versions of a component's JSX render tree with OXC and diffs:
+
+| What | Category | Example |
+|---|---|---|
+| Element tags | `dom_structure` | `<header>` &rarr; `<div>` |
+| Wrapper elements | `dom_structure` | Extra `<div>` added |
+| ARIA attributes | `accessibility` | `aria-labelledby` removed |
+| `role` attributes | `accessibility` | `separator` &rarr; `presentation` |
+| CSS classes | `css_class` | `pf-v5-c-*` &rarr; `pf-v6-c-*` |
+| `data-*` attributes | `data_attribute` | OUIA type changed |
+
+</div>
+<div>
+
+### CSS Scanner (`css_scan`)
+
+Regex-based scan of function bodies for CSS custom property and class prefix changes:
+
+| What | Category |
+|---|---|
+| `--pf-v5-global--*` removed | `css_variable` |
+| `--pf-v6-global--*` added | `css_variable` |
+| `pf-v5-c-*` class prefix removed | `css_class` |
+
+Both run in BU Phase 1 with **0.90 confidence** and produce categorized `BehavioralBreak` entries that flow through the full pipeline.
+
+</div>
 </div>
 
 ---
@@ -621,12 +673,13 @@ These break snapshot tests, custom CSS overrides, and E2E selectors -- discovere
 - **Additional languages** -- Rust, Python, Java
 - **Patch oracles** -- executable specs to *prove* behavioral diffs
 - **Config/schema** -- OpenAPI, protobuf, GraphQL
-- **Visual regression bridge** -- DOM/CSS findings &rarr; snapshot tooling
+- ~~**Visual regression bridge** -- DOM/CSS findings &rarr; snapshot tooling~~ **Partially done** (JSX differ + CSS scanner)
 
 ### Open Questions
 - Does `api-extractor` `.api.json` replace `.d.ts` parsing?
 - What LLM confidence threshold for behavioral breaks?
 - How practical are executable tests for behavioral proof?
+- End-to-end validation: run `--konveyor` against PatternFly and diff against hand-crafted rules
 
 </div>
 </div>

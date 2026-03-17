@@ -7,7 +7,7 @@
 use crate::types::{
     Parameter, Signature, StructuralChange, StructuralChangeType, Symbol, SymbolKind,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::helpers::{
     change, kind_label, param_summary, symbol_summary, type_param_summary, visibility_rank,
@@ -262,6 +262,11 @@ fn diff_parameters(
                 ),
                 true,
             ));
+
+            // Also emit per-value union literal changes
+            if let (Some(old_ta), Some(new_ta)) = (&old_p.type_annotation, &new_p.type_annotation) {
+                diff_union_literals(sym, &old_p.name, old_ta, new_ta, changes);
+            }
         }
 
         // Optionality change
@@ -437,6 +442,9 @@ fn diff_return_type(
             ),
             true,
         ));
+
+        // Also emit per-value union literal changes if both types are string literal unions
+        diff_union_literals(sym, &sym.name, old_ret, new_ret, changes);
     }
 }
 
@@ -714,6 +722,119 @@ pub(super) fn diff_members(old: &Symbol, new: &Symbol, changes: &mut Vec<Structu
                 diff_symbol(old_member, new_member, changes);
             }
         }
+    }
+}
+
+// ─── Union literal value diffing ─────────────────────────────────────────
+
+/// Parse a TypeScript string literal union type into its individual members.
+///
+/// Handles: `'primary' | 'secondary' | 'tertiary'` → `{"primary", "secondary", "tertiary"}`
+///
+/// Also handles mixed unions like `'primary' | ButtonVariant | undefined` by
+/// extracting only the string literal members (quoted with single or double quotes).
+///
+/// This is generic — works for any TypeScript union of string literals.
+fn parse_union_literals(type_str: &str) -> Option<BTreeSet<String>> {
+    // Quick check: must contain at least one string literal (quoted value)
+    if !type_str.contains('\'') && !type_str.contains('"') {
+        return None;
+    }
+
+    // Must look like a union (contains |)
+    if !type_str.contains('|') {
+        // Single literal — still valid but not a union to diff
+        return None;
+    }
+
+    let mut literals = BTreeSet::new();
+
+    for part in type_str.split('|') {
+        let trimmed = part.trim();
+        // Extract string literal values (single or double quoted)
+        if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        {
+            let value = &trimmed[1..trimmed.len() - 1];
+            if !value.is_empty() {
+                literals.insert(value.to_string());
+            }
+        }
+        // Skip non-literal members (type references, undefined, null, etc.)
+    }
+
+    // Only return if we found at least 2 literal members
+    // (a single literal in a union with types isn't a value-level concern)
+    if literals.len() >= 2 {
+        Some(literals)
+    } else {
+        None
+    }
+}
+
+/// Emit per-member union literal value changes.
+///
+/// When a property's type changes from `'a' | 'b' | 'c'` to `'a' | 'd'`,
+/// emits:
+///   - `UnionMemberRemoved` for `'b'` and `'c'`
+///   - `UnionMemberAdded` for `'d'`
+///
+/// The parent symbol provides context (e.g., `Button.variant`).
+fn diff_union_literals(
+    sym: &Symbol,
+    prop_name: &str,
+    old_type: &str,
+    new_type: &str,
+    changes: &mut Vec<StructuralChange>,
+) {
+    let old_literals = match parse_union_literals(old_type) {
+        Some(l) => l,
+        None => return,
+    };
+    let new_literals = match parse_union_literals(new_type) {
+        Some(l) => l,
+        None => return,
+    };
+
+    // Skip if identical
+    if old_literals == new_literals {
+        return;
+    }
+
+    // Removed values (breaking)
+    for removed in old_literals.difference(&new_literals) {
+        changes.push(StructuralChange {
+            symbol: format!("{}.{}", sym.name, prop_name),
+            qualified_name: format!("{}.{}", sym.qualified_name, prop_name),
+            kind: "property_value".to_string(),
+            change_type: StructuralChangeType::UnionMemberRemoved,
+            before: Some(format!("'{}'", removed)),
+            after: None,
+            description: format!(
+                "Value '{}' was removed from the `{}` prop on `{}`",
+                removed, prop_name, sym.name
+            ),
+            is_breaking: true,
+            impact: None,
+        });
+    }
+
+    // Added values (non-breaking, but useful for migration)
+    for added in new_literals.difference(&old_literals) {
+        changes.push(StructuralChange {
+            symbol: format!("{}.{}", sym.name, prop_name),
+            qualified_name: format!("{}.{}", sym.qualified_name, prop_name),
+            kind: "property_value".to_string(),
+            change_type: StructuralChangeType::UnionMemberAdded,
+            before: None,
+            after: Some(format!("'{}'", added)),
+            description: format!(
+                "Value '{}' was added to the `{}` prop on `{}`",
+                added, prop_name, sym.name
+            ),
+            is_breaking: false,
+            impact: None,
+        });
     }
 }
 

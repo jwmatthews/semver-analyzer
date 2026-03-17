@@ -2,6 +2,21 @@ mod cli;
 mod konveyor;
 mod orchestrator;
 
+/// Priority for fix strategy selection when multiple pre-consolidation strategies
+/// map to the same consolidated rule.  Higher = more actionable.
+fn strategy_priority(strategy: &str) -> u8 {
+    match strategy {
+        "Rename" => 5,
+        "RemoveProp" => 4,
+        "CssVariablePrefix" => 4,
+        "ImportPathChange" => 3,
+        "PropValueChange" => 2,
+        "PropTypeChange" => 2,
+        "LlmAssisted" => 1,
+        _ => 0, // Manual
+    }
+}
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::Path;
@@ -64,13 +79,14 @@ async fn main() -> Result<()> {
             to,
             output_dir,
             file_pattern,
-            provider,
             ruleset_name,
             no_llm,
             llm_command,
             max_llm_cost,
             build_command,
             llm_all_files,
+            no_consolidate,
+            rename_patterns,
         } => {
             cmd_konveyor(
                 from_report.as_deref(),
@@ -79,13 +95,14 @@ async fn main() -> Result<()> {
                 to.as_deref(),
                 &output_dir,
                 &file_pattern,
-                &provider,
                 &ruleset_name,
                 no_llm,
                 llm_command.as_deref(),
                 max_llm_cost,
                 build_command.as_deref(),
                 llm_all_files,
+                no_consolidate,
+                rename_patterns.as_deref(),
             )
             .await?;
         }
@@ -247,25 +264,21 @@ async fn cmd_konveyor(
     to_ref: Option<&str>,
     output_dir: &Path,
     file_pattern: &str,
-    provider_str: &str,
     ruleset_name: &str,
     no_llm: bool,
     llm_command: Option<&str>,
     _max_llm_cost: f64,
     build_command: Option<&str>,
     llm_all_files: bool,
+    no_consolidate: bool,
+    rename_patterns_path: Option<&Path>,
 ) -> Result<()> {
-    let provider = match provider_str {
-        "frontend" => konveyor::RuleProvider::Frontend,
-        "builtin" => konveyor::RuleProvider::Builtin,
-        other => {
-            eprintln!(
-                "Warning: unknown provider '{}', falling back to 'builtin'",
-                other
-            );
-            konveyor::RuleProvider::Builtin
-        }
+    let rename_patterns = if let Some(path) = rename_patterns_path {
+        konveyor::RenamePatterns::load(path)?
+    } else {
+        konveyor::RenamePatterns::empty()
     };
+
     let report = if let Some(report_path) = from_report {
         // Mode 1: Load pre-existing report
         eprintln!("Loading report from {}", report_path.display());
@@ -306,8 +319,65 @@ async fn cmd_konveyor(
         )
     };
 
-    // Generate rules and fix guidance
-    let rules = konveyor::generate_rules(&report, file_pattern, provider);
+    // Build package name cache from package.json files
+    let pkg_cache = konveyor::build_package_name_cache(&report);
+
+    // Analyze token member objects for redundancy suppression and member renames
+    let (covered_symbols, member_renames) =
+        konveyor::analyze_token_members(&report, &rename_patterns);
+    if !covered_symbols.is_empty() {
+        eprintln!(
+            "Found {} token member keys covered by parent objects, {} member renames",
+            covered_symbols.len(),
+            member_renames.len()
+        );
+    }
+
+    // Generate rules
+    let raw_rules = konveyor::generate_rules(&report, file_pattern, &pkg_cache, &rename_patterns);
+    let raw_count = raw_rules.len();
+
+    // Generate fix strategies keyed by pre-consolidation rule IDs
+    let pre_strategies =
+        konveyor::generate_fix_strategies(&report, &raw_rules, &rename_patterns, &member_renames);
+
+    // Suppress redundant individual token removal rules
+    let filtered_rules = konveyor::suppress_redundant_token_rules(raw_rules, &covered_symbols);
+
+    let (rules, id_mapping) = if no_consolidate {
+        // No consolidation: identity mapping
+        let mapping: std::collections::HashMap<String, String> = filtered_rules
+            .iter()
+            .map(|r| (r.rule_id.clone(), r.rule_id.clone()))
+            .collect();
+        (filtered_rules, mapping)
+    } else {
+        let (consolidated, mapping) = konveyor::consolidate_rules(filtered_rules);
+        eprintln!(
+            "Consolidated {} rules → {} rules",
+            raw_count,
+            consolidated.len()
+        );
+        (consolidated, mapping)
+    };
+
+    // Re-key strategies using the consolidation mapping so they match the
+    // post-consolidation rule IDs that appear in kantra output.  When multiple
+    // pre-consolidation rules map to the same consolidated rule, pick the most
+    // actionable strategy (Rename > RemoveProp > CssVariablePrefix > others).
+    let mut strategies: std::collections::HashMap<String, konveyor::FixStrategyEntry> =
+        std::collections::HashMap::new();
+    for (old_id, entry) in pre_strategies {
+        if let Some(new_id) = id_mapping.get(&old_id) {
+            let dominated = strategies.get(new_id).map_or(true, |existing| {
+                strategy_priority(&entry.strategy) > strategy_priority(&existing.strategy)
+            });
+            if dominated {
+                strategies.insert(new_id.clone(), entry);
+            }
+        }
+    }
+
     let fix_guidance = konveyor::generate_fix_guidance(&report, &rules, file_pattern);
     let rule_count = rules.len();
 
@@ -317,6 +387,9 @@ async fn cmd_konveyor(
     // Write fix guidance to sibling directory
     let fix_dir = konveyor::write_fix_guidance_dir(output_dir, &fix_guidance)?;
 
+    // Write fix strategies
+    konveyor::write_fix_strategies(&fix_dir, &strategies)?;
+
     eprintln!(
         "Generated {} Konveyor rules in {}",
         rule_count,
@@ -324,10 +397,8 @@ async fn cmd_konveyor(
     );
     eprintln!("  Ruleset:  {}/ruleset.yaml", output_dir.display());
     eprintln!("  Rules:    {}/breaking-changes.yaml", output_dir.display());
-    eprintln!(
-        "  Fixes:    {}/fix-guidance.yaml",
-        fix_dir.display()
-    );
+    eprintln!("  Fixes:    {}/fix-guidance.yaml", fix_dir.display());
+    eprintln!("  Strategies: {}/fix-strategies.json ({} entries)", fix_dir.display(), strategies.len());
     eprintln!(
         "  Summary:  {} auto-fixable, {} need review, {} manual only",
         fix_guidance.summary.auto_fixable,

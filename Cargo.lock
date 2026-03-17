@@ -886,6 +886,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "regex",
  "semver-analyzer-core",
  "semver-analyzer-llm",
  "semver-analyzer-ts",

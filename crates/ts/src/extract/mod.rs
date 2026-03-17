@@ -47,7 +47,11 @@ impl OxcExtractor {
     /// **Phase 2**: Extract symbols from each file using the merged global import
     /// map as a fallback. Per-file imports take priority over the global map.
     pub fn extract_from_dir(&self, dir: &Path) -> Result<ApiSurface> {
-        let files = find_dts_files(dir)?;
+        let all_files = find_dts_files(dir)?;
+
+        // Phase -1: Filter to only files reachable from package entry points (index.d.ts).
+        // This excludes internal implementation files that aren't re-exported.
+        let files = filter_to_reachable(&all_files, dir);
 
         // Phase 0: Scan @types/* for global namespace declarations
         let mut global_imports = scan_types_packages(dir);
@@ -197,6 +201,168 @@ fn find_dts_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
     files.sort(); // Deterministic ordering
     Ok(files)
+}
+
+/// Filter files to only those reachable from package entry points (`index.d.ts`).
+///
+/// Traces the `export * from './path'` and `export { X } from './path'` re-export
+/// graph starting from each `index.d.ts` file. Only files reachable through this
+/// graph are included. This excludes internal implementation files that have `.d.ts`
+/// declarations but are not part of the public API.
+///
+/// If no `index.d.ts` files are found, returns all files unchanged (fallback for
+/// packages without barrel exports).
+fn filter_to_reachable(files: &[PathBuf], _base_dir: &Path) -> Vec<PathBuf> {
+    use std::collections::{HashSet, VecDeque};
+
+    // Find all index.d.ts entry points
+    let index_files: Vec<&PathBuf> = files
+        .iter()
+        .filter(|f| f.file_name().map(|n| n == "index.d.ts").unwrap_or(false))
+        .collect();
+
+    if index_files.is_empty() {
+        return files.to_vec(); // No entry points found — keep everything
+    }
+
+    // Build a lookup set for fast path resolution
+    let file_set: HashSet<PathBuf> = files.iter().cloned().collect();
+
+    // BFS: start from each index.d.ts and follow re-exports
+    let mut reachable: HashSet<PathBuf> = HashSet::new();
+    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+
+    for idx in &index_files {
+        let canonical = idx.to_path_buf();
+        reachable.insert(canonical.clone());
+        queue.push_back(canonical);
+    }
+
+    while let Some(file) = queue.pop_front() {
+        let source = match std::fs::read_to_string(&file) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Parse export statements to find re-exported paths
+        let parent_dir = file.parent().unwrap_or(std::path::Path::new("."));
+        for line in source.lines() {
+            let trimmed = line.trim();
+            // Match: export * from './path';
+            //        export { X, Y } from './path';
+            //        export type { X } from './path';
+            if let Some(from_path) = extract_export_from_path(trimmed) {
+                // Resolve the relative path
+                let resolved = resolve_dts_path(parent_dir, &from_path, &file_set);
+                if let Some(resolved) = resolved {
+                    if reachable.insert(resolved.clone()) {
+                        queue.push_back(resolved);
+                    }
+                }
+            }
+        }
+    }
+
+    let original_count = files.len();
+    let filtered: Vec<PathBuf> = files
+        .iter()
+        .filter(|f| reachable.contains(*f))
+        .cloned()
+        .collect();
+
+    let excluded = original_count - filtered.len();
+    if excluded > 0 {
+        eprintln!(
+            "  Entry-point filter: {} of {} .d.ts files are reachable from index ({} internal files excluded)",
+            filtered.len(),
+            original_count,
+            excluded
+        );
+    }
+
+    filtered
+}
+
+/// Extract the `from` path from an export statement.
+///
+/// Matches patterns like:
+///   `export * from './components';`
+///   `export { Button, ButtonProps } from './Button';`
+///   `export type { CardProps } from './Card';`
+///
+/// Returns the path string without quotes (e.g., `./components`).
+fn extract_export_from_path(line: &str) -> Option<String> {
+    if !line.starts_with("export") {
+        return None;
+    }
+
+    // Find "from" keyword followed by a quoted string
+    let from_idx = line.find(" from ")?;
+    let after_from = &line[from_idx + 6..];
+
+    // Extract the quoted path
+    let quote_char = after_from.chars().next()?;
+    if quote_char != '\'' && quote_char != '"' {
+        return None;
+    }
+
+    let rest = &after_from[1..];
+    let end_idx = rest.find(quote_char)?;
+    let path = &rest[..end_idx];
+
+    // Only follow relative paths (not external packages)
+    if path.starts_with('.') {
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
+/// Resolve a relative path from an export statement to an actual `.d.ts` file.
+///
+/// Tries these resolution strategies (TypeScript module resolution):
+///   1. `./path.d.ts` (exact file)
+///   2. `./path/index.d.ts` (directory with index)
+///   3. `./path.d.ts` with `.js` → `.d.ts` extension swap
+fn resolve_dts_path(
+    parent_dir: &Path,
+    from_path: &str,
+    file_set: &std::collections::HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    let base = parent_dir.join(from_path);
+
+    // Try: ./path.d.ts
+    let with_dts = base.with_extension("d.ts");
+    if file_set.contains(&with_dts) {
+        return Some(with_dts);
+    }
+
+    // Try: ./path/index.d.ts
+    let with_index = base.join("index.d.ts");
+    if file_set.contains(&with_index) {
+        return Some(with_index);
+    }
+
+    // Try: ./path (if it already has .d.ts extension somehow)
+    if file_set.contains(&base) {
+        return Some(base);
+    }
+
+    // Try: strip .js extension and add .d.ts
+    // (TypeScript emits `export * from './Button.js'` in some configs)
+    if from_path.ends_with(".js") {
+        let without_js = &from_path[..from_path.len() - 3];
+        let with_dts = parent_dir.join(without_js).with_extension("d.ts");
+        if file_set.contains(&with_dts) {
+            return Some(with_dts);
+        }
+        let with_index = parent_dir.join(without_js).join("index.d.ts");
+        if file_set.contains(&with_index) {
+            return Some(with_index);
+        }
+    }
+
+    None
 }
 
 /// Build output directory priority. Lower index = higher priority.

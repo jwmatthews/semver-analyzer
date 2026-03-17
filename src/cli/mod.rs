@@ -131,13 +131,6 @@ pub enum Command {
         #[arg(long, default_value = "*.{ts,tsx,js,jsx,mjs,cjs}")]
         file_pattern: String,
 
-        /// Konveyor provider to target for rule conditions.
-        /// "builtin" uses builtin.filecontent (regex) — works with vanilla Konveyor.
-        /// "frontend" uses frontend.referenced (AST-level) — requires the
-        /// frontend-analyzer-provider gRPC server.
-        #[arg(long, default_value = "builtin")]
-        provider: String,
-
         /// Name for the generated ruleset.
         #[arg(long, default_value = "semver-breaking-changes")]
         ruleset_name: String,
@@ -162,6 +155,16 @@ pub enum Command {
         /// Send ALL files with changed exported functions to the LLM.
         #[arg(long)]
         llm_all_files: bool,
+
+        /// Disable rule consolidation (keep one rule per declaration change).
+        #[arg(long)]
+        no_consolidate: bool,
+
+        /// Path to a YAML file with regex-based rename patterns.
+        /// Used to map removed symbols to their replacements via regex
+        /// substitution (e.g., PaddingTop → PaddingBlockStart).
+        #[arg(long)]
+        rename_patterns: Option<PathBuf>,
     },
 
     /// Start as an MCP server (stdio transport).

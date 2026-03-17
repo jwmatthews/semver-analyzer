@@ -29,5 +29,8 @@ anyhow = "1"
 # YAML output (for Konveyor rules)
 serde_yaml = "0.9"
 
+# Regex for CSS pattern extraction in konveyor rules
+regex = "1"
+
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }

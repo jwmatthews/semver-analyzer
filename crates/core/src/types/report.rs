@@ -306,6 +306,10 @@ pub enum StructuralChangeType {
     PropertyRemoved,
     PropertyRenamed,
 
+    // Union literal value changes (e.g., 'primary' | 'secondary' → 'primary' | 'danger')
+    UnionMemberRemoved,
+    UnionMemberAdded,
+
     // Special
     ThisParameterTypeChanged,
 }
@@ -350,7 +354,10 @@ impl StructuralChangeType {
             | Self::EnumMemberAdded
             | Self::EnumMemberValueChanged => ApiChangeType::SignatureChanged,
 
-            Self::ParameterTypeChanged | Self::ReturnTypeChanged => ApiChangeType::TypeChanged,
+            Self::ParameterTypeChanged
+            | Self::ReturnTypeChanged
+            | Self::UnionMemberRemoved
+            | Self::UnionMemberAdded => ApiChangeType::TypeChanged,
 
             Self::VisibilityReduced | Self::VisibilityIncreased => ApiChangeType::VisibilityChanged,
 

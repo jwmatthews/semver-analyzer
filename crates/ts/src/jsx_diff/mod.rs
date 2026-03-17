@@ -198,25 +198,29 @@ fn visit_jsx_element<'a>(el: &'a JSXElement<'a>, source: &str, info: &mut JsxInf
     for attr_item in &el.opening_element.attributes {
         if let JSXAttributeItem::Attribute(attr) = attr_item {
             let attr_name = jsx_attr_name(&attr.name);
-            let attr_value = attr
-                .value
-                .as_ref()
-                .map(|v| jsx_attr_value(v, source))
-                .unwrap_or_default();
 
-            if attr_name.starts_with("aria-") {
-                info.aria_attrs
-                    .insert((tag_name.clone(), attr_name), attr_value);
-            } else if attr_name == "role" {
-                info.role_attrs.insert(tag_name.clone(), attr_value);
-            } else if attr_name == "className" || attr_name == "class" {
-                // Extract individual CSS class names from the value
-                for class in extract_css_classes(&attr_value) {
-                    info.css_classes.insert(class);
+            if attr_name == "className" || attr_name == "class" {
+                // Extract CSS classes — use AST-aware extraction to avoid
+                // false positives from JS expressions like `styles.modifiers.xxx`
+                if let Some(value) = &attr.value {
+                    extract_classes_from_jsx_value(value, info);
                 }
-            } else if attr_name.starts_with("data-") {
-                info.data_attrs
-                    .insert((tag_name.clone(), attr_name), attr_value);
+            } else {
+                let attr_value = attr
+                    .value
+                    .as_ref()
+                    .map(|v| jsx_attr_value(v, source))
+                    .unwrap_or_default();
+
+                if attr_name.starts_with("aria-") {
+                    info.aria_attrs
+                        .insert((tag_name.clone(), attr_name), attr_value);
+                } else if attr_name == "role" {
+                    info.role_attrs.insert(tag_name.clone(), attr_value);
+                } else if attr_name.starts_with("data-") {
+                    info.data_attrs
+                        .insert((tag_name.clone(), attr_name), attr_value);
+                }
             }
         }
     }
@@ -224,6 +228,95 @@ fn visit_jsx_element<'a>(el: &'a JSXElement<'a>, source: &str, info: &mut JsxInf
     // Recurse into children
     for child in &el.children {
         walk_jsx_child(child, source, info);
+    }
+}
+
+/// Extract CSS class names from a JSX attribute value by walking the AST.
+///
+/// For string literals (`className="pf-c-button pf-m-primary"`), extracts
+/// class names directly from the string value.
+///
+/// For expression containers (`className={css(styles.button, ...)}`), walks
+/// into the expression to find only string literals and template literal
+/// quasi-elements — skipping JS identifiers, property accesses, and operators
+/// that are NOT actual CSS class names.
+fn extract_classes_from_jsx_value<'a>(value: &'a JSXAttributeValue<'a>, info: &mut JsxInfo) {
+    match value {
+        JSXAttributeValue::StringLiteral(s) => {
+            // Direct string: className="pf-c-button pf-m-primary"
+            for class in extract_css_classes(&s.value) {
+                info.css_classes.insert(class);
+            }
+        }
+        JSXAttributeValue::ExpressionContainer(container) => {
+            // Expression: className={expr} — walk the AST for string literals only
+            if let Some(expr) = container.expression.as_expression() {
+                extract_classes_from_expr(expr, info);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively extract CSS class name strings from a JS expression.
+///
+/// Only extracts from:
+/// - String literals: `"pf-c-button"`
+/// - Template literal quasis: `` `pf-c-button ${dynamic}` ``
+/// - Call expression arguments: `css("pf-class", ...)`, `classNames("pf-class")`
+/// - Conditional branches: `isActive ? "pf-m-active" : ""`
+/// - Logical right-hand: `isBlock && "pf-m-block"`
+///
+/// Skips:
+/// - Identifiers (`className`, `cardWithActions`)
+/// - Member expressions (`styles.modifiers.plain`)
+/// - Computed access (`styles.modifiers[variant]`)
+fn extract_classes_from_expr<'a>(expr: &'a Expression<'a>, info: &mut JsxInfo) {
+    match expr {
+        Expression::StringLiteral(s) => {
+            for class in extract_css_classes(&s.value) {
+                info.css_classes.insert(class);
+            }
+        }
+        Expression::TemplateLiteral(tpl) => {
+            // Extract from the static text parts (quasis)
+            for quasi in &tpl.quasis {
+                let raw = quasi.value.raw.as_str();
+                for class in extract_css_classes(raw) {
+                    info.css_classes.insert(class);
+                }
+            }
+        }
+        Expression::CallExpression(call) => {
+            // Recurse into arguments: css("pf-class", cond && "other")
+            for arg in &call.arguments {
+                if let Some(expr) = arg.as_expression() {
+                    extract_classes_from_expr(expr, info);
+                }
+            }
+        }
+        Expression::ConditionalExpression(cond) => {
+            extract_classes_from_expr(&cond.consequent, info);
+            extract_classes_from_expr(&cond.alternate, info);
+        }
+        Expression::LogicalExpression(logical) => {
+            // `isBlock && "pf-m-block"` — the class is on the right
+            extract_classes_from_expr(&logical.right, info);
+        }
+        Expression::ParenthesizedExpression(paren) => {
+            extract_classes_from_expr(&paren.expression, info);
+        }
+        Expression::ArrayExpression(arr) => {
+            // classNames(["pf-class", cond && "other"])
+            for elem in &arr.elements {
+                if let Some(expr) = elem.as_expression() {
+                    extract_classes_from_expr(expr, info);
+                }
+            }
+        }
+        // Skip: identifiers, member expressions, computed access, etc.
+        // These are JS variable references (styles.modifiers.xxx), not CSS classes.
+        _ => {}
     }
 }
 
@@ -538,24 +631,72 @@ fn jsx_attr_value(value: &JSXAttributeValue<'_>, source: &str) -> String {
     }
 }
 
-/// Extract individual CSS class names from a className attribute value.
+/// Extract individual CSS class names from a string value.
 ///
-/// Handles:
-/// - String literals: `"pf-v5-c-button pf-m-primary"` → `["pf-v5-c-button", "pf-m-primary"]`
-/// - Template literals and expressions are kept as-is if they look like class names
+/// This is called only with actual string literal content (not JS expressions),
+/// so it just needs to split on whitespace and filter out empty tokens and
+/// any remaining template expression artifacts.
 fn extract_css_classes(value: &str) -> Vec<String> {
     value
         .split_whitespace()
-        .filter(|s| {
-            // Keep strings that look like CSS class names
-            !s.is_empty()
-                && !s.starts_with('{')
-                && !s.starts_with('$')
-                && !s.contains('(')
-                && !s.contains('?')
-        })
+        .filter(|s| is_css_class_name(s))
         .map(|s| s.to_string())
         .collect()
+}
+
+/// Check if a token looks like a valid CSS class name.
+///
+/// Accepts: `pf-v5-c-button`, `pf-m-primary`, `my-component`, `active`
+/// Rejects: JS identifiers (`className`, `cardWithActions`), operators (`&&`),
+///          property access (`styles.modifiers.plain`), syntax (`)`, `,`, `]`)
+fn is_css_class_name(s: &str) -> bool {
+    if s.is_empty() || s.len() < 2 {
+        return false;
+    }
+
+    // Reject tokens containing JS syntax characters
+    if s.contains('.')
+        || s.contains('(')
+        || s.contains(')')
+        || s.contains('[')
+        || s.contains(']')
+        || s.contains('{')
+        || s.contains('}')
+        || s.contains('?')
+        || s.contains('!')
+        || s.contains('=')
+        || s.contains('&')
+        || s.contains('|')
+        || s.contains(';')
+        || s.contains('`')
+        || s.contains('$')
+        || s.contains(',')
+        || s.contains('"')
+        || s.contains('\'')
+    {
+        return false;
+    }
+
+    // CSS class names are kebab-case or start with a known prefix
+    // Accept: pf-v5-c-button, pf-m-primary, my-component, btn-lg
+    // Also accept: single words that are lowercase (common class names)
+    let first = s.chars().next().unwrap();
+
+    // Must start with a letter or hyphen (CSS class convention)
+    if !first.is_ascii_alphabetic() && first != '-' && first != '_' {
+        return false;
+    }
+
+    // Reject camelCase identifiers (JS variables) — CSS classes are kebab-case
+    // Exception: single-word all-lowercase is fine (e.g., "active", "hidden")
+    if s.contains('-') || s.contains('_') {
+        // Has separators — looks like a CSS class
+        true
+    } else {
+        // No separators — only accept if all lowercase (not camelCase like "cardWithActions")
+        s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    }
 }
 
 /// Returns true if the body contains JSX (quick check before full parsing).
@@ -753,5 +894,98 @@ mod tests {
         assert!(categories.contains(&BehavioralCategory::DomStructure));
         assert!(categories.contains(&BehavioralCategory::CssClass));
         assert!(categories.contains(&BehavioralCategory::Accessibility));
+    }
+
+    #[test]
+    fn test_expression_classname_skips_js_identifiers() {
+        // className={css(styles.button, isBlock && styles.modifiers.block)}
+        // Should NOT produce "styles.modifiers.block" or "isBlock" as CSS classes
+        let old = r#"{ return <div className={css(styles.button, isBlock && styles.modifiers.block)}>btn</div>; }"#;
+        let new = r#"{ return <div className={css(styles.button, isBlock && styles.modifiers.fill)}>btn</div>; }"#;
+        let changes = diff_jsx_bodies(old, new, "Button", &PathBuf::from("test.tsx"));
+
+        let css_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == BehavioralCategory::CssClass)
+            .collect();
+        // Should be empty — no actual string literal CSS classes changed
+        assert!(
+            css_changes.is_empty(),
+            "Expression-based classNames should not produce CSS class changes, got: {:?}",
+            css_changes
+                .iter()
+                .map(|c| &c.description)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_expression_classname_extracts_string_literals() {
+        // className={css("pf-v5-c-button", isActive && "pf-m-active")}
+        // Should extract "pf-v5-c-button" and "pf-m-active" as CSS classes
+        let old = r#"{ return <div className={css("pf-v5-c-button", isActive && "pf-m-active")}>btn</div>; }"#;
+        let new = r#"{ return <div className={css("pf-v6-c-button", isActive && "pf-m-active")}>btn</div>; }"#;
+        let changes = diff_jsx_bodies(old, new, "Button", &PathBuf::from("test.tsx"));
+
+        let css_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == BehavioralCategory::CssClass)
+            .collect();
+        assert!(
+            !css_changes.is_empty(),
+            "Should detect CSS class changes in string literals within expressions"
+        );
+        assert!(
+            css_changes
+                .iter()
+                .any(|c| c.description.contains("pf-v5-c-button")
+                    && c.description.contains("removed"))
+        );
+        assert!(css_changes
+            .iter()
+            .any(|c| c.description.contains("pf-v6-c-button") && c.description.contains("added")));
+    }
+
+    #[test]
+    fn test_template_literal_classname() {
+        // className={`pf-v5-c-button ${isActive ? 'pf-m-active' : ''}`}
+        let old = r#"{ return <div className={`pf-v5-c-button ${cond}`}>btn</div>; }"#;
+        let new = r#"{ return <div className={`pf-v6-c-button ${cond}`}>btn</div>; }"#;
+        let changes = diff_jsx_bodies(old, new, "Button", &PathBuf::from("test.tsx"));
+
+        let css_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == BehavioralCategory::CssClass)
+            .collect();
+        assert!(
+            !css_changes.is_empty(),
+            "Should detect CSS class changes in template literals"
+        );
+        assert!(css_changes
+            .iter()
+            .any(|c| c.description.contains("pf-v5-c-button")));
+        assert!(css_changes
+            .iter()
+            .any(|c| c.description.contains("pf-v6-c-button")));
+    }
+
+    #[test]
+    fn test_is_css_class_name() {
+        // Valid CSS class names
+        assert!(is_css_class_name("pf-v5-c-button"));
+        assert!(is_css_class_name("pf-m-primary"));
+        assert!(is_css_class_name("my-component"));
+        assert!(is_css_class_name("active")); // single lowercase word OK
+
+        // Invalid — JS identifiers and syntax
+        assert!(!is_css_class_name("styles.modifiers.plain"));
+        assert!(!is_css_class_name("cardWithActions")); // camelCase
+        assert!(!is_css_class_name("className")); // camelCase
+        assert!(!is_css_class_name("isBlock")); // camelCase
+        assert!(!is_css_class_name("styles.modifiers.plain)"));
+        assert!(!is_css_class_name("&&"));
+        assert!(!is_css_class_name("("));
+        assert!(!is_css_class_name(""));
+        assert!(!is_css_class_name("x")); // too short
     }
 }
