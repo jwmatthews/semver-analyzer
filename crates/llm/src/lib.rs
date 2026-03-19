@@ -17,12 +17,12 @@
 //! let spec = analyzer.infer_spec(&function_body, &signature)?;
 //! ```
 
-mod invoke;
+pub mod invoke;
 mod prompts;
 mod spec_compare;
 
 use anyhow::Result;
-pub use invoke::{FileApiChange, FileBehavioralChange};
+pub use invoke::{FileApiChange, FileBehavioralChange, LlmRemovalDisposition};
 use semver_analyzer_core::{
     BehaviorAnalyzer, BreakingVerdict, ChangedFunction, EvidenceSource, FunctionSpec, TestDiff,
 };

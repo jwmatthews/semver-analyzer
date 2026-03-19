@@ -120,6 +120,17 @@ pub async fn run_concurrent_analysis(
         bu_stats.call_graph_propagated,
     );
 
+    // Extract API surfaces from shared state before it's dropped.
+    // These are used by build_report() to compute component summaries.
+    let old_surface = shared
+        .try_get_old_surface()
+        .cloned()
+        .unwrap_or_else(|| semver_analyzer_core::ApiSurface { symbols: vec![] });
+    let new_surface = shared
+        .try_get_new_surface()
+        .cloned()
+        .unwrap_or_else(|| semver_analyzer_core::ApiSurface { symbols: vec![] });
+
     Ok(AnalysisResult {
         structural_changes: td.structural_changes,
         behavioral_changes,
@@ -127,6 +138,8 @@ pub async fn run_concurrent_analysis(
         llm_api_changes,
         td_stats: td.stats,
         bu_stats,
+        old_surface,
+        new_surface,
     })
 }
 
@@ -139,6 +152,12 @@ pub struct AnalysisResult {
     pub llm_api_changes: Vec<LlmApiChangeEntry>,
     pub td_stats: TdStats,
     pub bu_stats: BuStats,
+    /// Full API surface at the old ref (for build_report aggregation).
+    /// Not serialized into the report — used only during report building
+    /// to compute component summaries, removal ratios, etc.
+    pub old_surface: semver_analyzer_core::ApiSurface,
+    /// Full API surface at the new ref (for build_report aggregation).
+    pub new_surface: semver_analyzer_core::ApiSurface,
 }
 
 /// An API change detected by the LLM during file-level analysis.
@@ -148,6 +167,10 @@ pub struct LlmApiChangeEntry {
     pub symbol: String,
     pub change: String,
     pub description: String,
+    /// LLM-determined disposition for removed props.
+    pub removal_disposition: Option<semver_analyzer_llm::invoke::LlmRemovalDisposition>,
+    /// HTML element the component renders.
+    pub renders_element: Option<String>,
 }
 
 /// Stats from the TD pipeline.
@@ -603,7 +626,7 @@ fn run_bu_phase1(
                         continue;
                     }
 
-                    // Skip test files, .d.ts, index files
+                    // Skip test files, .d.ts, index files, dist/ build output
                     let basename = Path::new(&file_path)
                         .file_name()
                         .map(|f| f.to_string_lossy().to_string())
@@ -615,6 +638,8 @@ fn run_bu_phase1(
                         || basename.contains(".test.")
                         || basename.contains(".spec.")
                         || file_path.contains("__tests__")
+                        || file_path.contains("/dist/")
+                        || file_path.starts_with("dist/")
                     {
                         continue;
                     }
@@ -756,6 +781,11 @@ async fn run_bu_phase2_llm(
                     for change in beh_changes {
                         breaks.fetch_add(1, Ordering::Relaxed);
                         let category = change.category.as_deref().and_then(parse_behavioral_category);
+                        // Encode is_internal_only into the notes for downstream extraction
+                        let mut notes = vec![change.description.clone()];
+                        if change.is_internal_only == Some(true) {
+                            notes.push("__is_internal_only__".to_string());
+                        }
                         let brk = BehavioralBreak {
                             symbol: format!("{}::{}", file_path, change.symbol),
                             caused_by: format!("{}::{}", file_path, change.symbol),
@@ -773,7 +803,7 @@ async fn run_bu_phase2_llm(
                                     postconditions: vec![],
                                     error_behavior: vec![],
                                     side_effects: vec![],
-                                    notes: vec![change.description.clone()],
+                                    notes,
                                 },
                             },
                             confidence: 0.70,
@@ -791,6 +821,8 @@ async fn run_bu_phase2_llm(
                                 symbol: change.symbol,
                                 change: change.change,
                                 description: change.description,
+                                removal_disposition: change.removal_disposition,
+                                renders_element: change.renders_element,
                             });
                         }
                     }
@@ -932,15 +964,98 @@ fn merge_behavioral_breaks(shared: &SharedFindings) -> Vec<BehavioralChange> {
                 EvidenceSource::JsxDiff { .. } => BehavioralChangeKind::Class, // JSX diff = component-level
             };
 
+            // Preserve evidence type from the BU pipeline
+            let evidence_type = Some(match &brk.evidence {
+                EvidenceSource::TestDelta { .. } => "TestDelta".to_string(),
+                EvidenceSource::JsxDiff { .. } => "JsxDiff".to_string(),
+                EvidenceSource::LlmOnly { .. } => "LlmOnly".to_string(),
+                EvidenceSource::LlmWithTestContext { .. } => "LlmWithTestContext".to_string(),
+            });
+
+            // Extract component names referenced in the description
+            let referenced_components = extract_component_refs(&brk.description);
+
+            // Extract is_internal_only from notes (encoded by the LLM ingestion)
+            let is_internal_only = match &brk.evidence {
+                EvidenceSource::LlmOnly { spec_new, .. }
+                | EvidenceSource::LlmWithTestContext { spec_new, .. } => {
+                    if spec_new.notes.iter().any(|n| n == "__is_internal_only__") {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
             BehavioralChange {
                 symbol: extract_display_name(&brk.symbol),
                 kind,
                 category: brk.category.clone(),
                 description: brk.description.clone(),
                 source_file,
+                confidence: Some(brk.confidence),
+                evidence_type,
+                referenced_components,
+                is_internal_only,
             }
         })
         .collect()
+}
+
+/// Extract PascalCase component name references from a behavioral change description.
+///
+/// Looks for patterns like `<ComponentName>`, `ComponentName component`, or
+/// backtick-quoted PascalCase identifiers. Returns deduplicated component names.
+fn extract_component_refs(description: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Pattern 1: JSX-style <ComponentName> or <ComponentName ...>
+    let mut remaining = description;
+    while let Some(start) = remaining.find('<') {
+        let after_lt = &remaining[start + 1..];
+        // Find the end of the tag name (space, >, or /)
+        let end = after_lt
+            .find(|c: char| c == '>' || c == ' ' || c == '/')
+            .unwrap_or(after_lt.len());
+        let name = &after_lt[..end];
+        // Must be PascalCase (starts with uppercase, has lowercase)
+        if !name.is_empty()
+            && name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+            && name.chars().all(|c| c.is_ascii_alphanumeric())
+            && name.chars().any(|c| c.is_ascii_lowercase())
+        {
+            if seen.insert(name.to_string()) {
+                refs.push(name.to_string());
+            }
+        }
+        remaining = &remaining[start + 1..];
+    }
+
+    // Pattern 2: backtick-quoted PascalCase identifiers like `Modal`
+    let mut remaining = description;
+    while let Some(start) = remaining.find('`') {
+        let after_tick = &remaining[start + 1..];
+        if let Some(end) = after_tick.find('`') {
+            let name = &after_tick[..end];
+            if !name.is_empty()
+                && name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                && name.chars().all(|c| c.is_ascii_alphanumeric())
+                && name.chars().any(|c| c.is_ascii_lowercase())
+                && !name.contains(' ')
+            {
+                if seen.insert(name.to_string()) {
+                    refs.push(name.to_string());
+                }
+            }
+            remaining = &after_tick[end + 1..];
+        } else {
+            break;
+        }
+    }
+
+    refs
 }
 
 /// Extract a human-readable display name from a qualified name.

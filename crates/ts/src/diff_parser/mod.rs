@@ -236,6 +236,12 @@ fn is_source_file(path: &Path) -> bool {
         return false;
     }
 
+    // Skip dist/ build output directories (TD handles API changes via .d.ts files;
+    // the BU pipeline should only analyze src/ files to avoid duplicate detection)
+    if path_str.contains("/dist/") || path_str.starts_with("dist/") {
+        return false;
+    }
+
     // Skip test files (TestAnalyzer handles them separately)
     if is_test_file(path) {
         return false;
@@ -978,6 +984,17 @@ mod tests {
         assert!(!is_source_file(Path::new("vitest.config.ts")));
         assert!(!is_source_file(Path::new("webpack.config.js")));
         assert!(!is_source_file(Path::new("tsconfig.json")));
+    }
+
+    #[test]
+    fn source_file_rejects_dist() {
+        assert!(!is_source_file(Path::new(
+            "packages/react-core/dist/esm/components/Button/Button.tsx"
+        )));
+        assert!(!is_source_file(Path::new(
+            "packages/react-core/dist/js/index.ts"
+        )));
+        assert!(!is_source_file(Path::new("dist/components/Card.tsx")));
     }
 
     #[test]

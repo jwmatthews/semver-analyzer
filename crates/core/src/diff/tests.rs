@@ -1380,3 +1380,75 @@ fn identical_complex_surface_no_changes() {
         changes.iter().map(|c| &c.change_type).collect::<Vec<_>>()
     );
 }
+
+// ── No-op rename detection ─────────────────────────────────────────
+
+/// When a symbol moves to a different file path but keeps the same export
+/// name (e.g., `src/components/Chart/Chart` → `src/victory/components/Chart/Chart`),
+/// it should NOT produce a SymbolRenamed change. The consumer's import doesn't
+/// change, so there's nothing to report.
+#[test]
+fn no_op_rename_is_skipped() {
+    // Old surface: Chart at path A
+    let mut old_sym = sym("Chart", SymbolKind::Variable);
+    old_sym.qualified_name = "packages/react-charts/src/components/Chart/Chart.Chart".to_string();
+    old_sym.file = "packages/react-charts/src/components/Chart/Chart.d.ts".into();
+
+    // New surface: Chart at path B (different directory, same name)
+    let mut new_sym = sym("Chart", SymbolKind::Variable);
+    new_sym.qualified_name =
+        "packages/react-charts/src/victory/components/Chart/Chart.Chart".to_string();
+    new_sym.file = "packages/react-charts/src/victory/components/Chart/Chart.d.ts".into();
+
+    let old = surface(vec![old_sym]);
+    let new = surface(vec![new_sym]);
+    let changes = diff_surfaces(&old, &new);
+
+    // Should NOT have a SymbolRenamed change
+    let renames: Vec<_> = changes
+        .iter()
+        .filter(|c| c.change_type == StructuralChangeType::SymbolRenamed)
+        .collect();
+    assert!(
+        renames.is_empty(),
+        "No-op rename (same name, different path) should be skipped. Got: {:?}",
+        renames
+            .iter()
+            .map(|c| format!(
+                "{}: {} -> {:?}",
+                c.symbol,
+                c.before.as_deref().unwrap_or("?"),
+                c.after
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A real rename (different names) should still produce a SymbolRenamed change.
+#[test]
+fn real_rename_is_detected() {
+    // Old: isFlat
+    let mut old_sym = sym("isFlat", SymbolKind::Property);
+    old_sym.qualified_name =
+        "packages/react-core/src/components/Card/Card.CardProps.isFlat".to_string();
+
+    // New: isPlain (different name, same fingerprint)
+    let mut new_sym = sym("isPlain", SymbolKind::Property);
+    new_sym.qualified_name =
+        "packages/react-core/src/components/Card/Card.CardProps.isPlain".to_string();
+
+    let old = surface(vec![old_sym]);
+    let new = surface(vec![new_sym]);
+    let changes = diff_surfaces(&old, &new);
+
+    let renames: Vec<_> = changes
+        .iter()
+        .filter(|c| c.change_type == StructuralChangeType::SymbolRenamed)
+        .collect();
+    assert!(
+        !renames.is_empty(),
+        "Real rename (isFlat → isPlain) should produce SymbolRenamed"
+    );
+    assert_eq!(renames[0].before.as_deref(), Some("isFlat"));
+    assert_eq!(renames[0].after.as_deref(), Some("isPlain"));
+}

@@ -356,6 +356,8 @@ Changes to type signatures that static .d.ts analysis may miss:
 4. **Type narrowed or widened**: e.g., `string | null` → `string`
 5. **Default value changed**: e.g., closeBtnAriaLabel default changed
    from 'close' to dynamic value
+6. **Prop migration**: When a prop is removed and its functionality moved
+   to a child/sibling component, include `removal_disposition`
 
 ## What to EXCLUDE:
 - New additions (new props, new functions, new enum members)
@@ -374,14 +376,17 @@ Return ONLY a JSON object:
       "symbol": "<ComponentName or functionName>",
       "kind": "class",
       "category": "<dom_structure|css_class|css_variable|accessibility|default_value|logic_change|data_attribute|render_output>",
-      "description": "<what changed and why it breaks consumers>"
+      "description": "<what changed and why it breaks consumers>",
+      "is_internal_only": false
     }}
   ],
   "breaking_api_changes": [
     {{
       "symbol": "<InterfaceName.propName or TypeName>",
       "change": "<signature_changed|type_changed|default_changed|removed>",
-      "description": "<what changed in the type signature>"
+      "description": "<what changed in the type signature>",
+      "removal_disposition": null,
+      "renders_element": null
     }}
   ]
 }}
@@ -390,7 +395,27 @@ Return ONLY a JSON object:
 Rules:
 - For behavioral: use "class" for React components, "function" for others
 - For behavioral: ALWAYS include a "category" from the list above
+- For behavioral: set `is_internal_only` to true when the change only
+  affects internal rendering and does NOT require consumer code changes
+  (e.g., internal component now passes a prop differently). Set false
+  when consumers must update their code.
 - For API: use "InterfaceName.propName" format for property changes
+- For API removals: include `removal_disposition` when you can determine
+  where the prop's functionality went:
+  - `{{"type": "moved_to_child", "target_component": "ChildName", "mechanism": "prop"}}` —
+    prop moved to a named prop on a child component (e.g., title → ModalHeader.title)
+  - `{{"type": "moved_to_child", "target_component": "ChildName", "mechanism": "children"}}` —
+    prop value should now be passed as children of the child component
+    (e.g., actions → <ModalFooter>{{actions}}</ModalFooter>)
+  - `{{"type": "replaced_by_prop", "new_prop": "newPropName"}}` —
+    replaced by a different prop on the same component
+  - `{{"type": "made_automatic"}}` — functionality is now inferred automatically
+  - `{{"type": "truly_removed"}}` — removed with no replacement
+  - `null` if you cannot determine the disposition
+- For API removals of components: include `renders_element` with the HTML
+  element the component renders (e.g., "ol", "ul", "div", "footer") when
+  the component is being replaced by a generic component that needs an
+  explicit element type. Set null if not applicable.
 - Keep descriptions specific and actionable
 - Only include changes that would break existing consumers
 - Use empty arrays for categories with no changes

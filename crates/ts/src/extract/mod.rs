@@ -81,11 +81,8 @@ impl OxcExtractor {
         let mut symbols = Vec::new();
         for (file_path, source) in &file_sources {
             let relative = file_path.strip_prefix(dir).unwrap_or(file_path);
-            symbols.extend(self.extract_from_source_with_globals(
-                source,
-                relative,
-                &global_imports,
-            ));
+            let mapped = remap_dist_to_src(relative);
+            symbols.extend(self.extract_from_source_with_globals(source, &mapped, &global_imports));
         }
         Ok(ApiSurface { symbols })
     }
@@ -171,6 +168,54 @@ impl ApiExtractor for OxcExtractor {
     fn extract(&self, repo: &Path, git_ref: &str) -> Result<ApiSurface> {
         self.extract_at_ref(repo, git_ref, None)
     }
+}
+
+// ─── Path remapping ──────────────────────────────────────────────────────
+
+/// Remap a `dist/` path back to its corresponding `src/` path.
+///
+/// TypeScript projects emit `.d.ts` declaration files into `dist/` directories
+/// (e.g., `dist/esm/`, `dist/js/`) that mirror the `src/` layout exactly.
+/// This function maps those paths back to `src/` so that the API surface
+/// references source files instead of build artifacts.
+///
+/// The mapping handles all common `dist/` variants:
+///   `packages/react-core/dist/esm/components/Button/Button.d.ts`
+///   → `packages/react-core/src/components/Button/Button.d.ts`
+///
+/// Paths that don't contain a recognized `dist/` segment are returned unchanged.
+fn remap_dist_to_src(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+
+    // Known dist output directory names (from tsconfig outDir patterns)
+    let dist_segments = [
+        "/dist/esm/",
+        "/dist/js/",
+        "/dist/cjs/",
+        "/dist/mjs/",
+        "/dist/es/",
+        "/dist/commonjs/",
+        "/dist/lib/",
+    ];
+
+    for segment in &dist_segments {
+        if let Some(pos) = path_str.find(segment) {
+            // Replace "/dist/<variant>/" with "/src/"
+            let before = &path_str[..pos];
+            let after = &path_str[pos + segment.len()..];
+            return PathBuf::from(format!("{}/src/{}", before, after));
+        }
+    }
+
+    // Handle bare "/dist/" (no variant subdirectory)
+    if let Some(pos) = path_str.find("/dist/") {
+        let before = &path_str[..pos];
+        let after = &path_str[pos + "/dist/".len()..];
+        return PathBuf::from(format!("{}/src/{}", before, after));
+    }
+
+    // No dist segment found -- return unchanged
+    path.to_path_buf()
 }
 
 // ─── File discovery ───────────────────────────────────────────────────────
@@ -3514,5 +3559,59 @@ export declare const Foo: MyReact.Component;
 
         // Original entry should be preserved
         assert_eq!(base.module_for("React"), Some("custom-react"));
+    }
+
+    // ── remap_dist_to_src ────────────────────────────────────────────
+
+    #[test]
+    fn remap_dist_esm_to_src() {
+        assert_eq!(
+            remap_dist_to_src(Path::new(
+                "packages/react-core/dist/esm/components/Button/Button.d.ts"
+            )),
+            PathBuf::from("packages/react-core/src/components/Button/Button.d.ts")
+        );
+    }
+
+    #[test]
+    fn remap_dist_js_to_src() {
+        assert_eq!(
+            remap_dist_to_src(Path::new(
+                "packages/react-core/dist/js/components/Card/Card.d.ts"
+            )),
+            PathBuf::from("packages/react-core/src/components/Card/Card.d.ts")
+        );
+    }
+
+    #[test]
+    fn remap_dist_cjs_to_src() {
+        assert_eq!(
+            remap_dist_to_src(Path::new("packages/react-core/dist/cjs/index.d.ts")),
+            PathBuf::from("packages/react-core/src/index.d.ts")
+        );
+    }
+
+    #[test]
+    fn remap_bare_dist_to_src() {
+        assert_eq!(
+            remap_dist_to_src(Path::new("packages/react-core/dist/components/Button.d.ts")),
+            PathBuf::from("packages/react-core/src/components/Button.d.ts")
+        );
+    }
+
+    #[test]
+    fn remap_no_dist_unchanged() {
+        let path = Path::new("packages/react-core/src/components/Button/Button.d.ts");
+        assert_eq!(remap_dist_to_src(path), path.to_path_buf());
+    }
+
+    #[test]
+    fn remap_preserves_deprecated_subpath() {
+        assert_eq!(
+            remap_dist_to_src(Path::new(
+                "packages/react-core/dist/esm/deprecated/components/Chip/Chip.d.ts"
+            )),
+            PathBuf::from("packages/react-core/src/deprecated/components/Chip/Chip.d.ts")
+        );
     }
 }

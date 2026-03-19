@@ -6,7 +6,7 @@
 //! The mapping is deterministic: each breaking change type produces a specific
 //! rule pattern using `builtin.filecontent` (regex) or `builtin.json` (xpath).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -264,10 +264,6 @@ impl RenamePatterns {
             component_warnings: Vec::new(),
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.patterns.is_empty()
-    }
 }
 
 // ── Konveyor YAML types ─────────────────────────────────────────────────
@@ -293,6 +289,10 @@ pub struct KonveyorRule {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<KonveyorLink>,
     pub when: KonveyorCondition,
+    /// Fix strategy for this rule. Not serialized to kantra YAML — written
+    /// separately to fix-strategies.json after consolidation.
+    #[serde(skip)]
+    pub fix_strategy: Option<FixStrategyEntry>,
 }
 
 /// A hyperlink attached to a rule.
@@ -456,8 +456,6 @@ pub enum FixStrategy {
     UpdateType,
     /// Remove usages of a deleted symbol and find alternatives.
     FindAlternative,
-    /// Remove a property/field that no longer exists.
-    RemoveUsage,
     /// Update import paths or module system (require ↔ import).
     UpdateImport,
     /// Update package.json dependency configuration.
@@ -529,15 +527,950 @@ pub struct FixSummary {
 ///
 /// When `provider` is `Frontend`, API change rules use `frontend.referenced`
 /// conditions with AST-level location discriminators (JSX_COMPONENT, JSX_PROP,
+/// Minimum number of constants from the same package with the same change type
+/// before they are collapsed into a single combined rule.
+const CONSTANT_COLLAPSE_THRESHOLD: usize = 10;
+
+/// Grouping key for collapsible constant changes: package + change type + strategy.
+/// This ensures constants with different fix strategies end up in separate rules.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConstantGroupKey {
+    package: String,
+    change_type: ApiChangeType,
+    strategy: String,
+}
+
+/// Detect groups of constant changes from the same package that should be
+/// collapsed into a single rule.
+///
+/// This is generic — no framework-specific heuristics. It groups by:
+/// - Same npm package (resolved via `pkg_cache`)
+/// - Same change type (e.g., all `TypeChanged`)
+/// - Same fix strategy type (e.g., all `CssVariablePrefix`)
+/// - Kind is `Constant` (not Property, Interface, etc.)
+/// - Top-level export (no dot in symbol — not an interface member)
+///
+/// Returns a map of `ConstantGroupKey` → list of `(change, from_pkg, strategy)`
+/// for groups exceeding `CONSTANT_COLLAPSE_THRESHOLD`.
+fn detect_collapsible_constant_groups<'a>(
+    report: &'a AnalysisReport,
+    pkg_cache: &HashMap<String, String>,
+    rename_patterns: &RenamePatterns,
+    member_renames: &HashMap<String, String>,
+) -> HashMap<ConstantGroupKey, Vec<(&'a ApiChange, Option<String>, FixStrategyEntry)>> {
+    let mut groups: HashMap<
+        ConstantGroupKey,
+        Vec<(&'a ApiChange, Option<String>, FixStrategyEntry)>,
+    > = HashMap::new();
+
+    for file_changes in &report.changes {
+        let from_pkg = resolve_npm_package(&file_changes.file.to_string_lossy(), pkg_cache);
+        let pkg_name = match &from_pkg {
+            Some(p) => p.clone(),
+            None => continue,
+        };
+        let file_path_str = file_changes.file.to_string_lossy();
+
+        for change in &file_changes.breaking_api_changes {
+            if change.kind != ApiChangeKind::Constant {
+                continue;
+            }
+            // Skip dotted symbols (interface properties like ModalProps.title)
+            if change.symbol.contains('.') {
+                continue;
+            }
+            // Compute the strategy for this change so we can group by it
+            let strategy = match api_change_to_strategy(
+                change,
+                rename_patterns,
+                member_renames,
+                &file_path_str,
+            ) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let key = ConstantGroupKey {
+                package: pkg_name.clone(),
+                change_type: change.change.clone(),
+                strategy: strategy.strategy.clone(),
+            };
+            groups
+                .entry(key)
+                .or_default()
+                .push((change, from_pkg.clone(), strategy));
+        }
+    }
+
+    // Only keep groups that exceed the threshold
+    groups.retain(|_, changes| changes.len() >= CONSTANT_COLLAPSE_THRESHOLD);
+    groups
+}
+
+/// Build a regex pattern that matches all symbol names in a group by
+/// extracting common prefixes (up to the first `_` segment).
+///
+/// For symbols like `["c_button_Color", "c_nav_PaddingTop", "global_Color_100"]`,
+/// produces `^(c_|global_)\w+`.
+///
+/// Falls back to `.*` if there are too many distinct prefixes (>20).
+fn build_token_prefix_pattern(symbols: &[&str]) -> String {
+    let mut prefixes: BTreeSet<String> = BTreeSet::new();
+    for sym in symbols {
+        if let Some(idx) = sym.find('_') {
+            prefixes.insert(format!("{}_", &sym[..idx]));
+        } else {
+            prefixes.insert(sym.to_string());
+        }
+    }
+    if prefixes.len() > 20 || prefixes.is_empty() {
+        return ".*".to_string();
+    }
+    let alts: Vec<String> = prefixes.into_iter().map(|p| regex_escape(&p)).collect();
+    format!("^({})", alts.join("|"))
+}
+
+/// Build a single combined rule for a group of collapsible constant changes.
+///
+/// The rule uses a broad prefix-matching pattern that matches all constants
+/// from the package. The strategy is uniform within the group (guaranteed by
+/// the grouping key in `detect_collapsible_constant_groups`).
+fn build_combined_constant_rule(
+    key: &ConstantGroupKey,
+    changes: &[(&ApiChange, Option<String>, FixStrategyEntry)],
+    id_counts: &mut HashMap<String, usize>,
+) -> KonveyorRule {
+    let symbol_names: Vec<&str> = changes.iter().map(|(c, _, _)| c.symbol.as_str()).collect();
+    let pattern = build_token_prefix_pattern(&symbol_names);
+    let from_pkg = changes[0].1.clone();
+    // Strategy is uniform within the group — take the first one
+    let strategy = Some(changes[0].2.clone());
+
+    let change_type_str = api_change_type_label(&key.change_type);
+    let kind_str = api_kind_label(&ApiChangeKind::Constant);
+    let slug = key
+        .package
+        .replace('@', "")
+        .replace('/', "-")
+        .replace('.', "-");
+    let strategy_slug = key.strategy.to_lowercase().replace(' ', "-");
+    let base_id = format!(
+        "semver-{}-constant-{}-{}-combined",
+        slug, change_type_str, strategy_slug
+    );
+    let rule_id = unique_id(base_id, id_counts);
+
+    // Build a summary message
+    let mut message = format!(
+        "{} constants from `{}` had breaking changes ({}).\n",
+        changes.len(),
+        key.package,
+        change_type_str,
+    );
+
+    // If there's a CSS prefix change, include it in the message
+    if let Some(ref strat) = strategy {
+        if strat.strategy == "CssVariablePrefix" {
+            if let (Some(ref from), Some(ref to)) = (&strat.from, &strat.to) {
+                message.push_str(&format!(
+                    "CSS variable prefix changed from `{}` to `{}`.\n",
+                    from, to
+                ));
+            }
+        }
+    }
+
+    // Add a sample of the first few symbol names
+    let sample_count = 5.min(symbol_names.len());
+    message.push_str(&format!(
+        "Affected constants include: {}",
+        symbol_names[..sample_count].join(", ")
+    ));
+    if symbol_names.len() > sample_count {
+        message.push_str(&format!(" and {} more.", symbol_names.len() - sample_count));
+    }
+
+    KonveyorRule {
+        rule_id,
+        labels: vec![
+            "source=semver-analyzer".to_string(),
+            format!("change-type={}", change_type_str),
+            format!("kind={}", kind_str),
+            "has-codemod=true".to_string(),
+            format!("package={}", key.package),
+        ],
+        effort: 3,
+        category: "mandatory".to_string(),
+        description: format!(
+            "{} constants from {} have breaking changes",
+            changes.len(),
+            key.package
+        ),
+        message,
+        links: Vec::new(),
+        when: KonveyorCondition::FrontendReferenced {
+            referenced: FrontendReferencedFields {
+                pattern,
+                location: "IMPORT".to_string(),
+                component: None,
+                parent: None,
+                value: None,
+                from: from_pkg,
+            },
+        },
+        fix_strategy: strategy,
+    }
+}
+
+/// Build an LLM-actionable migration message for a P0-C component rule.
+///
+/// Aggregates all available context about the component into a single
+/// self-contained migration brief:
+/// - Migration target and property mapping (when available)
+/// - Type/signature changes on the component's props
+/// - Behavioral changes (DOM, CSS, rendering)
+///
+/// **Legacy**: This version scans the full report 3 times.
+/// New code should use `build_migration_message_v2()` which reads from
+/// the pre-aggregated `ComponentSummary`.
+#[allow(dead_code)]
+fn build_migration_message_legacy(
+    component_name: &str,
+    interface_name: &str,
+    report: &AnalysisReport,
+    removal_count: usize,
+    total_changes: usize,
+) -> String {
+    // Look up migration_target for this component's Props interface.
+    let props_name = format!("{}Props", component_name);
+    let migration_target = report
+        .changes
+        .iter()
+        .flat_map(|fc| &fc.breaking_api_changes)
+        .find(|c| {
+            (c.symbol == props_name || c.symbol == *interface_name) && c.migration_target.is_some()
+        })
+        .and_then(|c| c.migration_target.as_ref());
+
+    // Collect type/signature changes for the same interface's props.
+    let type_changes: Vec<(String, Option<String>, Option<String>)> = report
+        .changes
+        .iter()
+        .flat_map(|fc| &fc.breaking_api_changes)
+        .filter(|c| {
+            (c.symbol.starts_with(&format!("{}.", interface_name))
+                || c.symbol.starts_with(&format!("{}.", props_name)))
+                && matches!(
+                    c.change,
+                    ApiChangeType::TypeChanged | ApiChangeType::SignatureChanged
+                )
+        })
+        .map(|c| {
+            let prop = extract_leaf_symbol(&c.symbol).to_string();
+            (prop, c.before.clone(), c.after.clone())
+        })
+        .collect();
+
+    // Collect behavioral changes for this component across all files.
+    let behavioral_descs: Vec<String> = report
+        .changes
+        .iter()
+        .flat_map(|fc| &fc.breaking_behavioral_changes)
+        .filter(|b| {
+            b.symbol == component_name
+                || b.symbol.starts_with(&format!("{}.", component_name))
+                || b.symbol == *interface_name
+                || b.symbol == props_name
+        })
+        .map(|b| {
+            let cat = b
+                .category
+                .as_ref()
+                .map(|c| behavioral_category_label(c))
+                .unwrap_or("change");
+            format!("{}: {}", cat, b.description)
+        })
+        .collect();
+
+    let mut msg = String::new();
+
+    // ── Header: migration target or generic removal ──
+    if let Some(target) = migration_target {
+        let replacement = target
+            .replacement_symbol
+            .strip_suffix("Props")
+            .unwrap_or(&target.replacement_symbol);
+
+        msg.push_str(&format!(
+            "MIGRATION: Replace <{}> with props on <{}>.\n\n",
+            component_name, replacement
+        ));
+
+        if !target.matching_members.is_empty() {
+            msg.push_str("Property mapping:\n");
+            for m in &target.matching_members {
+                if m.old_name == m.new_name {
+                    msg.push_str(&format!(
+                        "  - {}.{}  →  {}.{}\n",
+                        component_name, m.old_name, replacement, m.new_name
+                    ));
+                } else {
+                    msg.push_str(&format!(
+                        "  - {}.{}  →  {}.{} (renamed)\n",
+                        component_name, m.old_name, replacement, m.new_name
+                    ));
+                }
+            }
+            msg.push('\n');
+        }
+
+        if !target.removed_only_members.is_empty() {
+            msg.push_str(&format!(
+                "Removed with no direct equivalent: {}\n\n",
+                target.removed_only_members.join(", ")
+            ));
+        }
+    } else if removal_count == total_changes && total_changes <= 2 {
+        // Fully removed component constant (e.g., EmptyStateHeader)
+        msg.push_str(&format!(
+            "MIGRATION: <{}> was removed.\n\n\
+             This component has no detected direct replacement.\n\
+             Replace all <{}> usages with the recommended alternative.\n\n",
+            component_name, component_name,
+        ));
+    } else {
+        // Heavily modified interface — many props removed but the component
+        // still exists (e.g., Modal lost title/actions/header but still works
+        // with a composed children pattern).
+        //
+        // Collect the specific removed prop names to give the LLM concrete
+        // guidance about what to restructure.
+        let removed_props: Vec<String> = report
+            .changes
+            .iter()
+            .flat_map(|fc| &fc.breaking_api_changes)
+            .filter(|c| {
+                c.change == ApiChangeType::Removed
+                    && (c.symbol.starts_with(&format!("{}.", interface_name))
+                        || c.symbol.starts_with(&format!("{}.", props_name)))
+            })
+            .map(|c| extract_leaf_symbol(&c.symbol).to_string())
+            .collect();
+
+        msg.push_str(&format!(
+            "MIGRATION: <{}> has been restructured ({} of {} props removed).\n\n\
+             The component still exists but its API changed significantly.\n\
+             Props that were removed have moved to composed child components.\n\
+             Keep <{}> and restructure by replacing removed props with \
+             child components that provide the same functionality.\n\n",
+            component_name, removal_count, total_changes, component_name,
+        ));
+
+        if !removed_props.is_empty() {
+            msg.push_str("Removed props (move to child components):\n");
+            for prop in &removed_props {
+                msg.push_str(&format!("  - {}\n", prop));
+            }
+            msg.push('\n');
+
+            // Discover child components that share the same name prefix.
+            // Sources: added_files (new in this version) + report changes
+            // (existing related components).
+            let prefix = component_name;
+            let mut child_components: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+            // From added_files: new components in the same directory family
+            for added in &report.added_files {
+                if let Some(stem) = added.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                    if stem.starts_with(prefix) && stem != prefix && stem != props_name {
+                        child_components.entry(stem).or_default();
+                    }
+                }
+            }
+
+            // From report changes: existing components with the same prefix
+            for fc in &report.changes {
+                for c in &fc.breaking_api_changes {
+                    let sym = &c.symbol;
+                    // Non-dotted symbols that share the prefix
+                    if !sym.contains('.')
+                        && sym.starts_with(prefix)
+                        && sym != prefix
+                        && sym != &props_name
+                        && !sym.ends_with("Props")
+                        && sym.chars().next().map_or(false, |ch| ch.is_uppercase())
+                    {
+                        child_components.entry(sym.clone()).or_default();
+                    }
+                    // Dotted symbols — extract props for child interfaces
+                    if sym.contains('.') {
+                        let parent_iface = sym.split('.').next().unwrap_or("");
+                        let child_name = parent_iface.strip_suffix("Props").unwrap_or(parent_iface);
+                        if child_name.starts_with(prefix)
+                            && child_name != prefix
+                            && parent_iface.ends_with("Props")
+                        {
+                            let prop_name = extract_leaf_symbol(sym).to_string();
+                            child_components
+                                .entry(child_name.to_string())
+                                .or_default()
+                                .push(prop_name);
+                        }
+                    }
+                }
+            }
+
+            if !child_components.is_empty() {
+                msg.push_str("Available child components:\n");
+                for (child, props) in &child_components {
+                    if props.is_empty() {
+                        msg.push_str(&format!("  - <{}>\n", child));
+                    } else {
+                        let unique_props: BTreeSet<&String> = props.iter().collect();
+                        msg.push_str(&format!(
+                            "  - <{}> (props: {})\n",
+                            child,
+                            unique_props
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                }
+                msg.push_str(&format!(
+                    "\nFor each removed prop, pass it to the corresponding <{}___> \
+                     child component as a prop or as children.\n\n",
+                    component_name
+                ));
+            }
+        }
+    }
+
+    // ── Type changes section ──
+    if !type_changes.is_empty() {
+        msg.push_str("Type changes:\n");
+        for (prop, before, after) in &type_changes {
+            match (before, after) {
+                (Some(b), Some(a)) => {
+                    msg.push_str(&format!("  - {}: {}  →  {}\n", prop, b, a));
+                }
+                (Some(b), None) => {
+                    msg.push_str(&format!("  - {}: {} (removed)\n", prop, b));
+                }
+                (None, Some(a)) => {
+                    msg.push_str(&format!("  - {}: → {} (added)\n", prop, a));
+                }
+                (None, None) => {
+                    msg.push_str(&format!("  - {}: type changed\n", prop));
+                }
+            }
+        }
+        msg.push('\n');
+    }
+
+    // ── Behavioral changes section ──
+    if !behavioral_descs.is_empty() {
+        msg.push_str("Behavioral changes:\n");
+        for desc in &behavioral_descs {
+            msg.push_str(&format!("  - {}\n", desc));
+        }
+        msg.push('\n');
+    }
+
+    // ── Action instruction ──
+    if let Some(target) = migration_target {
+        let replacement = target
+            .replacement_symbol
+            .strip_suffix("Props")
+            .unwrap_or(&target.replacement_symbol);
+        msg.push_str(&format!(
+            "Remove <{}> from JSX and move its props to <{}>.\n\
+             Also remove {} from the import statement.",
+            component_name, replacement, component_name
+        ));
+    } else if removal_count == total_changes && total_changes <= 2 {
+        // Fully removed — tell LLM to remove the import
+        msg.push_str(&format!(
+            "Remove {} from the import statement.",
+            component_name,
+        ));
+    } else {
+        // Restructured — keep the import, restructure usage
+        msg.push_str(&format!(
+            "Keep {} in the import statement. Restructure JSX to use \
+             composed children instead of the removed props.",
+            component_name,
+        ));
+    }
+
+    msg
+}
+
+/// Build an LLM-actionable migration message for a P0-C component rule
+/// from a pre-aggregated `ComponentSummary`.
+///
+/// This is the v2 replacement for `build_migration_message_legacy()`.
+/// It reads directly from the pre-aggregated fields on `ComponentSummary`
+/// rather than scanning the full report.
+fn build_migration_message_v2(comp: &semver_analyzer_core::ComponentSummary) -> String {
+    let component_name = &comp.name;
+    let removal_count = comp.property_summary.removed;
+    let total = comp.property_summary.total;
+
+    let mut msg = String::new();
+
+    // ── Header: migration target or generic removal ──
+    if let Some(ref target) = comp.migration_target {
+        let replacement = target
+            .replacement_symbol
+            .strip_suffix("Props")
+            .unwrap_or(&target.replacement_symbol);
+
+        msg.push_str(&format!(
+            "MIGRATION: Replace <{}> with props on <{}>.\n\n",
+            component_name, replacement
+        ));
+
+        if !target.matching_members.is_empty() {
+            msg.push_str("Property mapping:\n");
+            for m in &target.matching_members {
+                if m.old_name == m.new_name {
+                    msg.push_str(&format!(
+                        "  - {}.{}  →  {}.{}\n",
+                        component_name, m.old_name, replacement, m.new_name
+                    ));
+                } else {
+                    msg.push_str(&format!(
+                        "  - {}.{}  →  {}.{} (renamed)\n",
+                        component_name, m.old_name, replacement, m.new_name
+                    ));
+                }
+            }
+            msg.push('\n');
+        }
+
+        if !target.removed_only_members.is_empty() {
+            msg.push_str(&format!(
+                "Removed with no direct equivalent: {}\n\n",
+                target.removed_only_members.join(", ")
+            ));
+        }
+    } else if comp.status == semver_analyzer_core::ComponentStatus::Removed
+        || (removal_count == total && total <= 2)
+    {
+        // Fully removed component
+        msg.push_str(&format!(
+            "MIGRATION: <{}> was removed.\n\n\
+             This component has no detected direct replacement.\n\
+             Replace all <{}> usages with the recommended alternative.\n\n",
+            component_name, component_name,
+        ));
+    } else {
+        // Heavily modified interface — many props removed but the component
+        // still exists.
+        msg.push_str(&format!(
+            "MIGRATION: <{}> has been restructured ({} of {} props removed).\n\n\
+             The component still exists but its API changed significantly.\n\
+             Props that were removed have moved to composed child components.\n\
+             Keep <{}> and restructure by replacing removed props with \
+             child components that provide the same functionality.\n\n",
+            component_name, removal_count, total, component_name,
+        ));
+
+        if !comp.removed_properties.is_empty() {
+            msg.push_str("Removed props (move to child components):\n");
+            for prop in &comp.removed_properties {
+                msg.push_str(&format!("  - {}\n", prop.name));
+            }
+            msg.push('\n');
+
+            // Include child components with prop→child mappings from AST + LLM analysis.
+            // Distinguish between "pass as named prop" and "pass as children" using
+            // the removal_disposition data from LLM analysis.
+            if !comp.child_components.is_empty() {
+                // Build a map of prop → disposition for quick lookup
+                let prop_dispositions: std::collections::HashMap<
+                    &str,
+                    &semver_analyzer_core::RemovalDisposition,
+                > = comp
+                    .removed_properties
+                    .iter()
+                    .filter_map(|rp| {
+                        rp.removal_disposition
+                            .as_ref()
+                            .map(|d| (rp.name.as_str(), d))
+                    })
+                    .collect();
+
+                msg.push_str("Use these child components inside <");
+                msg.push_str(component_name);
+                msg.push_str(">:\n");
+                for child in &comp.child_components {
+                    if !child.absorbed_props.is_empty() {
+                        // Separate props by mechanism: named prop vs children
+                        let mut as_props = Vec::new();
+                        let mut as_children = Vec::new();
+                        for prop_name in &child.absorbed_props {
+                            match prop_dispositions.get(prop_name.as_str()) {
+                                Some(semver_analyzer_core::RemovalDisposition::MovedToChild {
+                                    mechanism,
+                                    ..
+                                }) if mechanism == "children" => {
+                                    as_children.push(prop_name.as_str());
+                                }
+                                _ => {
+                                    // Default: if the child has this as a named prop, it's a prop;
+                                    // otherwise it's likely children
+                                    if child.known_props.contains(prop_name) {
+                                        as_props.push(prop_name.as_str());
+                                    } else {
+                                        as_children.push(prop_name.as_str());
+                                    }
+                                }
+                            }
+                        }
+                        let mut parts = Vec::new();
+                        if !as_props.is_empty() {
+                            parts.push(format!("pass as props: {}", as_props.join(", ")));
+                        }
+                        if !as_children.is_empty() {
+                            parts.push(format!("pass as children: {}", as_children.join(", ")));
+                        }
+                        msg.push_str(&format!("  - <{}> — {}\n", child.name, parts.join("; ")));
+                    } else {
+                        msg.push_str(&format!(
+                            "  - <{}> — wrap relevant content as children\n",
+                            child.name,
+                        ));
+                    }
+                }
+
+                // List any removed props that no child absorbs
+                let absorbed: std::collections::HashSet<&str> = comp
+                    .child_components
+                    .iter()
+                    .flat_map(|c| c.absorbed_props.iter().map(|s| s.as_str()))
+                    .collect();
+                let unmapped: Vec<&str> = comp
+                    .removed_properties
+                    .iter()
+                    .map(|rp| rp.name.as_str())
+                    .filter(|n| !absorbed.contains(n))
+                    .collect();
+                if !unmapped.is_empty() {
+                    // Check if any unmapped props have a known disposition
+                    let truly_removed: Vec<&str> = unmapped
+                        .iter()
+                        .filter(|n| {
+                            matches!(
+                                prop_dispositions.get(*n),
+                                Some(semver_analyzer_core::RemovalDisposition::TrulyRemoved)
+                                    | Some(semver_analyzer_core::RemovalDisposition::MadeAutomatic)
+                            )
+                        })
+                        .copied()
+                        .collect();
+                    let unknown: Vec<&str> = unmapped
+                        .iter()
+                        .filter(|n| !truly_removed.contains(n))
+                        .copied()
+                        .collect();
+                    if !truly_removed.is_empty() {
+                        msg.push_str(&format!(
+                            "\nRemoved with no replacement (safe to delete): {}\n",
+                            truly_removed.join(", ")
+                        ));
+                    }
+                    if !unknown.is_empty() {
+                        msg.push_str(&format!(
+                            "\nProps with no direct child component match (handle manually): {}\n",
+                            unknown.join(", ")
+                        ));
+                    }
+                }
+                msg.push('\n');
+            }
+        }
+    }
+
+    // ── Type changes section ──
+    if !comp.type_changes.is_empty() {
+        msg.push_str("Type changes:\n");
+        for tc in &comp.type_changes {
+            match (&tc.before, &tc.after) {
+                (Some(b), Some(a)) => {
+                    msg.push_str(&format!("  - {}: {}  →  {}\n", tc.property, b, a));
+                }
+                (Some(b), None) => {
+                    msg.push_str(&format!("  - {}: {} (removed)\n", tc.property, b));
+                }
+                (None, Some(a)) => {
+                    msg.push_str(&format!("  - {}: → {} (added)\n", tc.property, a));
+                }
+                (None, None) => {
+                    msg.push_str(&format!("  - {}: type changed\n", tc.property));
+                }
+            }
+        }
+        msg.push('\n');
+    }
+
+    // ── Behavioral changes section ──
+    if !comp.behavioral_changes.is_empty() {
+        msg.push_str("Behavioral changes:\n");
+        for b in &comp.behavioral_changes {
+            let cat = b
+                .category
+                .as_ref()
+                .map(|c| behavioral_category_label(c))
+                .unwrap_or("change");
+            msg.push_str(&format!("  - {}: {}\n", cat, b.description));
+        }
+        msg.push('\n');
+    }
+
+    // ── Action instruction ──
+    if let Some(ref target) = comp.migration_target {
+        let replacement = target
+            .replacement_symbol
+            .strip_suffix("Props")
+            .unwrap_or(&target.replacement_symbol);
+        msg.push_str(&format!(
+            "Remove <{}> from JSX and move its props to <{}>.\n\
+             Also remove {} from the import statement.",
+            component_name, replacement, component_name
+        ));
+    } else if comp.status == semver_analyzer_core::ComponentStatus::Removed
+        || (removal_count == total && total <= 2)
+    {
+        // Fully removed — tell LLM to remove the import
+        msg.push_str(&format!(
+            "Remove {} from the import statement.",
+            component_name,
+        ));
+    } else {
+        // Restructured — keep the import, restructure usage
+        msg.push_str(&format!(
+            "Keep {} in the import statement. Restructure JSX to use \
+             composed children instead of the removed props.",
+            component_name,
+        ));
+    }
+
+    msg
+}
+
 /// IMPORT, etc.). When `Builtin`, rules use `builtin.filecontent` regex patterns.
 pub fn generate_rules(
     report: &AnalysisReport,
     file_pattern: &str,
     pkg_cache: &HashMap<String, String>,
     rename_patterns: &RenamePatterns,
+    member_renames: &HashMap<String, String>,
 ) -> Vec<KonveyorRule> {
     let mut rules = Vec::new();
     let mut id_counts: HashMap<String, usize> = HashMap::new();
+
+    // ── Pre-scan: build set of changes covered by component-level (P0-C) rules ──
+    //
+    // When a component qualifies for a P0-C composition rule (its child
+    // components absorb removed props), individual per-prop and per-behavioral
+    // rules for that component are redundant. We build the covered set from
+    // the report's pre-aggregated ComponentSummary data so that per-change
+    // rule generation can skip them upfront — no post-hoc string suppression.
+    //
+    // covered_components: set of component names that will get a P0-C rule
+    // covered_props: set of (interface_name, prop_name) tuples covered by P0-C
+    let mut covered_components: HashSet<String> = HashSet::new();
+    let mut covered_props: HashSet<(String, String)> = HashSet::new();
+
+    for pkg in &report.packages {
+        for comp in &pkg.components {
+            let qualifies = comp.status == semver_analyzer_core::ComponentStatus::Removed
+                || (comp.property_summary.removed >= 3
+                    && comp.property_summary.removal_ratio > 0.5)
+                || comp.property_summary.removed >= 5;
+            if !qualifies {
+                continue;
+            }
+            covered_components.insert(comp.name.clone());
+            covered_components.insert(comp.interface_name.clone());
+            // Mark all removed props as covered
+            for rp in &comp.removed_properties {
+                covered_props.insert((comp.interface_name.clone(), rp.name.clone()));
+                covered_props.insert((comp.name.clone(), rp.name.clone()));
+            }
+        }
+    }
+
+    if !covered_components.is_empty() {
+        eprintln!(
+            "P0-C coverage: {} components with {} covered prop changes",
+            covered_components.len(),
+            covered_props.len(),
+        );
+    }
+
+    // ── Pre-scan: build set of public component/symbol names ──────────────
+    //
+    // Used to filter behavioral rules: only generate rules for symbols that
+    // are part of the public API (appear in report.packages as components).
+    // Internal components (ModalBox, MenuBase, etc.) that happen to get
+    // LLM-analyzed because they share a source file with public components
+    // should not produce consumer-facing rules.
+    let public_symbols: HashSet<&str> = report
+        .packages
+        .iter()
+        .flat_map(|pkg| {
+            pkg.components.iter().flat_map(|comp| {
+                // Include both the component name and interface name
+                std::iter::once(comp.name.as_str())
+                    .chain(std::iter::once(comp.interface_name.as_str()))
+            })
+        })
+        .collect();
+
+    // ── Pre-scan: collapse large groups of constant changes into single rules ──
+    //
+    // When a package has many constants with the same change type (e.g., 2,000+
+    // token type-changed constants from @patternfly/react-tokens), emit one
+    // combined rule instead of thousands of individual rules.
+    //
+    // V2 path: when report.packages has pre-grouped constants, use those
+    // directly instead of re-scanning the flat changes list.
+    let mut collapsed_keys: std::collections::HashSet<(String, ApiChangeType, String)> =
+        std::collections::HashSet::new();
+
+    let has_package_constants = report.packages.iter().any(|pkg| !pkg.constants.is_empty());
+
+    if has_package_constants {
+        // V2 path: iterate pre-grouped constant groups from report.packages
+        for pkg in &report.packages {
+            for cg in &pkg.constants {
+                if cg.count < CONSTANT_COLLAPSE_THRESHOLD {
+                    continue;
+                }
+                let symbol_names: Vec<&str> = cg.symbols.iter().map(|s| s.as_str()).collect();
+                let pattern = if cg.common_prefix_pattern.is_empty() {
+                    build_token_prefix_pattern(&symbol_names)
+                } else {
+                    cg.common_prefix_pattern.clone()
+                };
+                let strategy_name = if cg.strategy_hint.is_empty() {
+                    "Manual".to_string()
+                } else {
+                    cg.strategy_hint.clone()
+                };
+
+                let change_type_str = api_change_type_label(&cg.change_type);
+                let kind_str = api_kind_label(&ApiChangeKind::Constant);
+                let slug = pkg
+                    .name
+                    .replace('@', "")
+                    .replace('/', "-")
+                    .replace('.', "-");
+                let strategy_slug = strategy_name.to_lowercase().replace(' ', "-");
+                let base_id = format!(
+                    "semver-{}-constant-{}-{}-combined",
+                    slug, change_type_str, strategy_slug
+                );
+                let rule_id = unique_id(base_id, &mut id_counts);
+
+                let mut message = format!(
+                    "{} constants from `{}` had breaking changes ({}).\n",
+                    cg.count, pkg.name, change_type_str,
+                );
+                // Add a sample of the first few symbol names
+                let sample_count = 5.min(symbol_names.len());
+                if !symbol_names.is_empty() {
+                    message.push_str(&format!(
+                        "Affected constants include: {}",
+                        symbol_names[..sample_count].join(", ")
+                    ));
+                    if symbol_names.len() > sample_count {
+                        message
+                            .push_str(&format!(" and {} more.", symbol_names.len() - sample_count));
+                    }
+                }
+
+                // Build fix strategy from strategy_hint + suffix_renames
+                let mut strategy = FixStrategyEntry::new(&strategy_name);
+                if !cg.suffix_renames.is_empty() {
+                    strategy.mappings = cg
+                        .suffix_renames
+                        .iter()
+                        .map(|sr| MappingEntry {
+                            from: Some(sr.from.clone()),
+                            to: Some(sr.to.clone()),
+                            component: None,
+                            prop: None,
+                        })
+                        .collect();
+                }
+
+                eprintln!(
+                    "Collapsed {} {} constant rules ({}) from {} into single rule: {}",
+                    cg.count, change_type_str, strategy_name, pkg.name, rule_id,
+                );
+
+                rules.push(KonveyorRule {
+                    rule_id,
+                    labels: vec![
+                        "source=semver-analyzer".to_string(),
+                        format!("change-type={}", change_type_str),
+                        format!("kind={}", kind_str),
+                        "has-codemod=true".to_string(),
+                        format!("package={}", pkg.name),
+                    ],
+                    effort: 3,
+                    category: "mandatory".to_string(),
+                    description: format!(
+                        "{} constants from {} have breaking changes",
+                        cg.count, pkg.name
+                    ),
+                    message,
+                    links: Vec::new(),
+                    when: KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern,
+                            location: "IMPORT".to_string(),
+                            component: None,
+                            parent: None,
+                            value: None,
+                            from: Some(pkg.name.clone()),
+                        },
+                    },
+                    fix_strategy: Some(strategy),
+                });
+
+                collapsed_keys.insert((pkg.name.clone(), cg.change_type.clone(), strategy_name));
+            }
+        }
+    } else {
+        // Legacy path: scan the flat changes list
+        let collapsible_groups =
+            detect_collapsible_constant_groups(report, pkg_cache, rename_patterns, member_renames);
+
+        for (key, changes) in &collapsible_groups {
+            let combined_rule = build_combined_constant_rule(key, changes, &mut id_counts);
+            eprintln!(
+                "Collapsed {} {} constant rules ({}) from {} into single rule: {}",
+                changes.len(),
+                api_change_type_label(&key.change_type),
+                key.strategy,
+                key.package,
+                combined_rule.rule_id,
+            );
+            rules.push(combined_rule);
+            collapsed_keys.insert((
+                key.package.clone(),
+                key.change_type.clone(),
+                key.strategy.clone(),
+            ));
+        }
+    }
+
     // API changes (per-file)
     for file_changes in &report.changes {
         // resolve_npm_package already appends /deprecated or /next when the
@@ -548,12 +1481,56 @@ pub fn generate_rules(
         let from_pkg = resolve_npm_package(&file_changes.file.to_string_lossy(), pkg_cache);
 
         for api_change in &file_changes.breaking_api_changes {
+            // Skip constants that were already collapsed into a combined rule.
+            // We check package + change_type + strategy to ensure only the exact
+            // group that was collapsed gets skipped.
+            if api_change.kind == ApiChangeKind::Constant && !api_change.symbol.contains('.') {
+                if let Some(ref pkg) = from_pkg {
+                    let file_path_str = file_changes.file.to_string_lossy();
+                    if let Some(strat) = api_change_to_strategy(
+                        api_change,
+                        rename_patterns,
+                        &member_renames,
+                        &file_path_str,
+                    ) {
+                        if collapsed_keys.contains(&(
+                            pkg.clone(),
+                            api_change.change.clone(),
+                            strat.strategy,
+                        )) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Skip individual prop/symbol changes that are covered by a
+            // component-level P0-C composition rule. The P0-C rule has the
+            // full picture (child components, prop→child mappings) so
+            // individual rules are redundant and potentially misleading.
+            if api_change.symbol.contains('.') {
+                let parts: Vec<&str> = api_change.symbol.splitn(2, '.').collect();
+                let interface_name = parts[0];
+                let prop_name = parts[1];
+                if covered_props.contains(&(interface_name.to_string(), prop_name.to_string())) {
+                    continue;
+                }
+            } else if covered_components.contains(&api_change.symbol) {
+                // Top-level symbol changes (e.g., "Modal" removed) are also
+                // covered by the P0-C rule when it exists
+                if api_change.change == ApiChangeType::Removed {
+                    continue;
+                }
+            }
+
             let new_rules = api_change_to_rules(
                 api_change,
                 file_changes,
                 file_pattern,
                 from_pkg.as_deref(),
                 &mut id_counts,
+                rename_patterns,
+                &member_renames,
             );
             rules.extend(new_rules);
         }
@@ -572,121 +1549,227 @@ pub fn generate_rules(
 
         if !is_test_demo_file {
             for behavioral in &file_changes.breaking_behavioral_changes {
-                let rule = behavioral_change_to_rule(
+                // Skip behavioral rules for components covered by P0-C.
+                // The P0-C rule already includes behavioral changes in its
+                // message (from ComponentSummary.behavioral_changes).
+                if covered_components.contains(&behavioral.symbol) {
+                    continue;
+                }
+
+                // Skip behavioral rules for symbols that aren't part of the
+                // public API. Internal components (ModalBox, MenuBase, etc.)
+                // may get LLM-analyzed because their source file contains
+                // exported functions, but consumers never import them directly.
+                let beh_leaf = extract_leaf_symbol(&behavioral.symbol);
+                if !public_symbols.is_empty() && !public_symbols.contains(beh_leaf) {
+                    continue;
+                }
+                if let Some(rule) = behavioral_change_to_rule(
                     behavioral,
                     file_changes,
                     file_pattern,
                     from_pkg.as_deref(),
                     &mut id_counts,
-                );
-                rules.push(rule);
+                ) {
+                    rules.push(rule);
+                }
             }
         }
     }
 
-    // ── P0-C + P1-A: Synthesize component-level IMPORT and review rules ──
+    // ── P0-C: Synthesize component-level IMPORT rules ──
     //
-    // Aggregate API changes by parent component interface.  When an interface
-    // has had most of its properties removed (gutted), emit an IMPORT rule for
-    // the component itself (stripping the "Props" suffix).  When a component
-    // has >= 3 distinct breaking API changes but NO prop-level rules already
-    // covering it, emit a JSX_COMPONENT "review" rule.
+    // When a component has significant removals or was fully removed,
+    // emit an IMPORT rule for the component itself.
     //
-    // SUPPRESSION: When a component already has >= 2 prop-level rules (from
-    // the per-change loop above), skip both P0-C and P1-A.  The specific
-    // prop-level rules already fire at the exact JSX_PROP locations, so the
-    // broad component-level rules would only add noise at already-covered
-    // locations.  The prop-level rules tell you WHICH props broke; the
-    // component-level rules only say "something broke."
+    // V2 path: iterate pre-aggregated report.packages[].components.
+    // Legacy path: scan dotted symbols to aggregate by parent interface.
     {
-        struct ComponentInfo {
-            total_changes: usize,
-            removal_count: usize,
-            from_pkg: Option<String>,
-        }
-        let mut component_map: BTreeMap<String, ComponentInfo> = BTreeMap::new();
-        for file_changes in &report.changes {
-            let from_pkg = resolve_npm_package(&file_changes.file.to_string_lossy(), pkg_cache);
+        let has_package_components = report.packages.iter().any(|pkg| !pkg.components.is_empty());
 
-            for api_change in &file_changes.breaking_api_changes {
-                if !api_change.symbol.contains('.') {
-                    continue;
-                }
-                let parts: Vec<&str> = api_change.symbol.splitn(2, '.').collect();
-                let interface_name = parts[0].to_string();
-                let entry = component_map
-                    .entry(interface_name)
-                    .or_insert(ComponentInfo {
-                        total_changes: 0,
-                        removal_count: 0,
-                        from_pkg: from_pkg.clone(),
-                    });
-                entry.total_changes += 1;
-                if api_change.change == ApiChangeType::Removed {
-                    entry.removal_count += 1;
-                }
-            }
-        }
+        if has_package_components {
+            // V2 path: read from pre-aggregated ComponentSummary data
+            for pkg in &report.packages {
+                for comp in &pkg.components {
+                    // A component qualifies for a P0-C rule if:
+                    // - it was fully removed, OR
+                    // - it has many props removed (>50% ratio), OR
+                    // - it has a high absolute count of removals (>=5), indicating
+                    //   significant restructuring even if total prop count is large
+                    //   (e.g., Modal: 11 of 28 props removed = composition change)
+                    let qualifies = comp.status == semver_analyzer_core::ComponentStatus::Removed
+                        || (comp.property_summary.removed >= 3
+                            && comp.property_summary.removal_ratio > 0.5)
+                        || comp.property_summary.removed >= 5;
 
-        for (interface_name, info) in &component_map {
-            let component_name = interface_name
-                .strip_suffix("Props")
-                .unwrap_or(interface_name);
+                    if !qualifies {
+                        continue;
+                    }
 
-            // P0-C: Interface with significant removals → IMPORT rule for the
-            // component so consumers importing it are warned.
-            // NOT suppressed by prop-level rules — prop rules use JSX_PROP
-            // which fires at usage sites, not at the import line.  The import
-            // is where the consumer needs to act (remove or replace the import).
-            let mostly_removed = info.removal_count >= 1
-                && (info.removal_count * 2 >= info.total_changes)
-                && info.total_changes >= 2;
-            if mostly_removed {
-                let base_id = format!(
-                    "semver-{}-component-import-deprecated",
-                    sanitize_id(component_name)
-                );
-                let rule_id = unique_id(base_id, &mut id_counts);
-                rules.push(KonveyorRule {
-                    rule_id,
-                    labels: vec![
-                        "source=semver-analyzer".to_string(),
-                        "change-type=component-removal".to_string(),
-                        format!("kind=interface"),
-                        "has-codemod=false".to_string(),
-                    ],
-                    effort: 3,
-                    category: "mandatory".to_string(),
-                    description: format!(
-                        "{} has significant breaking changes — {} of {} props removed",
-                        component_name, info.removal_count, info.total_changes
-                    ),
-                    message: format!(
-                        "Interface '{}' had {} of {} properties removed, indicating \
-                         the component was removed or merged into another component. \
-                         Review your imports and migrate to the replacement.\n\
-                         File: synthetic/{}.d.ts",
-                        interface_name, info.removal_count, info.total_changes, component_name
-                    ),
-                    links: Vec::new(),
-                    when: KonveyorCondition::FrontendReferenced {
-                        referenced: FrontendReferencedFields {
-                            pattern: format!("^{}$", regex_escape(component_name)),
-                            location: "IMPORT".to_string(),
-                            component: None,
-                            parent: None,
-                            value: None,
-                            from: info.from_pkg.clone(),
+                    let component_name = &comp.name;
+                    let base_id = format!(
+                        "semver-{}-component-import-deprecated",
+                        sanitize_id(component_name)
+                    );
+                    let rule_id = unique_id(base_id, &mut id_counts);
+                    let message = build_migration_message_v2(comp);
+
+                    rules.push(KonveyorRule {
+                        rule_id,
+                        labels: vec![
+                            "source=semver-analyzer".to_string(),
+                            "change-type=component-removal".to_string(),
+                            "kind=interface".to_string(),
+                            "has-codemod=false".to_string(),
+                        ],
+                        effort: 3,
+                        category: "mandatory".to_string(),
+                        description: format!(
+                            "{} has significant breaking changes — {} of {} props removed",
+                            component_name,
+                            comp.property_summary.removed,
+                            comp.property_summary.total
+                        ),
+                        message,
+                        links: Vec::new(),
+                        when: KonveyorCondition::FrontendReferenced {
+                            referenced: FrontendReferencedFields {
+                                pattern: format!("^{}$", regex_escape(component_name)),
+                                location: "IMPORT".to_string(),
+                                component: None,
+                                parent: None,
+                                value: None,
+                                from: Some(pkg.name.clone()),
+                            },
                         },
-                    },
-                });
+                        fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+                    });
+                }
+            }
+        } else {
+            // Legacy path: scan the flat changes list
+            struct ComponentInfo {
+                total_changes: usize,
+                removal_count: usize,
+                from_pkg: Option<String>,
+                from_constant_removal: bool,
+            }
+            let mut component_map: BTreeMap<String, ComponentInfo> = BTreeMap::new();
+            for file_changes in &report.changes {
+                let from_pkg = resolve_npm_package(&file_changes.file.to_string_lossy(), pkg_cache);
+
+                for api_change in &file_changes.breaking_api_changes {
+                    if !api_change.symbol.contains('.') {
+                        continue;
+                    }
+                    let parts: Vec<&str> = api_change.symbol.splitn(2, '.').collect();
+                    let interface_name = parts[0].to_string();
+                    let entry = component_map
+                        .entry(interface_name)
+                        .or_insert(ComponentInfo {
+                            total_changes: 0,
+                            removal_count: 0,
+                            from_pkg: from_pkg.clone(),
+                            from_constant_removal: false,
+                        });
+                    entry.total_changes += 1;
+                    if api_change.change == ApiChangeType::Removed {
+                        entry.removal_count += 1;
+                    }
+                }
             }
 
-            // P1-A (component-review) is intentionally omitted here.  The
-            // prop-level rules from the per-change loop above already fire at
-            // the exact JSX_PROP locations telling the consumer WHICH props
-            // broke.  A broad "review all usages" JSX_COMPONENT rule would
-            // only add noise at the same locations without new information.
+            // P0-C extension: fully-removed PascalCase component exports
+            for file_changes in &report.changes {
+                let from_pkg = resolve_npm_package(&file_changes.file.to_string_lossy(), pkg_cache);
+                for api_change in &file_changes.breaking_api_changes {
+                    if api_change.change != ApiChangeType::Removed {
+                        continue;
+                    }
+                    if api_change.symbol.contains('.') {
+                        continue;
+                    }
+                    let sym = &api_change.symbol;
+                    if !sym.chars().next().map_or(false, |c| c.is_uppercase()) {
+                        continue;
+                    }
+                    if !sym.chars().any(|c| c.is_lowercase()) {
+                        continue;
+                    }
+                    if sym.ends_with("Props") || sym.ends_with("Variants") {
+                        continue;
+                    }
+                    if !matches!(
+                        api_change.kind,
+                        ApiChangeKind::Constant | ApiChangeKind::Interface
+                    ) {
+                        continue;
+                    }
+                    if !component_map.contains_key(sym) {
+                        component_map.insert(
+                            sym.clone(),
+                            ComponentInfo {
+                                total_changes: 1,
+                                removal_count: 1,
+                                from_pkg: from_pkg.clone(),
+                                from_constant_removal: true,
+                            },
+                        );
+                    }
+                }
+            }
+
+            for (interface_name, info) in &component_map {
+                let component_name = interface_name
+                    .strip_suffix("Props")
+                    .unwrap_or(interface_name);
+
+                let mostly_removed = info.from_constant_removal
+                    || (info.removal_count >= 3 && (info.removal_count * 2 > info.total_changes));
+                if mostly_removed {
+                    let base_id = format!(
+                        "semver-{}-component-import-deprecated",
+                        sanitize_id(component_name)
+                    );
+                    let rule_id = unique_id(base_id, &mut id_counts);
+                    let message = build_migration_message_legacy(
+                        component_name,
+                        interface_name,
+                        report,
+                        info.removal_count,
+                        info.total_changes,
+                    );
+
+                    rules.push(KonveyorRule {
+                        rule_id,
+                        labels: vec![
+                            "source=semver-analyzer".to_string(),
+                            "change-type=component-removal".to_string(),
+                            "kind=interface".to_string(),
+                            "has-codemod=false".to_string(),
+                        ],
+                        effort: 3,
+                        category: "mandatory".to_string(),
+                        description: format!(
+                            "{} has significant breaking changes — {} of {} props removed",
+                            component_name, info.removal_count, info.total_changes
+                        ),
+                        message,
+                        links: Vec::new(),
+                        when: KonveyorCondition::FrontendReferenced {
+                            referenced: FrontendReferencedFields {
+                                pattern: format!("^{}$", regex_escape(component_name)),
+                                location: "IMPORT".to_string(),
+                                component: None,
+                                parent: None,
+                                value: None,
+                                from: info.from_pkg.clone(),
+                            },
+                        },
+                        fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+                    });
+                }
+            }
         }
     }
 
@@ -701,6 +1784,7 @@ pub fn generate_rules(
     let css_prefix_changes = detect_css_prefix_changes(report);
     for (old_class_prefix, old_var_prefix) in &css_prefix_changes {
         // Consumer CSS/SCSS — stale CSS class prefix
+        let new_class_prefix = increment_version_prefix(old_class_prefix);
         rules.push(KonveyorRule {
             rule_id: format!(
                 "semver-consumer-css-stale-{}",
@@ -727,9 +1811,15 @@ pub fn generate_rules(
                     pattern: old_class_prefix.clone(),
                 },
             },
+            fix_strategy: Some(FixStrategyEntry::with_from_to(
+                "CssVariablePrefix",
+                old_class_prefix,
+                &new_class_prefix,
+            )),
         });
 
         // Consumer CSS/SCSS — stale CSS variable prefix
+        let new_var_prefix = increment_version_prefix(old_var_prefix);
         rules.push(KonveyorRule {
             rule_id: format!(
                 "semver-consumer-css-stale-var-{}",
@@ -756,7 +1846,107 @@ pub fn generate_rules(
                     pattern: old_var_prefix.clone(),
                 },
             },
+            fix_strategy: Some(FixStrategyEntry::with_from_to(
+                "CssVariablePrefix",
+                old_var_prefix,
+                &new_var_prefix,
+            )),
         });
+    }
+
+    // ── CSS logical property suffix renames ────────────────────────────
+    //
+    // Token constants use suffixes like PaddingTop, MarginLeft, etc. In PF6,
+    // these became logical properties (PaddingBlockStart, MarginInlineStart).
+    // The CssVariablePrefix strategy handles the prefix (pf-v5- → pf-v6-) but
+    // not the suffix. Extract the unique suffix-level renames from the member
+    // renames data and generate cssvar rules for each.
+    {
+        let mut suffix_renames: BTreeMap<String, String> = BTreeMap::new();
+
+        // Primary source: function parameter (from --member-renames flag)
+        let effective_renames: &HashMap<String, String> = if member_renames.is_empty() {
+            // Fallback: report.member_renames (for --from-report case)
+            &report.member_renames
+        } else {
+            member_renames
+        };
+
+        for (old_name, new_name) in effective_renames {
+            // Extract the suffix — the part after the last underscore that
+            // starts with an uppercase letter (e.g., "PaddingTop" from
+            // "c_table__caption_PaddingTop")
+            let old_suffix = extract_trailing_suffix(old_name);
+            let new_suffix = extract_trailing_suffix(new_name);
+            if let (Some(old_s), Some(new_s)) = (old_suffix, new_suffix) {
+                if old_s != new_s {
+                    suffix_renames
+                        .entry(old_s.to_string())
+                        .or_insert_with(|| new_s.to_string());
+                }
+            }
+        }
+
+        if !suffix_renames.is_empty() {
+            eprintln!(
+                "Generating combined CSS logical property rule with {} suffix renames",
+                suffix_renames.len()
+            );
+
+            // Build a single pattern matching all physical property suffixes
+            let suffix_alts: Vec<String> = suffix_renames.keys().map(|s| regex_escape(s)).collect();
+            let combined_pattern = format!("--({})", suffix_alts.join("|"));
+
+            // Build mappings array with all from/to pairs
+            let mappings: Vec<MappingEntry> = suffix_renames
+                .iter()
+                .map(|(old_s, new_s)| MappingEntry {
+                    from: Some(format!("--{}", old_s)),
+                    to: Some(format!("--{}", new_s)),
+                    component: None,
+                    prop: None,
+                })
+                .collect();
+
+            // Build a human-readable message listing all renames
+            let mut message = format!(
+                "MIGRATION: {} CSS custom property suffixes have been renamed.\n\n\
+                 Rename mappings:\n",
+                suffix_renames.len()
+            );
+            for (old_s, new_s) in &suffix_renames {
+                message.push_str(&format!("  - --{}  →  --{}\n", old_s, new_s));
+            }
+            message.push_str("\nUpdate all CSS variable references to use the new suffixes.");
+
+            let rule_id = unique_id(
+                "semver-css-logical-property-renames".to_string(),
+                &mut id_counts,
+            );
+
+            let mut strategy = FixStrategyEntry::new("Rename");
+            strategy.mappings = mappings;
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=css-variable".to_string(),
+                    "has-codemod=true".to_string(),
+                ],
+                effort: 1,
+                category: "mandatory".to_string(),
+                description: format!("{} CSS variable suffixes renamed", suffix_renames.len()),
+                message,
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendCssVar {
+                    cssvar: FrontendPatternFields {
+                        pattern: combined_pattern,
+                    },
+                },
+                fix_strategy: Some(strategy),
+            });
+        }
     }
 
     // ── P2-A: Composition rules (parent/child nesting) ──────────────────
@@ -789,6 +1979,7 @@ pub fn generate_rules(
                     from: entry.package.clone(),
                 },
             },
+            fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
         });
     }
 
@@ -828,6 +2019,7 @@ pub fn generate_rules(
                     from: entry.package.clone(),
                 },
             },
+            fix_strategy: Some(FixStrategyEntry::rename(&entry.old_prop, &entry.new_prop)),
         });
     }
 
@@ -862,6 +2054,7 @@ pub fn generate_rules(
                     from: entry.package.clone(),
                 },
             },
+            fix_strategy: Some(FixStrategyEntry::new("Manual")),
         });
     }
 
@@ -892,6 +2085,7 @@ pub fn generate_rules(
                     from: entry.package.clone(),
                 },
             },
+            fix_strategy: Some(FixStrategyEntry::new("Manual")),
         });
     }
 
@@ -931,10 +2125,499 @@ pub fn generate_rules(
                     },
                 ],
             },
+            fix_strategy: Some(FixStrategyEntry::new("Manual")),
         });
     }
 
+    // ── New sibling component detection ─────────────────────────────────
+    //
+    // When a component has breaking changes AND a new sibling component was
+    // added, generate a composition rule suggesting the new component.
+    //
+    // V2 path: iterate report.packages[].components[].child_components.
+    // Legacy path: scan added_files + behavioral descriptions.
+    {
+        let has_child_components = report.packages.iter().any(|pkg| {
+            pkg.components
+                .iter()
+                .any(|comp| !comp.child_components.is_empty())
+        });
+
+        if has_child_components {
+            // V2 path: read from pre-aggregated child_components
+            for pkg in &report.packages {
+                for comp in &pkg.components {
+                    for child in &comp.child_components {
+                        if child.status != semver_analyzer_core::ChildComponentStatus::Added {
+                            continue;
+                        }
+
+                        let component_name = &comp.name;
+                        let new_component = &child.name;
+
+                        let mut msg = format!(
+                            "MIGRATION: Use <{}> inside <{}>.\n\n",
+                            new_component, component_name,
+                        );
+
+                        // Build prop migration instructions from AST data
+                        if !child.absorbed_props.is_empty() {
+                            // Categorize absorbed props by mechanism using
+                            // the parent's removal_disposition data
+                            let prop_dispositions: HashMap<
+                                &str,
+                                &semver_analyzer_core::RemovalDisposition,
+                            > = comp
+                                .removed_properties
+                                .iter()
+                                .filter_map(|rp| {
+                                    rp.removal_disposition
+                                        .as_ref()
+                                        .map(|d| (rp.name.as_str(), d))
+                                })
+                                .collect();
+
+                            let mut as_props = Vec::new();
+                            let mut as_children = Vec::new();
+
+                            for prop_name in &child.absorbed_props {
+                                match prop_dispositions.get(prop_name.as_str()) {
+                                    Some(
+                                        semver_analyzer_core::RemovalDisposition::MovedToChild {
+                                            mechanism,
+                                            ..
+                                        },
+                                    ) if mechanism == "children" => {
+                                        as_children.push(prop_name.as_str());
+                                    }
+                                    _ => {
+                                        if child.known_props.contains(prop_name) {
+                                            as_props.push(prop_name.as_str());
+                                        } else {
+                                            as_children.push(prop_name.as_str());
+                                        }
+                                    }
+                                }
+                            }
+
+                            msg.push_str(&format!(
+                                "These props were removed from <{}> and moved to <{}>:\n",
+                                component_name, new_component,
+                            ));
+                            for prop in &as_props {
+                                msg.push_str(&format!(
+                                    "  - {} → <{} {}={{...}}>\n",
+                                    prop, new_component, prop,
+                                ));
+                            }
+                            for prop in &as_children {
+                                msg.push_str(&format!(
+                                    "  - {} → <{}>{{{}value}}</{}>  (pass as children)\n",
+                                    prop, new_component, prop, new_component,
+                                ));
+                            }
+                            msg.push('\n');
+                        } else {
+                            msg.push_str(&format!(
+                                "<{}> is a new child component of <{}>.\n\
+                                 Wrap relevant content inside <{}>.\n\n",
+                                new_component, component_name, new_component,
+                            ));
+                        }
+
+                        msg.push_str(&format!(
+                            "Add {} to your import statement from the same package.",
+                            new_component,
+                        ));
+
+                        let base_id = format!(
+                            "semver-new-sibling-{}-in-{}",
+                            sanitize_id(new_component),
+                            sanitize_id(component_name),
+                        );
+                        let rule_id = unique_id(base_id, &mut id_counts);
+
+                        rules.push(KonveyorRule {
+                            rule_id,
+                            labels: vec![
+                                "source=semver-analyzer".to_string(),
+                                "change-type=new-sibling-component".to_string(),
+                                "has-codemod=false".to_string(),
+                            ],
+                            effort: 3,
+                            category: "optional".to_string(),
+                            description: format!(
+                                "New component <{}> may be needed alongside <{}>",
+                                new_component, component_name
+                            ),
+                            message: msg,
+                            links: Vec::new(),
+                            when: KonveyorCondition::FrontendReferenced {
+                                referenced: FrontendReferencedFields {
+                                    pattern: format!("^{}$", regex_escape(component_name)),
+                                    location: "IMPORT".to_string(),
+                                    component: None,
+                                    parent: None,
+                                    value: None,
+                                    from: Some(pkg.name.clone()),
+                                },
+                            },
+                            fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+                        });
+
+                        eprintln!(
+                            "Detected new sibling: <{}> added alongside modified <{}> (from packages data)",
+                            new_component, component_name
+                        );
+                    }
+                }
+            }
+        } else if !report.added_files.is_empty() {
+            // Legacy path: scan added_files + behavioral descriptions
+            let mut dir_to_added: HashMap<String, Vec<String>> = HashMap::new();
+            for added_path in &report.added_files {
+                let path_str = added_path.to_string_lossy();
+                if let (Some(dir), Some(file_stem)) = (
+                    added_path.parent().map(|p| p.to_string_lossy().to_string()),
+                    added_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string()),
+                ) {
+                    if file_stem.chars().next().map_or(false, |c| c.is_uppercase())
+                        && !path_str.contains(".d.ts")
+                    {
+                        dir_to_added.entry(dir).or_default().push(file_stem);
+                    }
+                }
+            }
+
+            let behavioral_added_refs: BTreeSet<String> = report
+                .changes
+                .iter()
+                .flat_map(|fc| &fc.breaking_behavioral_changes)
+                .filter_map(|b| {
+                    let desc = &b.description;
+                    if desc.contains("element added") || desc.contains("added to render output") {
+                        let start = desc.find('<')? + 1;
+                        let end = desc[start..].find('>')? + start;
+                        Some(desc[start..end].to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for file_changes in &report.changes {
+                let file_str = file_changes.file.to_string_lossy();
+                let dir = file_changes
+                    .file
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                if file_changes.breaking_api_changes.is_empty() {
+                    continue;
+                }
+
+                let component_name = file_changes
+                    .file
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                if !component_name
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_uppercase())
+                {
+                    continue;
+                }
+                if file_str.contains(".d.ts") {
+                    continue;
+                }
+
+                if let Some(added_siblings) = dir_to_added.get(&dir) {
+                    for new_component in added_siblings {
+                        if !behavioral_added_refs.contains(new_component.as_str()) {
+                            continue;
+                        }
+
+                        let mut msg = format!(
+                            "MIGRATION: <{}> may need to be used alongside <{}>.\n\n\
+                             <{}> is a new component added in this version. \
+                             Consumer code in examples and demos now uses <{}> \
+                             within <{}>.\n\n",
+                            new_component,
+                            component_name,
+                            new_component,
+                            new_component,
+                            component_name,
+                        );
+
+                        let breaking_summary: Vec<String> = file_changes
+                            .breaking_api_changes
+                            .iter()
+                            .take(5)
+                            .map(|c| format!("  - {}: {}", c.symbol, c.description))
+                            .collect();
+                        if !breaking_summary.is_empty() {
+                            msg.push_str(&format!(
+                                "Breaking changes on <{}>:\n{}\n\n",
+                                component_name,
+                                breaking_summary.join("\n"),
+                            ));
+                        }
+
+                        msg.push_str(&format!(
+                            "Consider wrapping children of <{}> in <{}>.\n\
+                             Add {} to your import statement from the same package.",
+                            component_name, new_component, new_component,
+                        ));
+
+                        let from_pkg = resolve_npm_package(&file_str, pkg_cache);
+
+                        let base_id = format!(
+                            "semver-new-sibling-{}-in-{}",
+                            sanitize_id(new_component),
+                            sanitize_id(&component_name),
+                        );
+                        let rule_id = unique_id(base_id, &mut id_counts);
+
+                        rules.push(KonveyorRule {
+                            rule_id,
+                            labels: vec![
+                                "source=semver-analyzer".to_string(),
+                                "change-type=new-sibling-component".to_string(),
+                                "has-codemod=false".to_string(),
+                            ],
+                            effort: 3,
+                            category: "optional".to_string(),
+                            description: format!(
+                                "New component <{}> may be needed alongside <{}>",
+                                new_component, component_name
+                            ),
+                            message: msg,
+                            links: Vec::new(),
+                            when: KonveyorCondition::FrontendReferenced {
+                                referenced: FrontendReferencedFields {
+                                    pattern: format!("^{}$", regex_escape(&component_name)),
+                                    location: "IMPORT".to_string(),
+                                    component: None,
+                                    parent: None,
+                                    value: None,
+                                    from: from_pkg,
+                                },
+                            },
+                            fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+                        });
+
+                        eprintln!(
+                            "Detected new sibling: <{}> added alongside modified <{}> (behavioral evidence found)",
+                            new_component, component_name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Post-generation: deduplicate behavioral rules ──
+    //
+    // When an API rule (especially a P0-C component-import-deprecated rule)
+    // already includes behavioral context in its message, standalone behavioral
+    // rules for the same component are redundant.  Downgrade them from
+    // LlmAssisted to Manual to avoid duplicate goose invocations.
+    {
+        let enriched_components: BTreeSet<String> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=component-removal")
+            })
+            .filter_map(|r| match &r.when {
+                KonveyorCondition::FrontendReferenced { referenced } => {
+                    let pat = &referenced.pattern;
+                    Some(
+                        pat.strip_prefix('^')
+                            .unwrap_or(pat)
+                            .strip_suffix('$')
+                            .unwrap_or(pat)
+                            .to_string(),
+                    )
+                }
+                _ => None,
+            })
+            .collect();
+
+        if !enriched_components.is_empty() {
+            let mut deduped = 0usize;
+            for rule in &mut rules {
+                let is_behavioral = rule
+                    .labels
+                    .iter()
+                    .any(|l| l.starts_with("change-type=behavioral"));
+                if !is_behavioral {
+                    continue;
+                }
+                // Extract the component name from the behavioral rule's pattern
+                let component = match &rule.when {
+                    KonveyorCondition::FrontendReferenced { referenced } => {
+                        let pat = &referenced.pattern;
+                        pat.strip_prefix('^')
+                            .unwrap_or(pat)
+                            .strip_suffix('$')
+                            .unwrap_or(pat)
+                            .to_string()
+                    }
+                    _ => continue,
+                };
+                if enriched_components.contains(&component) {
+                    if let Some(ref mut strat) = rule.fix_strategy {
+                        if strat.strategy == "LlmAssisted" {
+                            strat.strategy = "Manual".into();
+                            deduped += 1;
+                        }
+                    }
+                }
+            }
+            if deduped > 0 {
+                eprintln!(
+                    "Downgraded {} behavioral rules to Manual (covered by enriched API rules)",
+                    deduped
+                );
+            }
+        }
+    }
+
     rules
+}
+
+/// Generate Konveyor rules and fix strategies for dependency version updates.
+///
+/// For each package in the monorepo that has breaking changes, generates a rule
+/// that detects the package in the consumer's `package.json` dependencies and a
+/// fix strategy to update the version.
+///
+/// Returns `(rules, strategies)` where:
+/// - `rules` are Konveyor rules using `builtin.json` to detect the dependency
+/// - `strategies` maps rule IDs to `UpdateDependency` fix strategy entries
+pub fn generate_dependency_update_rules(
+    report: &AnalysisReport,
+    pkg_info_cache: &HashMap<String, PackageInfo>,
+) -> (Vec<KonveyorRule>, HashMap<String, FixStrategyEntry>) {
+    let mut rules = Vec::new();
+    let mut strategies = HashMap::new();
+
+    // Collect packages that have breaking changes
+    let mut packages_with_changes: HashMap<String, &PackageInfo> = HashMap::new();
+    for file_changes in &report.changes {
+        let file_str = file_changes.file.to_string_lossy();
+        let parts: Vec<&str> = file_str.split('/').collect();
+
+        if let Some(pkg_idx) = parts.iter().position(|&p| p == "packages") {
+            if let Some(pkg_dir_name) = parts.get(pkg_idx + 1) {
+                if let Some(info) = pkg_info_cache.get(*pkg_dir_name) {
+                    // Only include if the package has a version and breaking changes
+                    if info.version.is_some()
+                        && (!file_changes.breaking_api_changes.is_empty()
+                            || !file_changes.breaking_behavioral_changes.is_empty())
+                    {
+                        packages_with_changes
+                            .entry(info.name.clone())
+                            .or_insert(info);
+                    }
+                }
+            }
+        }
+    }
+
+    for (npm_name, info) in &packages_with_changes {
+        let version = match &info.version {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Generate a slug-safe rule ID from the package name
+        let slug = npm_name
+            .replace('@', "")
+            .replace('/', "-")
+            .replace('.', "-");
+        let rule_id = format!("semver-dep-update-{}", slug);
+
+        // Escape the package name for xpath — replace / with ~1 (JSON pointer encoding)
+        let xpath_name = npm_name.replace('/', "~1");
+
+        let new_version = format!("^{}", version);
+
+        // Match the package in all dependency fields of package.json:
+        // dependencies, devDependencies, peerDependencies, optionalDependencies,
+        // and resolution/override fields (yarn resolutions, npm overrides).
+        let dep_fields = [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+            "resolutions", // yarn classic
+            "overrides",   // npm
+        ];
+
+        let conditions: Vec<KonveyorCondition> = dep_fields
+            .iter()
+            .map(|field| KonveyorCondition::Json {
+                json: JsonFields {
+                    xpath: format!("//{}/{}", field, xpath_name),
+                    filepaths: Some("**/package.json".into()),
+                },
+            })
+            .collect();
+
+        rules.push(KonveyorRule {
+            rule_id: rule_id.clone(),
+            description: format!("Update {} to v{}", npm_name, version),
+            labels: vec![
+                "change-type=dependency-update".into(),
+                "has-codemod=true".into(),
+                "source=semver-analyzer".into(),
+            ],
+            effort: 1,
+            category: "mandatory".into(),
+            links: Vec::new(),
+            when: KonveyorCondition::Or { or: conditions },
+            message: format!(
+                "Update {} from current version to {}. \
+                 This package has breaking changes between {} and {}.\n\n\
+                 After updating package.json, regenerate your lockfile:\n\
+                 - npm: npm install\n\
+                 - yarn: yarn install\n\
+                 - pnpm: pnpm install",
+                npm_name, new_version, report.comparison.from_ref, report.comparison.to_ref,
+            ),
+            fix_strategy: Some(FixStrategyEntry::update_dependency(
+                npm_name.clone(),
+                new_version.clone(),
+            )),
+        });
+
+        strategies.insert(
+            rule_id,
+            FixStrategyEntry::update_dependency(npm_name.clone(), new_version),
+        );
+    }
+
+    if !rules.is_empty() {
+        eprintln!(
+            "Generated {} dependency update rules for: {}",
+            rules.len(),
+            packages_with_changes
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    (rules, strategies)
 }
 
 /// Analyze the report to find token object member keys and member renames.
@@ -1067,6 +2750,176 @@ pub fn suppress_redundant_token_rules(
     rules
 }
 
+/// Suppress redundant prop-level removal rules when a component-level
+/// `component-import-deprecated` rule already covers the same component.
+///
+/// When a component (e.g., Modal) has both:
+/// - a `component-import-deprecated` rule with `LlmAssisted` strategy
+/// - individual `RemoveProp` rules for its props (title, actions, etc.)
+///
+/// The `RemoveProp` rules are redundant and destructive — they delete props
+/// in the pattern phase before the LLM can do the structural rewrite.
+/// This function suppresses them.
+pub fn suppress_redundant_prop_rules(rules: Vec<KonveyorRule>) -> Vec<KonveyorRule> {
+    // Collect component names covered by component-import-deprecated rules
+    let covered: BTreeSet<String> = rules
+        .iter()
+        .filter(|r| r.rule_id.contains("component-import-deprecated"))
+        .filter_map(|r| {
+            // Extract the component name from the rule's IMPORT pattern.
+            // Pattern format: "^ComponentName$"
+            match &r.when {
+                KonveyorCondition::FrontendReferenced { referenced } => {
+                    let pat = &referenced.pattern;
+                    Some(
+                        pat.strip_prefix('^')
+                            .unwrap_or(pat)
+                            .strip_suffix('$')
+                            .unwrap_or(pat)
+                            .to_string(),
+                    )
+                }
+                _ => None,
+            }
+        })
+        .collect();
+
+    if covered.is_empty() {
+        return rules;
+    }
+
+    let before_count = rules.len();
+    let rules: Vec<KonveyorRule> = rules
+        .into_iter()
+        .filter(|rule| {
+            // Only suppress RemoveProp rules
+            let strategy = rule.fix_strategy.as_ref();
+            let is_remove_prop = strategy
+                .map(|s| s.strategy == "RemoveProp")
+                .unwrap_or(false);
+            if !is_remove_prop {
+                return true;
+            }
+            // Check if the target component is covered by a component-level rule.
+            // The strategy's `component` field holds the interface name (e.g., "Modal"
+            // or "ModalProps"). Strip the "Props" suffix to match the component name.
+            let target = strategy.and_then(|s| s.component.as_deref()).unwrap_or("");
+            let target_base = target.strip_suffix("Props").unwrap_or(target);
+            // If covered, suppress this rule
+            if covered.contains(target_base) {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    let suppressed = before_count - rules.len();
+    if suppressed > 0 {
+        eprintln!(
+            "Suppressed {} redundant prop removal rules (covered by component-import-deprecated)",
+            suppressed
+        );
+    }
+
+    rules
+}
+
+/// Suppress `prop-value-change` rules that overlap with `type-changed` rules
+/// for the same component/prop/value.
+///
+/// When a property's union type changes (e.g., Button.variant loses 'tertiary'),
+/// two rule paths can fire:
+/// 1. A `type-changed` rule from the per-value virtual file (with `value` constraint)
+/// 2. A `prop-value-change` rule from the main props file (also with `value` constraint)
+///
+/// These produce byte-for-byte identical triggers. The `type-changed` rule has
+/// richer context (full before/after type), so it wins.
+pub fn suppress_redundant_prop_value_rules(rules: Vec<KonveyorRule>) -> Vec<KonveyorRule> {
+    // Build a set of (component_pattern, prop_pattern, value) from type-changed rules
+    // that have a value constraint.
+    let mut type_changed_triggers: HashSet<(String, String, String)> = HashSet::new();
+
+    for rule in &rules {
+        let is_type_changed = rule.labels.iter().any(|l| l == "change-type=type-changed");
+        if !is_type_changed {
+            continue;
+        }
+
+        // Extract triggers from the rule's when condition
+        let refs = extract_frontend_refs(&rule.when);
+        for cond in refs {
+            if let (Some(component), Some(value)) = (&cond.component, &cond.value) {
+                if cond.location == "JSX_PROP" {
+                    type_changed_triggers.insert((
+                        component.clone(),
+                        cond.pattern.clone(),
+                        value.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    if type_changed_triggers.is_empty() {
+        return rules;
+    }
+
+    let before_count = rules.len();
+    let rules: Vec<KonveyorRule> = rules
+        .into_iter()
+        .filter(|rule| {
+            let is_prop_value = rule
+                .labels
+                .iter()
+                .any(|l| l == "change-type=prop-value-change");
+            if !is_prop_value {
+                return true;
+            }
+
+            // Check if ALL of this rule's triggers are covered by type-changed rules
+            let refs = extract_frontend_refs(&rule.when);
+            if refs.is_empty() {
+                return true;
+            }
+
+            let all_covered = refs.iter().all(|cond| {
+                if let (Some(component), Some(value)) = (&cond.component, &cond.value) {
+                    type_changed_triggers.contains(&(
+                        component.clone(),
+                        cond.pattern.clone(),
+                        value.clone(),
+                    ))
+                } else {
+                    false
+                }
+            });
+
+            !all_covered
+        })
+        .collect();
+
+    let suppressed = before_count - rules.len();
+    if suppressed > 0 {
+        eprintln!(
+            "Suppressed {} redundant prop-value-change rules (covered by type-changed)",
+            suppressed
+        );
+    }
+
+    rules
+}
+
+/// Extract all `FrontendReferencedFields` from a `KonveyorCondition`,
+/// recursing into `Or`/`And` combinators.
+fn extract_frontend_refs(condition: &KonveyorCondition) -> Vec<&FrontendReferencedFields> {
+    match condition {
+        KonveyorCondition::FrontendReferenced { referenced } => vec![referenced],
+        KonveyorCondition::Or { or } => or.iter().flat_map(extract_frontend_refs).collect(),
+        KonveyorCondition::And { and } => and.iter().flat_map(extract_frontend_refs).collect(),
+        _ => vec![],
+    }
+}
+
 /// Consolidate rules by grouping related changes into composite rules.
 /// Consolidate rules by grouping related rules into single combined rules.
 ///
@@ -1146,6 +2999,16 @@ fn consolidation_key(rule: &KonveyorRule) -> String {
         }
     }
 
+    // Rules with these change types should NOT be consolidated — they are
+    // standalone rules with specific conditions that would be lost in merging.
+    // Use the rule_id as the key to prevent any grouping.
+    match change_type {
+        "css-variable" | "new-sibling-component" | "component-removal" | "dependency-update" => {
+            return rule.rule_id.clone();
+        }
+        _ => {}
+    }
+
     format!("{}-{}-{}", file_key, kind, change_type)
 }
 
@@ -1156,9 +3019,32 @@ fn consolidation_key(rule: &KonveyorRule) -> String {
 /// is not readable (e.g., when working from a report without the repo present).
 ///
 /// Also handles `/deprecated/` and `/next/` subpaths by appending them.
+/// Information about a package discovered in the monorepo.
+#[derive(Debug, Clone)]
+pub struct PackageInfo {
+    /// npm package name (e.g., "@patternfly/react-core").
+    pub name: String,
+    /// Package version at the new ref (read from disk).
+    pub version: Option<String>,
+}
+
 pub fn build_package_name_cache(report: &AnalysisReport) -> HashMap<String, String> {
-    let mut cache: HashMap<String, String> = HashMap::new();
+    let full_cache = build_package_info_cache(report);
+    full_cache
+        .into_iter()
+        .map(|(dir, info)| (dir, info.name))
+        .collect()
+}
+
+/// Build a cache of package directory name -> PackageInfo (name + version).
+///
+/// Reads package.json from the to_ref (new version) using `git show` to get
+/// the target version for dependency update rules. Falls back to reading from
+/// disk if git fails.
+pub fn build_package_info_cache(report: &AnalysisReport) -> HashMap<String, PackageInfo> {
+    let mut cache: HashMap<String, PackageInfo> = HashMap::new();
     let repo_path = &report.repository;
+    let to_ref = &report.comparison.to_ref;
 
     for file_changes in &report.changes {
         let file_str = file_changes.file.to_string_lossy();
@@ -1170,29 +3056,80 @@ pub fn build_package_name_cache(report: &AnalysisReport) -> HashMap<String, Stri
                     continue;
                 }
 
-                // Try to read package.json from the repo
-                let pkg_dir = repo_path.join("packages").join(pkg_dir_name);
-                let pkg_json_path = pkg_dir.join("package.json");
+                // Read package.json at the to_ref to get the target version.
+                // Use `git show <ref>:path` to avoid depending on the checkout state.
+                let pkg_json_git_path = format!("packages/{}/package.json", pkg_dir_name);
+                let (npm_name, npm_version) =
+                    read_package_json_at_ref(repo_path, to_ref, &pkg_json_git_path)
+                        .or_else(|| {
+                            // Fallback: read from disk (current checkout)
+                            let pkg_json_path = repo_path
+                                .join("packages")
+                                .join(pkg_dir_name)
+                                .join("package.json");
+                            read_package_json_from_file(&pkg_json_path)
+                        })
+                        .unwrap_or((None, None));
 
-                let npm_name = if let Ok(content) = std::fs::read_to_string(&pkg_json_path) {
-                    serde_json::from_str::<serde_json::Value>(&content)
-                        .ok()
-                        .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
-                } else {
-                    None
+                let info = PackageInfo {
+                    name: npm_name.unwrap_or_else(|| pkg_dir_name.to_string()),
+                    version: npm_version,
                 };
-
-                let name = npm_name.unwrap_or_else(|| pkg_dir_name.to_string());
-                cache.insert(pkg_dir_name.to_string(), name);
+                cache.insert(pkg_dir_name.to_string(), info);
             }
         }
     }
 
     if !cache.is_empty() {
-        eprintln!("Package name cache: {:?}", cache);
+        eprintln!(
+            "Package info cache: {:?}",
+            cache
+                .iter()
+                .map(|(k, v)| format!(
+                    "{}: {} ({})",
+                    k,
+                    v.name,
+                    v.version.as_deref().unwrap_or("?")
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 
     cache
+}
+
+/// Read package.json at a specific git ref using `git show`.
+/// Returns (name, version) tuple.
+fn read_package_json_at_ref(
+    repo_path: &std::path::Path,
+    git_ref: &str,
+    pkg_json_path: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    let output = std::process::Command::new("git")
+        .args(["show", &format!("{}:{}", git_ref, pkg_json_path)])
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let content = String::from_utf8(output.stdout).ok()?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    let name = parsed.get("name")?.as_str().map(|s| s.to_string());
+    let version = parsed.get("version")?.as_str().map(|s| s.to_string());
+    Some((name, version))
+}
+
+/// Read package.json from a file path on disk.
+/// Returns (name, version) tuple.
+fn read_package_json_from_file(path: &std::path::Path) -> Option<(Option<String>, Option<String>)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    let name = parsed.get("name")?.as_str().map(|s| s.to_string());
+    let version = parsed.get("version")?.as_str().map(|s| s.to_string());
+    Some((name, version))
 }
 
 /// Look up the npm package name for a file path using the cache.
@@ -1266,30 +3203,31 @@ fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
     }
     let labels: Vec<String> = all_labels.into_iter().collect();
     let descriptions: Vec<&str> = group.iter().map(|r| r.description.as_str()).collect();
-    let unique_descriptions: Vec<&str> = {
+
+    // Build the merged message using the FULL message content from each sub-rule
+    // (not just the short description), formatted as numbered steps so the LLM
+    // can process each migration instruction independently.
+    let unique_messages: Vec<&str> = {
         let mut seen = BTreeSet::new();
-        descriptions
+        group
             .iter()
-            .filter(|d| seen.insert(**d))
-            .copied()
+            .map(|r| r.message.as_str())
+            .filter(|m| seen.insert(*m))
             .collect()
     };
-    let message = if unique_descriptions.len() <= 5 {
-        unique_descriptions
-            .iter()
-            .map(|d| format!("- {}", d))
-            .collect::<Vec<_>>()
-            .join("\n")
+    let message = if unique_messages.len() == 1 {
+        unique_messages[0].to_string()
     } else {
-        let shown: Vec<String> = unique_descriptions[..4]
-            .iter()
-            .map(|d| format!("- {}", d))
-            .collect();
-        format!(
-            "{}\n- ... and {} more changes",
-            shown.join("\n"),
-            unique_descriptions.len() - 4
-        )
+        let total = unique_messages.len();
+        let mut parts = Vec::new();
+        parts.push(format!(
+            "This rule contains {} migration steps. Apply each one independently:\n",
+            total
+        ));
+        for (i, msg) in unique_messages.iter().enumerate() {
+            parts.push(format!("Step {} of {}:\n{}\n", i + 1, total, msg));
+        }
+        parts.join("\n")
     };
     let description = format!("{} related changes", count);
     let rule_id = format!("{}-group-{}", first_rule_id, count);
@@ -1301,23 +3239,22 @@ fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
         && labels.iter().any(|l| l == "change-type=removed")
         && labels.iter().any(|l| l == "kind=constant");
 
+    // Extract strategies before consuming the group
+    let all_strategies: Vec<Option<FixStrategyEntry>> =
+        group.iter().map(|r| r.fix_strategy.clone()).collect();
+
     let when = if is_large_removed_constant {
-        // Extract symbol names from descriptions to find common prefix
         let symbols: Vec<&str> = descriptions
             .iter()
             .filter_map(|d| d.split('`').nth(1))
             .collect();
         let pattern = build_common_prefix_pattern(&symbols);
 
-        // Try to extract the package name from the labels (package=@scope/name)
         let from_pkg: Option<String> = labels
             .iter()
             .find(|l| l.starts_with("package="))
             .map(|l| l.strip_prefix("package=").unwrap_or("").to_string());
 
-        // If we have a package scope, use frontend.referenced with IMPORT location
-        // This matches exactly how the hand-crafted rules work:
-        //   frontend.referenced: { pattern: "^c_[a-z]", location: IMPORT, from: "@patternfly/react-tokens" }
         if from_pkg.is_some() {
             KonveyorCondition::FrontendReferenced {
                 referenced: FrontendReferencedFields {
@@ -1353,6 +3290,63 @@ fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
         }
     };
 
+    // Merge fix strategies: collect all strategies of the highest-priority
+    // type and combine their mappings.
+    let fix_strategy = {
+        let strats: Vec<FixStrategyEntry> = all_strategies.into_iter().filter_map(|s| s).collect();
+        if strats.is_empty() {
+            None
+        } else if strats.len() == 1 {
+            Some(strats.into_iter().next().unwrap())
+        } else {
+            // Find best strategy type by priority.
+            let mut best = strats[0].strategy.clone();
+            let mut best_prio = strategy_priority(&best);
+            for s in &strats {
+                let p = strategy_priority(&s.strategy);
+                if p > best_prio {
+                    best_prio = p;
+                    best = s.strategy.clone();
+                }
+            }
+            // Override: if any entry is LlmAssisted with structural migration
+            // data (member_mappings), it wins regardless of priority. Removing
+            // props individually (RemoveProp) is destructive when the component
+            // has a known migration target that needs structural rewriting.
+            let has_structural_migration = strats
+                .iter()
+                .any(|s| s.strategy == "LlmAssisted" && !s.member_mappings.is_empty());
+            if has_structural_migration {
+                best = "LlmAssisted".to_string();
+            }
+            // Collect mappings from matching-type entries only
+            let matching: Vec<&FixStrategyEntry> =
+                strats.iter().filter(|s| s.strategy == best).collect();
+            let mappings: Vec<MappingEntry> = matching.iter().map(|s| s.to_mapping()).collect();
+            // Prefer the entry with migration data (member_mappings) when
+            // consolidating, so structural migration metadata isn't lost.
+            let primary = matching
+                .iter()
+                .find(|s| !s.member_mappings.is_empty())
+                .copied()
+                .unwrap_or(matching[0]);
+            Some(FixStrategyEntry {
+                strategy: best,
+                from: primary.from.clone(),
+                to: primary.to.clone(),
+                component: primary.component.clone(),
+                prop: primary.prop.clone(),
+                mappings,
+                member_mappings: primary.member_mappings.clone(),
+                removed_members: primary.removed_members.clone(),
+                replacement: primary.replacement.clone(),
+                overlap_ratio: primary.overlap_ratio,
+                package: primary.package.clone(),
+                new_version: primary.new_version.clone(),
+            })
+        }
+    };
+
     KonveyorRule {
         rule_id,
         labels,
@@ -1362,6 +3356,21 @@ fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
         message,
         links: Vec::new(),
         when,
+        fix_strategy,
+    }
+}
+
+/// Priority for fix strategy type. Higher = more actionable.
+fn strategy_priority(strategy: &str) -> u8 {
+    match strategy {
+        "Rename" => 5,
+        "RemoveProp" => 4,
+        "CssVariablePrefix" => 4,
+        "ImportPathChange" => 3,
+        "PropValueChange" => 2,
+        "PropTypeChange" => 2,
+        "LlmAssisted" => 1,
+        _ => 0,
     }
 }
 
@@ -1449,6 +3458,19 @@ fn detect_css_prefix_changes(report: &AnalysisReport) -> Vec<(String, String)> {
     results
 }
 
+/// Increment the version number in a CSS prefix string.
+///
+/// `"pf-v5-"` → `"pf-v6-"`, `"--pf-v5-"` → `"--pf-v6-"`.
+/// If no version pattern is found, returns the input unchanged.
+fn increment_version_prefix(prefix: &str) -> String {
+    let re = regex::Regex::new(r"v(\d+)").unwrap();
+    re.replace(prefix, |caps: &regex::Captures| {
+        let ver: u32 = caps[1].parse().unwrap_or(0);
+        format!("v{}", ver + 1)
+    })
+    .to_string()
+}
+
 fn dedup_conditions(conditions: Vec<KonveyorCondition>) -> Vec<KonveyorCondition> {
     let mut seen = BTreeSet::new();
     let mut unique = Vec::new();
@@ -1461,108 +3483,18 @@ fn dedup_conditions(conditions: Vec<KonveyorCondition>) -> Vec<KonveyorCondition
     unique
 }
 
-/// Generate fix strategy mappings from an AnalysisReport.
-pub fn generate_fix_strategies(
-    report: &AnalysisReport,
-    rules: &[KonveyorRule],
-    rename_patterns: &RenamePatterns,
-    member_renames: &HashMap<String, String>,
-) -> HashMap<String, FixStrategyEntry> {
-    let mut strategies = HashMap::new();
-    let mut rule_idx = 0;
-    for file_changes in &report.changes {
-        let file_path = file_changes.file.to_string_lossy();
-        for api_change in &file_changes.breaking_api_changes {
-            if rule_idx < rules.len() {
-                if let Some(entry) =
-                    api_change_to_strategy(api_change, rename_patterns, member_renames, &file_path)
-                {
-                    strategies.insert(rules[rule_idx].rule_id.clone(), entry);
-                }
-                rule_idx += 1;
-            }
-        }
-        for _behavioral in &file_changes.breaking_behavioral_changes {
-            if rule_idx < rules.len() {
-                strategies.insert(
-                    rules[rule_idx].rule_id.clone(),
-                    FixStrategyEntry {
-                        strategy: "LlmAssisted".into(),
-                        from: None,
-                        to: None,
-                        component: None,
-                        prop: None,
-                    },
-                );
-            }
-            rule_idx += 1;
-        }
-    }
-    for _manifest in &report.manifest_changes {
-        if rule_idx < rules.len() {
-            strategies.insert(
-                rules[rule_idx].rule_id.clone(),
-                FixStrategyEntry {
-                    strategy: "Manual".into(),
-                    from: None,
-                    to: None,
-                    component: None,
-                    prop: None,
-                },
-            );
-        }
-        rule_idx += 1;
-    }
-
-    // Also add strategies for synthetic rules (composition, prop renames,
-    // value reviews, component warnings, missing imports) that are generated
-    // after the report iteration.  These rules start after rule_idx.
-    for rule in rules.iter().skip(rule_idx) {
-        let change_type = rule
-            .labels
-            .iter()
-            .find(|l| l.starts_with("change-type="))
-            .map(|l| l.strip_prefix("change-type=").unwrap_or(""))
-            .unwrap_or("");
-        let entry = match change_type {
-            "composition" | "prop-rename" => {
-                // Extract from/to from the rule description if possible
-                let from = rule.description.split('\'').nth(1).map(String::from);
-                let to = rule.description.split('\'').nth(3).map(String::from);
-                FixStrategyEntry {
-                    strategy: "Rename".into(),
-                    from,
-                    to,
-                    component: None,
-                    prop: None,
-                }
-            }
-            "prop-value-review" | "component-warning" | "missing-import" => FixStrategyEntry {
-                strategy: "Manual".into(),
-                from: None,
-                to: None,
-                component: None,
-                prop: None,
-            },
-            "component-removal" => FixStrategyEntry {
-                strategy: "LlmAssisted".into(),
-                from: None,
-                to: None,
-                component: None,
-                prop: None,
-            },
-            _ => FixStrategyEntry {
-                strategy: "Manual".into(),
-                from: None,
-                to: None,
-                component: None,
-                prop: None,
-            },
-        };
-        strategies.insert(rule.rule_id.clone(), entry);
-    }
-
-    strategies
+/// Extract fix strategies from the final (post-consolidation) rules.
+///
+/// Returns a map of rule_id -> FixStrategyEntry ready to write to JSON.
+pub fn extract_fix_strategies(rules: &[KonveyorRule]) -> HashMap<String, FixStrategyEntry> {
+    rules
+        .iter()
+        .filter_map(|r| {
+            r.fix_strategy
+                .as_ref()
+                .map(|s| (r.rule_id.clone(), s.clone()))
+        })
+        .collect()
 }
 
 /// Write fix strategies JSON to the fix-guidance directory.
@@ -1577,8 +3509,34 @@ pub fn write_fix_strategies(
     Ok(())
 }
 
+/// A single from/to mapping within a consolidated fix strategy.
+#[derive(Debug, Clone, Serialize)]
+pub struct MappingEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prop: Option<String>,
+}
+
+/// A member-level mapping entry for structural migration strategies.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemberMappingEntry {
+    pub old_name: String,
+    pub new_name: String,
+}
+
 /// A machine-readable fix strategy entry.
-#[derive(Debug, Serialize)]
+///
+/// For non-consolidated rules, `from`/`to` hold the single mapping.
+/// For consolidated rules, `mappings` holds all individual mappings from the
+/// merged rules, allowing the fix engine to apply all renames/removals.
+/// For structural migration rules, `member_mappings` and `removed_members`
+/// describe the member-level overlap between removed and replacement interfaces.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct FixStrategyEntry {
     pub strategy: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1589,6 +3547,107 @@ pub struct FixStrategyEntry {
     pub component: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prop: Option<String>,
+    /// All individual mappings when this strategy was merged from multiple rules.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub mappings: Vec<MappingEntry>,
+    /// Structural migration: matching member mappings between removed and replacement.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub member_mappings: Vec<MemberMappingEntry>,
+    /// Structural migration: member names only in the removed interface (no match).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub removed_members: Vec<String>,
+    /// Structural migration: the replacement symbol name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+    /// Structural migration: overlap ratio between removed and replacement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlap_ratio: Option<f64>,
+    /// Dependency update: npm package name (e.g., "@patternfly/react-core").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    /// Dependency update: new version range (e.g., "^6.1.0").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_version: Option<String>,
+}
+
+impl FixStrategyEntry {
+    /// Create a new strategy entry with only the strategy type set.
+    pub fn new(strategy: &str) -> Self {
+        Self {
+            strategy: strategy.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Create a Rename strategy with a single from/to pair.
+    pub fn rename(from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            strategy: "Rename".into(),
+            from: Some(from.into()),
+            to: Some(to.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Create a strategy with from/to and a named strategy type.
+    pub fn with_from_to(strategy: &str, from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            strategy: strategy.into(),
+            from: Some(from.into()),
+            to: Some(to.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Create a RemoveProp strategy.
+    pub fn remove_prop(component: impl Into<String>, prop: impl Into<String>) -> Self {
+        Self {
+            strategy: "RemoveProp".into(),
+            component: Some(component.into()),
+            prop: Some(prop.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Create an LlmAssisted strategy enriched with structural migration data.
+    pub fn structural_migration(
+        removed_symbol: &str,
+        replacement_symbol: &str,
+        member_mappings: Vec<MemberMappingEntry>,
+        removed_members: Vec<String>,
+        overlap_ratio: f64,
+    ) -> Self {
+        Self {
+            strategy: "LlmAssisted".into(),
+            from: Some(removed_symbol.into()),
+            to: Some(replacement_symbol.into()),
+            member_mappings,
+            removed_members,
+            replacement: Some(replacement_symbol.into()),
+            overlap_ratio: Some(overlap_ratio),
+            ..Default::default()
+        }
+    }
+
+    /// Create an UpdateDependency strategy for a package version bump.
+    pub fn update_dependency(package: impl Into<String>, new_version: impl Into<String>) -> Self {
+        Self {
+            strategy: "UpdateDependency".into(),
+            package: Some(package.into()),
+            new_version: Some(new_version.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Convert to a MappingEntry (extracting the single mapping).
+    pub fn to_mapping(&self) -> MappingEntry {
+        MappingEntry {
+            from: self.from.clone(),
+            to: self.to.clone(),
+            component: self.component.clone(),
+            prop: self.prop.clone(),
+        }
+    }
 }
 
 fn api_change_to_strategy(
@@ -1602,141 +3661,99 @@ fn api_change_to_strategy(
             let before = change.before.as_deref().unwrap_or("");
             let after = change.after.as_deref().unwrap_or("");
             if after.contains("/deprecated/") && !before.contains("/deprecated/") {
-                return Some(FixStrategyEntry {
-                    strategy: "ImportPathChange".into(),
-                    from: extract_package_path(before),
-                    to: extract_package_path(after),
-                    component: None,
-                    prop: None,
-                });
+                let mut e = FixStrategyEntry::new("ImportPathChange");
+                e.from = extract_package_path(before);
+                e.to = extract_package_path(after);
+                return Some(e);
             }
             if before == after || extract_leaf_symbol(before) == extract_leaf_symbol(after) {
                 let fp = extract_package_path(before);
                 let tp = extract_package_path(after);
                 if fp.is_some() && tp.is_some() && fp != tp {
-                    return Some(FixStrategyEntry {
-                        strategy: "ImportPathChange".into(),
-                        from: fp,
-                        to: tp,
-                        component: None,
-                        prop: None,
-                    });
+                    let mut e = FixStrategyEntry::new("ImportPathChange");
+                    e.from = fp;
+                    e.to = tp;
+                    return Some(e);
                 }
             }
-            Some(FixStrategyEntry {
-                strategy: "Rename".into(),
-                from: Some(extract_leaf_symbol(before).into()),
-                to: Some(extract_leaf_symbol(after).into()),
-                component: None,
-                prop: None,
-            })
+            Some(FixStrategyEntry::rename(
+                extract_leaf_symbol(before),
+                extract_leaf_symbol(after),
+            ))
         }
         ApiChangeType::TypeChanged | ApiChangeType::SignatureChanged => {
             // Union member value change
             if let Some(ref before) = change.before {
-                if (before.starts_with('\'') && before.ends_with('\''))
-                    || (before.starts_with('"') && before.ends_with('"'))
-                {
+                if is_single_quoted_value(before) {
                     let value = &before[1..before.len() - 1];
-                    let (component, prop) = if change.symbol.contains('.') {
-                        let parts: Vec<&str> = change.symbol.splitn(2, '.').collect();
-                        (Some(parts[0].to_string()), Some(parts[1].to_string()))
-                    } else {
-                        (None, None)
-                    };
-                    return Some(FixStrategyEntry {
-                        strategy: "PropValueChange".into(),
-                        from: Some(value.into()),
-                        to: None,
-                        component,
-                        prop,
-                    });
+                    let (component, prop) = extract_component_prop(&change.symbol);
+                    let mut e = FixStrategyEntry::new("PropValueChange");
+                    e.from = Some(value.into());
+                    e.component = component;
+                    e.prop = prop;
+                    return Some(e);
                 }
             }
             // CSS variable prefix change
             if let Some((fp, tp)) = detect_version_prefix(&change.description) {
-                return Some(FixStrategyEntry {
-                    strategy: "CssVariablePrefix".into(),
-                    from: Some(fp),
-                    to: Some(tp),
-                    component: None,
-                    prop: None,
-                });
+                return Some(FixStrategyEntry::with_from_to("CssVariablePrefix", fp, tp));
             }
-            let (component, prop) = if change.symbol.contains('.') {
-                let parts: Vec<&str> = change.symbol.splitn(2, '.').collect();
-                (Some(parts[0].to_string()), Some(parts[1].to_string()))
-            } else {
-                (None, None)
-            };
-            Some(FixStrategyEntry {
-                strategy: "PropTypeChange".into(),
-                from: change.before.clone(),
-                to: change.after.clone(),
-                component,
-                prop,
-            })
+            let (component, prop) = extract_component_prop(&change.symbol);
+            let mut e = FixStrategyEntry::new("PropTypeChange");
+            e.from = change.before.clone();
+            e.to = change.after.clone();
+            e.component = component;
+            e.prop = prop;
+            Some(e)
         }
         ApiChangeType::Removed => {
+            // Check for structural migration target first.
+            if let Some(ref target) = change.migration_target {
+                let member_mappings = target
+                    .matching_members
+                    .iter()
+                    .map(|m| MemberMappingEntry {
+                        old_name: m.old_name.clone(),
+                        new_name: m.new_name.clone(),
+                    })
+                    .collect();
+                return Some(FixStrategyEntry::structural_migration(
+                    &target.removed_symbol,
+                    &target.replacement_symbol,
+                    member_mappings,
+                    target.removed_only_members.clone(),
+                    target.overlap_ratio,
+                ));
+            }
+
             if matches!(change.kind, ApiChangeKind::Property | ApiChangeKind::Field) {
-                let (component, prop) = if change.symbol.contains('.') {
-                    let parts: Vec<&str> = change.symbol.splitn(2, '.').collect();
-                    (Some(parts[0].into()), Some(parts[1].into()))
-                } else {
-                    (None, Some(change.symbol.clone()))
-                };
-                Some(FixStrategyEntry {
-                    strategy: "RemoveProp".into(),
-                    from: None,
-                    to: None,
-                    component,
-                    prop,
-                })
+                let (component, prop) = extract_component_prop(&change.symbol);
+                let mut e = FixStrategyEntry::new("RemoveProp");
+                e.component = component;
+                e.prop = prop.or_else(|| Some(change.symbol.clone()));
+                Some(e)
             } else if let Some(new_name) = member_renames.get(&change.symbol) {
-                // Member rename derived from parent token object diff
-                Some(FixStrategyEntry {
-                    strategy: "Rename".into(),
-                    from: Some(change.symbol.clone()),
-                    to: Some(new_name.clone()),
-                    component: None,
-                    prop: None,
-                })
+                Some(FixStrategyEntry::rename(&change.symbol, new_name))
             } else if let Some(replacement) = rename_patterns.find_replacement(&change.symbol) {
-                // User-supplied rename pattern matched
-                Some(FixStrategyEntry {
-                    strategy: "Rename".into(),
-                    from: Some(change.symbol.clone()),
-                    to: Some(replacement),
-                    component: None,
-                    prop: None,
-                })
+                Some(FixStrategyEntry::rename(&change.symbol, &replacement))
             } else if file_path.contains("/deprecated/") {
-                // Symbol from a deprecated path that was fully removed.
-                // The LLM can suggest the replacement component.
-                Some(FixStrategyEntry {
-                    strategy: "LlmAssisted".into(),
-                    from: Some(change.symbol.clone()),
-                    to: None,
-                    component: None,
-                    prop: None,
-                })
+                let mut e = FixStrategyEntry::new("LlmAssisted");
+                e.from = Some(change.symbol.clone());
+                Some(e)
             } else {
-                Some(FixStrategyEntry {
-                    strategy: "Manual".into(),
-                    from: None,
-                    to: None,
-                    component: None,
-                    prop: None,
-                })
+                Some(FixStrategyEntry::new("Manual"))
             }
         }
-        ApiChangeType::VisibilityChanged => Some(FixStrategyEntry {
-            strategy: "Manual".into(),
-            from: None,
-            to: None,
-            component: None,
-            prop: None,
-        }),
+        ApiChangeType::VisibilityChanged => Some(FixStrategyEntry::new("Manual")),
+    }
+}
+
+fn extract_component_prop(symbol: &str) -> (Option<String>, Option<String>) {
+    if symbol.contains('.') {
+        let parts: Vec<&str> = symbol.splitn(2, '.').collect();
+        (Some(parts[0].to_string()), Some(parts[1].to_string()))
+    } else {
+        (None, None)
     }
 }
 
@@ -1929,7 +3946,7 @@ pub fn write_fix_guidance_dir(
 ///
 /// `./my-rules` → `./fix-guidance`
 /// `./output/rules` → `./output/fix-guidance`
-pub fn fix_guidance_dir_for(output_dir: &Path) -> std::path::PathBuf {
+fn fix_guidance_dir_for(output_dir: &Path) -> std::path::PathBuf {
     let parent = output_dir.parent().unwrap_or(Path::new("."));
     parent.join("fix-guidance")
 }
@@ -1942,6 +3959,8 @@ fn api_change_to_rules(
     file_pattern: &str,
     from_pkg: Option<&str>,
     id_counts: &mut HashMap<String, usize>,
+    rename_patterns: &RenamePatterns,
+    member_renames: &HashMap<String, String>,
 ) -> Vec<KonveyorRule> {
     let file_path = file_changes.file.display().to_string();
     let leaf_symbol = extract_leaf_symbol(&change.symbol);
@@ -1956,7 +3975,44 @@ fn api_change_to_rules(
     );
     let rule_id = unique_id(base_id.clone(), id_counts);
 
-    let message = build_api_message(change, &file_path);
+    let mut message = build_api_message(change, &file_path);
+
+    // Enrich with behavioral context from the same file for this component.
+    // This gives the LLM information about DOM/CSS/rendering changes alongside
+    // the API removal/rename information.
+    let component_symbol = if change.symbol.contains('.') {
+        change.symbol.split('.').next().unwrap_or(leaf_symbol)
+    } else {
+        leaf_symbol
+    };
+    // Also match without "Props" suffix (e.g., "ModalProps" → also match "Modal")
+    let component_base = component_symbol
+        .strip_suffix("Props")
+        .unwrap_or(component_symbol);
+    let behavioral_context: Vec<String> = file_changes
+        .breaking_behavioral_changes
+        .iter()
+        .filter(|b| {
+            b.symbol == component_symbol
+                || b.symbol == component_base
+                || b.symbol.starts_with(&format!("{}.", component_symbol))
+                || b.symbol.starts_with(&format!("{}.", component_base))
+        })
+        .map(|b| {
+            let cat = b
+                .category
+                .as_ref()
+                .map(|c| behavioral_category_label(c))
+                .unwrap_or("change");
+            format!("{}: {}", cat, b.description)
+        })
+        .collect();
+    if !behavioral_context.is_empty() {
+        message.push_str("\n\nBehavioral changes:\n");
+        for desc in &behavioral_context {
+            message.push_str(&format!("  - {}\n", desc));
+        }
+    }
 
     let mut labels = vec![
         "source=semver-analyzer".to_string(),
@@ -1964,7 +4020,6 @@ fn api_change_to_rules(
         format!("kind={}", api_kind_label(&change.kind)),
     ];
 
-    // Infer has-codemod from the change type
     let has_codemod = matches!(
         change.change,
         ApiChangeType::Renamed | ApiChangeType::SignatureChanged | ApiChangeType::TypeChanged
@@ -1976,6 +4031,7 @@ fn api_change_to_rules(
     }
 
     let condition = build_frontend_condition(change, leaf_symbol, from_pkg);
+    let fix_strategy = api_change_to_strategy(change, rename_patterns, member_renames, &file_path);
 
     let mut rules = vec![KonveyorRule {
         rule_id,
@@ -1986,6 +4042,7 @@ fn api_change_to_rules(
         message,
         links: Vec::new(),
         when: condition,
+        fix_strategy,
     }];
 
     // P4-B: For type_changed Property/Field changes, check for removed union
@@ -2037,6 +4094,7 @@ fn api_change_to_rules(
                             from: from.clone(),
                         },
                     },
+                    fix_strategy: Some(FixStrategyEntry::new("PropValueChange")),
                 });
             }
         }
@@ -2051,7 +4109,13 @@ fn behavioral_change_to_rule(
     file_pattern: &str,
     from_pkg: Option<&str>,
     id_counts: &mut HashMap<String, usize>,
-) -> KonveyorRule {
+) -> Option<KonveyorRule> {
+    // Skip internal-only changes -- these affect internal rendering
+    // and don't require consumer code changes.
+    if change.is_internal_only == Some(true) {
+        return None;
+    }
+
     let file_path = file_changes.file.display().to_string();
     // For dotted symbols like "NavList.render", use the component name (first
     // part) for JSX_COMPONENT matching.  The leaf ("render") is the method that
@@ -2129,7 +4193,7 @@ fn behavioral_change_to_rule(
         }
     };
 
-    KonveyorRule {
+    Some(KonveyorRule {
         rule_id,
         labels,
         effort: 3,
@@ -2138,7 +4202,8 @@ fn behavioral_change_to_rule(
         message,
         links: Vec::new(),
         when: condition,
-    }
+        fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+    })
 }
 
 fn manifest_change_to_rule(
@@ -2179,6 +4244,7 @@ fn manifest_change_to_rule(
         message,
         links: Vec::new(),
         when: condition,
+        fix_strategy: Some(FixStrategyEntry::new("Manual")),
     }
 }
 
@@ -3140,6 +5206,27 @@ fn extract_leaf_symbol(symbol: &str) -> &str {
     symbol.rsplit('.').next().unwrap_or(symbol)
 }
 
+/// Extract the trailing PascalCase suffix from a snake_case token constant name.
+///
+/// `"c_table__caption_PaddingTop"` → `Some("PaddingTop")`
+/// `"global_Color_100"` → `None` (contains underscore — not a pure PascalCase suffix)
+/// `"c_button"` → `None` (no PascalCase suffix)
+fn extract_trailing_suffix(name: &str) -> Option<&str> {
+    // Find the last '_' and check the remainder
+    let last_underscore = name.rfind('_')?;
+    let suffix = &name[last_underscore + 1..];
+    // Must start with uppercase, contain a lowercase, and have no underscores
+    if !suffix.is_empty()
+        && suffix.chars().next().map_or(false, |c| c.is_uppercase())
+        && suffix.chars().any(|c| c.is_lowercase())
+        && !suffix.contains('_')
+    {
+        Some(suffix)
+    } else {
+        None
+    }
+}
+
 /// Sanitize a string for use in a Konveyor rule ID.
 /// Replaces non-alphanumeric characters with hyphens, lowercases, and deduplicates.
 fn sanitize_id(s: &str) -> String {
@@ -3243,6 +5330,9 @@ mod tests {
             },
             changes,
             manifest_changes,
+            added_files: Vec::new(),
+            packages: vec![],
+            member_renames: std::collections::HashMap::new(),
             metadata: AnalysisMetadata {
                 call_graph_analysis: "none".to_string(),
                 tool_version: "0.1.0".to_string(),
@@ -3339,6 +5429,9 @@ mod tests {
                 before: None,
                 after: None,
                 description: "Exported function 'createUser' was removed".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
         }];
@@ -3350,6 +5443,7 @@ mod tests {
             "*.{ts,tsx,js,jsx}",
             &empty_cache,
             &RenamePatterns::empty(),
+            &HashMap::new(),
         );
 
         assert_eq!(rules.len(), 1);
@@ -3379,6 +5473,10 @@ mod tests {
                 category: None,
                 description: "Now rejects emails with '+' aliases".to_string(),
                 source_file: Some("src/api/users.ts".to_string()),
+                confidence: None,
+                evidence_type: None,
+                referenced_components: vec![],
+                is_internal_only: None,
             }],
         }];
 
@@ -3389,6 +5487,7 @@ mod tests {
             "*.{ts,tsx}",
             &empty_cache,
             &RenamePatterns::empty(),
+            &HashMap::new(),
         );
 
         assert_eq!(rules.len(), 1);
@@ -3418,6 +5517,7 @@ mod tests {
             "*.{ts,tsx,js,jsx}",
             &empty_cache,
             &RenamePatterns::empty(),
+            &HashMap::new(),
         );
 
         assert_eq!(rules.len(), 1);
@@ -3453,6 +5553,7 @@ mod tests {
             "*.{ts,tsx,js,jsx}",
             &empty_cache,
             &RenamePatterns::empty(),
+            &HashMap::new(),
         );
 
         assert_eq!(rules.len(), 1);
@@ -3479,6 +5580,9 @@ mod tests {
                     before: None,
                     after: None,
                     description: "Removed foo".to_string(),
+                    migration_target: None,
+                    removal_disposition: None,
+                    renders_element: None,
                 },
                 ApiChange {
                     symbol: "foo".to_string(),
@@ -3487,6 +5591,9 @@ mod tests {
                     before: None,
                     after: None,
                     description: "Removed foo overload".to_string(),
+                    migration_target: None,
+                    removal_disposition: None,
+                    renders_element: None,
                 },
             ],
             breaking_behavioral_changes: vec![],
@@ -3494,7 +5601,13 @@ mod tests {
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
 
         assert_eq!(rules.len(), 2);
         assert_ne!(rules[0].rule_id, rules[1].rule_id);
@@ -3509,7 +5622,13 @@ mod tests {
 
         let report = make_report(vec![], vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
         let fix_guidance = generate_fix_guidance(&report, &rules, "*.ts");
 
         write_ruleset_dir(&dir, "test-ruleset", &report, &rules).unwrap();
@@ -3548,6 +5667,9 @@ mod tests {
                 before: Some("'primary' | 'secondary'".to_string()),
                 after: Some("'primary' | 'danger'".to_string()),
                 description: "Removed 'secondary' variant, added 'danger'".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
         }];
@@ -3559,6 +5681,7 @@ mod tests {
             "*.{ts,tsx}",
             &empty_cache,
             &RenamePatterns::empty(),
+            &HashMap::new(),
         );
 
         // Verify YAML serialization succeeds
@@ -3583,6 +5706,9 @@ mod tests {
                 before: Some("Chip".to_string()),
                 after: Some("Label".to_string()),
                 description: "Chip renamed to Label".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
         }];
@@ -3594,6 +5720,7 @@ mod tests {
             "*.{ts,tsx}",
             &empty_cache,
             &RenamePatterns::empty(),
+            &HashMap::new(),
         );
         let guidance = generate_fix_guidance(&report, &rules, "*.{ts,tsx}");
 
@@ -3621,13 +5748,22 @@ mod tests {
                 before: None,
                 after: None,
                 description: "Function createUser was removed".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
         let guidance = generate_fix_guidance(&report, &rules, "*.ts");
 
         assert_eq!(guidance.fixes.len(), 1);
@@ -3652,13 +5788,22 @@ mod tests {
                 before: Some("formatDate(d: Date): string".to_string()),
                 after: Some("formatDate(d: Date, locale: string): string".to_string()),
                 description: "Added required 'locale' parameter".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
         let guidance = generate_fix_guidance(&report, &rules, "*.ts");
 
         assert_eq!(guidance.fixes.len(), 1);
@@ -3687,12 +5832,22 @@ mod tests {
                 category: None,
                 description: "Now throws on expired tokens instead of returning null".to_string(),
                 source_file: Some("src/auth.ts".to_string()),
+                confidence: None,
+                evidence_type: None,
+                referenced_components: vec![],
+                is_internal_only: None,
             }],
         }];
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
         let guidance = generate_fix_guidance(&report, &rules, "*.ts");
 
         assert_eq!(guidance.fixes.len(), 1);
@@ -3717,7 +5872,13 @@ mod tests {
 
         let report = make_report(vec![], manifest);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
         let guidance = generate_fix_guidance(&report, &rules, "*.ts");
 
         assert_eq!(guidance.fixes.len(), 1);
@@ -3743,6 +5904,9 @@ mod tests {
                     before: Some("Chip".to_string()),
                     after: Some("Label".to_string()),
                     description: "Renamed".to_string(),
+                    migration_target: None,
+                    removal_disposition: None,
+                    renders_element: None,
                 },
                 ApiChange {
                     symbol: "oldFn".to_string(),
@@ -3751,6 +5915,9 @@ mod tests {
                     before: None,
                     after: None,
                     description: "Removed".to_string(),
+                    migration_target: None,
+                    removal_disposition: None,
+                    renders_element: None,
                 },
             ],
             breaking_behavioral_changes: vec![BehavioralChange {
@@ -3759,12 +5926,22 @@ mod tests {
                 category: None,
                 description: "Changed behavior".to_string(),
                 source_file: Some("src/lib.ts".to_string()),
+                confidence: None,
+                evidence_type: None,
+                referenced_components: vec![],
+                is_internal_only: None,
             }],
         }];
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
         let guidance = generate_fix_guidance(&report, &rules, "*.ts");
 
         assert_eq!(guidance.summary.total_fixes, 3);
@@ -3788,6 +5965,9 @@ mod tests {
                     before: Some("Foo".to_string()),
                     after: Some("Bar".to_string()),
                     description: "Renamed Foo to Bar".to_string(),
+                    migration_target: None,
+                    removal_disposition: None,
+                    renders_element: None,
                 },
                 ApiChange {
                     symbol: "baz".to_string(),
@@ -3796,6 +5976,9 @@ mod tests {
                     before: Some("baz(): void".to_string()),
                     after: Some("baz(x: number): void".to_string()),
                     description: "Added required param".to_string(),
+                    migration_target: None,
+                    removal_disposition: None,
+                    renders_element: None,
                 },
             ],
             breaking_behavioral_changes: vec![],
@@ -3817,6 +6000,7 @@ mod tests {
             "*.{ts,tsx}",
             &empty_cache,
             &RenamePatterns::empty(),
+            &HashMap::new(),
         );
         let guidance = generate_fix_guidance(&report, &rules, "*.{ts,tsx}");
 
@@ -3849,13 +6033,22 @@ mod tests {
                 before: Some("Chip".to_string()),
                 after: Some("Label".to_string()),
                 description: "Chip renamed to Label".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
 
         assert_eq!(rules.len(), 1);
         let yaml = serde_yaml::to_string(&rules[0]).unwrap();
@@ -3880,20 +6073,36 @@ mod tests {
                 before: None,
                 after: None,
                 description: "Card.isFlat prop removed".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
 
-        assert_eq!(rules.len(), 1);
-        let yaml = serde_yaml::to_string(&rules[0]).unwrap();
-        // Should use JSX_PROP location with component filter
-        assert!(yaml.contains("JSX_PROP"));
-        assert!(yaml.contains("^isFlat$"));
-        assert!(yaml.contains("^Card$")); // component filter
+        // Single prop removal (1 of 1) should NOT trigger P0-C — requires >= 3 removals.
+        // Only the prop-level JSX_PROP rule should be generated.
+        assert_eq!(
+            rules.len(),
+            1,
+            "Single prop removal should not trigger P0-C, got {} rules",
+            rules.len()
+        );
+        let yaml0 = serde_yaml::to_string(&rules[0]).unwrap();
+        // First rule: JSX_PROP location with component filter
+        assert!(yaml0.contains("JSX_PROP"));
+        assert!(yaml0.contains("^isFlat$"));
+        assert!(yaml0.contains("^Card$")); // component filter
     }
 
     #[test]
@@ -3909,13 +6118,22 @@ mod tests {
                 before: None,
                 after: None,
                 description: "createUser removed".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
 
         assert_eq!(rules.len(), 1);
         let yaml = serde_yaml::to_string(&rules[0]).unwrap();
@@ -3936,18 +6154,1739 @@ mod tests {
                 before: None,
                 after: None,
                 description: "UserRole type removed".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
 
         assert_eq!(rules.len(), 1);
         let yaml = serde_yaml::to_string(&rules[0]).unwrap();
         assert!(yaml.contains("TYPE_REFERENCE"));
         assert!(yaml.contains("^UserRole$"));
+    }
+
+    // ── Issue-derived regression tests ──────────────────────────────────
+
+    // Helpers for building realistic test data
+    fn make_api_change(
+        symbol: &str,
+        kind: ApiChangeKind,
+        change: ApiChangeType,
+        description: &str,
+    ) -> ApiChange {
+        ApiChange {
+            symbol: symbol.to_string(),
+            kind,
+            change,
+            before: None,
+            after: None,
+            description: description.to_string(),
+            migration_target: None,
+            removal_disposition: None,
+            renders_element: None,
+        }
+    }
+
+    fn make_file_changes(
+        file: &str,
+        api: Vec<ApiChange>,
+        behavioral: Vec<BehavioralChange>,
+    ) -> FileChanges {
+        FileChanges {
+            file: PathBuf::from(file),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: api,
+            breaking_behavioral_changes: behavioral,
+        }
+    }
+
+    fn make_behavioral(
+        symbol: &str,
+        category: Option<BehavioralCategory>,
+        description: &str,
+    ) -> BehavioralChange {
+        BehavioralChange {
+            symbol: symbol.to_string(),
+            kind: BehavioralChangeKind::Function,
+            category,
+            description: description.to_string(),
+            source_file: None,
+            confidence: None,
+            evidence_type: None,
+            referenced_components: vec![],
+            is_internal_only: None,
+        }
+    }
+
+    fn make_report_with_added(
+        changes: Vec<FileChanges>,
+        added_files: Vec<PathBuf>,
+    ) -> AnalysisReport {
+        let mut report = make_report(changes, vec![]);
+        report.added_files = added_files;
+        report
+    }
+
+    // ── Issue 2: P0-C generates component-import-deprecated for removed constants ──
+    // Scenario: EmptyStateHeader (PascalCase constant) is removed entirely.
+    // P0-C should generate a component-import-deprecated rule with LlmAssisted.
+    #[test]
+    fn test_p0c_removed_constant_generates_import_deprecated_rule() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/EmptyState/EmptyStateHeader.tsx",
+            vec![make_api_change(
+                "EmptyStateHeader",
+                ApiChangeKind::Constant,
+                ApiChangeType::Removed,
+                "EmptyStateHeader component was removed",
+            )],
+            vec![],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let empty_cache = HashMap::new();
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Should have 2 rules: per-change removal + P0-C component-import-deprecated
+        assert!(
+            rules.len() >= 2,
+            "Expected at least 2 rules, got {}",
+            rules.len()
+        );
+
+        let p0c_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("component-import-deprecated"));
+        assert!(
+            p0c_rule.is_some(),
+            "Missing P0-C component-import-deprecated rule"
+        );
+
+        let rule = p0c_rule.unwrap();
+        assert!(rule.message.contains("MIGRATION"));
+        // Strategy should be LlmAssisted
+        assert_eq!(rule.fix_strategy.as_ref().unwrap().strategy, "LlmAssisted");
+    }
+
+    // P0-C should NOT trigger for components with only 1-2 removed props (like Button)
+    // These are minor interface changes, not component removals.
+    #[test]
+    fn test_p0c_skips_minor_prop_removals() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Button/Button.tsx",
+            vec![
+                make_api_change(
+                    "ButtonProps.isActive",
+                    ApiChangeKind::Property,
+                    ApiChangeType::Removed,
+                    "isActive prop removed",
+                ),
+                make_api_change(
+                    "ButtonProps.variant",
+                    ApiChangeKind::Property,
+                    ApiChangeType::TypeChanged,
+                    "variant type changed",
+                ),
+            ],
+            vec![],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Button has 1 removal out of 2 total changes — should NOT trigger P0-C
+        let p0c_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("component-import-deprecated"))
+            .collect();
+        assert!(
+            p0c_rules.is_empty(),
+            "Button with 1/2 removed props should NOT get a P0-C rule. Got: {:?}",
+            p0c_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    // P0-C SHOULD trigger for components with many removed props (like Modal: 12 of 14)
+    #[test]
+    fn test_p0c_triggers_for_heavily_removed_components() {
+        let mut api_changes = Vec::new();
+        // 10 removed props
+        for i in 0..10 {
+            api_changes.push(make_api_change(
+                &format!("ModalProps.prop{}", i),
+                ApiChangeKind::Property,
+                ApiChangeType::Removed,
+                &format!("prop{} removed", i),
+            ));
+        }
+        // 4 type-changed props
+        for i in 10..14 {
+            api_changes.push(make_api_change(
+                &format!("ModalProps.prop{}", i),
+                ApiChangeKind::Property,
+                ApiChangeType::TypeChanged,
+                &format!("prop{} type changed", i),
+            ));
+        }
+
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Modal/Modal.tsx",
+            api_changes,
+            vec![],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Modal has 10 removals out of 14 total — should trigger P0-C
+        let p0c_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("component-import-deprecated"))
+            .collect();
+        assert!(
+            !p0c_rules.is_empty(),
+            "Modal with 10/14 removed props should get a P0-C rule"
+        );
+        assert_eq!(
+            p0c_rules[0].fix_strategy.as_ref().unwrap().strategy,
+            "LlmAssisted"
+        );
+    }
+
+    // P0-C should NOT generate rules for TypeAlias removals (not components)
+    #[test]
+    fn test_p0c_skips_type_alias_removals() {
+        let changes = vec![make_file_changes(
+            "src/types.d.ts",
+            vec![make_api_change(
+                "UserRole",
+                ApiChangeKind::TypeAlias,
+                ApiChangeType::Removed,
+                "UserRole type removed",
+            )],
+            vec![],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Should only have the per-change rule, no P0-C
+        assert_eq!(rules.len(), 1);
+        assert!(!rules[0].rule_id.contains("component-import-deprecated"));
+    }
+
+    // ── Issue 7: suppress_redundant_prop_rules ──
+    // Scenario: Modal has both a component-import-deprecated rule (LlmAssisted)
+    // AND a RemoveProp rule for individual props. The RemoveProp should be suppressed.
+    #[test]
+    fn test_suppress_redundant_prop_rules_modal_scenario() {
+        let rules = vec![
+            // Component-level LlmAssisted rule for Modal
+            KonveyorRule {
+                rule_id: "semver-modal-component-import-deprecated".to_string(),
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=component-removal".to_string(),
+                ],
+                effort: 3,
+                category: "mandatory".to_string(),
+                description: "Modal has significant breaking changes".to_string(),
+                message: "MIGRATION: Modal restructured".to_string(),
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^Modal$".to_string(),
+                        location: "IMPORT".to_string(),
+                        component: None,
+                        parent: None,
+                        value: None,
+                        from: Some("@patternfly/react-core".to_string()),
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+            },
+            // Prop-level RemoveProp rule for Modal.title
+            KonveyorRule {
+                rule_id: "semver-modal-title-removed".to_string(),
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=removed".to_string(),
+                ],
+                effort: 1,
+                category: "mandatory".to_string(),
+                description: "Modal.title removed".to_string(),
+                message: "title prop removed".to_string(),
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^title$".to_string(),
+                        location: "JSX_PROP".to_string(),
+                        component: Some("^Modal$".to_string()),
+                        parent: None,
+                        value: None,
+                        from: Some("@patternfly/react-core".to_string()),
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry {
+                    strategy: "RemoveProp".to_string(),
+                    component: Some("Modal".to_string()),
+                    ..Default::default()
+                }),
+            },
+            // Prop-level RemoveProp rule for Modal.actions
+            KonveyorRule {
+                rule_id: "semver-modal-actions-removed".to_string(),
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=removed".to_string(),
+                ],
+                effort: 1,
+                category: "mandatory".to_string(),
+                description: "Modal.actions removed".to_string(),
+                message: "actions prop removed".to_string(),
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^actions$".to_string(),
+                        location: "JSX_PROP".to_string(),
+                        component: Some("^Modal$".to_string()),
+                        parent: None,
+                        value: None,
+                        from: Some("@patternfly/react-core".to_string()),
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry {
+                    strategy: "RemoveProp".to_string(),
+                    component: Some("Modal".to_string()),
+                    ..Default::default()
+                }),
+            },
+            // Unrelated rule (should NOT be suppressed)
+            KonveyorRule {
+                rule_id: "semver-card-isflat-removed".to_string(),
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=removed".to_string(),
+                ],
+                effort: 1,
+                category: "mandatory".to_string(),
+                description: "Card.isFlat removed".to_string(),
+                message: "isFlat prop removed".to_string(),
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^isFlat$".to_string(),
+                        location: "JSX_PROP".to_string(),
+                        component: Some("^Card$".to_string()),
+                        parent: None,
+                        value: None,
+                        from: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry {
+                    strategy: "RemoveProp".to_string(),
+                    component: Some("Card".to_string()),
+                    ..Default::default()
+                }),
+            },
+        ];
+
+        let result = suppress_redundant_prop_rules(rules);
+
+        // Modal RemoveProp rules should be suppressed (2 removed)
+        // Card RemoveProp should survive (Card has no component-import-deprecated rule)
+        // Component-import-deprecated rule should survive
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 rules after suppression, got {}",
+            result.len()
+        );
+        assert!(result
+            .iter()
+            .any(|r| r.rule_id == "semver-modal-component-import-deprecated"));
+        assert!(result
+            .iter()
+            .any(|r| r.rule_id == "semver-card-isflat-removed"));
+        assert!(!result.iter().any(|r| r.rule_id.contains("modal-title")));
+        assert!(!result.iter().any(|r| r.rule_id.contains("modal-actions")));
+    }
+
+    // ── Issue 4: CSS logical property suffix renames ──
+    // Scenario: Token member renames like PaddingTop→PaddingBlockStart should
+    // generate a single combined cssvar rule with all suffix mappings.
+    #[test]
+    fn test_css_logical_property_suffix_renames() {
+        let member_renames: HashMap<String, String> = vec![
+            (
+                "c_table__caption_PaddingTop".to_string(),
+                "c_table__caption_PaddingBlockStart".to_string(),
+            ),
+            (
+                "c_table__caption_PaddingBottom".to_string(),
+                "c_table__caption_PaddingBlockEnd".to_string(),
+            ),
+            (
+                "c_nav_PaddingLeft".to_string(),
+                "c_nav_PaddingInlineStart".to_string(),
+            ),
+            (
+                "c_button_MarginTop".to_string(),
+                "c_button_MarginBlockStart".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let report = make_report(vec![], vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &member_renames,
+        );
+
+        // Should generate one combined CSS suffix rename rule
+        let css_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("css-logical"))
+            .collect();
+        assert_eq!(
+            css_rules.len(),
+            1,
+            "Expected 1 combined CSS logical property rule, got {}",
+            css_rules.len()
+        );
+
+        let rule = css_rules[0];
+        // Should be a Rename strategy with mappings
+        let strat = rule.fix_strategy.as_ref().unwrap();
+        assert_eq!(strat.strategy, "Rename");
+        assert!(
+            strat.mappings.len() >= 4,
+            "Expected at least 4 suffix mappings, got {}",
+            strat.mappings.len()
+        );
+
+        // Check specific mappings
+        let has_padding_top = strat.mappings.iter().any(|m| {
+            m.from.as_deref() == Some("--PaddingTop")
+                && m.to.as_deref() == Some("--PaddingBlockStart")
+        });
+        assert!(
+            has_padding_top,
+            "Missing PaddingTop→PaddingBlockStart mapping"
+        );
+
+        let has_margin_top = strat.mappings.iter().any(|m| {
+            m.from.as_deref() == Some("--MarginTop")
+                && m.to.as_deref() == Some("--MarginBlockStart")
+        });
+        assert!(has_margin_top, "Missing MarginTop→MarginBlockStart mapping");
+
+        // Message should list all renames
+        assert!(rule.message.contains("PaddingTop"));
+        assert!(rule.message.contains("PaddingBlockStart"));
+
+        // Condition should use frontend.cssvar
+        match &rule.when {
+            KonveyorCondition::FrontendCssVar { cssvar } => {
+                assert!(cssvar.pattern.contains("PaddingTop"));
+                assert!(cssvar.pattern.contains("MarginTop"));
+            }
+            _ => panic!("Expected FrontendCssVar condition"),
+        }
+    }
+
+    // ── Constant collapsing ──
+    // Scenario: 15+ token constants with the same change type and strategy
+    // should be collapsed into a single combined rule.
+    #[test]
+    fn test_constant_collapse_threshold() {
+        let mut api_changes = Vec::new();
+        for i in 0..15 {
+            api_changes.push(ApiChange {
+                symbol: format!("c_component_token_{}", i),
+                kind: ApiChangeKind::Constant,
+                change: ApiChangeType::Removed,
+                before: None,
+                after: None,
+                description: format!("Token {} removed", i),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            });
+        }
+
+        let changes = vec![make_file_changes(
+            "packages/react-tokens/dist/esm/tokens.d.ts",
+            api_changes,
+            vec![],
+        )];
+
+        let mut pkg_cache = HashMap::new();
+        pkg_cache.insert(
+            "react-tokens".to_string(),
+            "@patternfly/react-tokens".to_string(),
+        );
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Should collapse 15 removed constants into a single combined rule
+        let combined_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("combined"))
+            .collect();
+        assert!(
+            !combined_rules.is_empty(),
+            "Expected at least one combined rule from 15 constants"
+        );
+
+        // Should NOT have 15 individual rules
+        let individual_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("c-component-token"))
+            .collect();
+        assert_eq!(
+            individual_rules.len(),
+            0,
+            "Expected 0 individual token rules (all collapsed), got {}",
+            individual_rules.len()
+        );
+    }
+
+    // Below threshold — should NOT collapse
+    #[test]
+    fn test_constant_collapse_below_threshold() {
+        let mut api_changes = Vec::new();
+        for i in 0..5 {
+            api_changes.push(ApiChange {
+                symbol: format!("c_component_token_{}", i),
+                kind: ApiChangeKind::Constant,
+                change: ApiChangeType::Removed,
+                before: None,
+                after: None,
+                description: format!("Token {} removed", i),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            });
+        }
+
+        let changes = vec![make_file_changes(
+            "packages/react-tokens/dist/esm/tokens.d.ts",
+            api_changes,
+            vec![],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // 5 constants is below the threshold (10) — should NOT collapse
+        let combined_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("combined"))
+            .collect();
+        assert_eq!(
+            combined_rules.len(),
+            0,
+            "Should not collapse 5 constants (below threshold)"
+        );
+    }
+
+    // ── Issue 2: New sibling component detection (MastheadLogo) ──
+    // Scenario: MastheadBrand has breaking changes and MastheadLogo was added
+    // in the same directory, with behavioral evidence in consumer code.
+    #[test]
+    fn test_new_sibling_component_detection_with_behavioral_evidence() {
+        let changes = vec![
+            make_file_changes(
+                "packages/react-core/src/components/Masthead/MastheadBrand.tsx",
+                vec![
+                    make_api_change(
+                        "MastheadBrandProps",
+                        ApiChangeKind::Interface,
+                        ApiChangeType::SignatureChanged,
+                        "Now extends HTMLDivElement instead of HTMLAnchorElement",
+                    ),
+                    make_api_change(
+                        "MastheadBrandProps.component",
+                        ApiChangeKind::Property,
+                        ApiChangeType::Removed,
+                        "component prop removed",
+                    ),
+                ],
+                vec![make_behavioral(
+                    "MastheadBrand",
+                    Some(BehavioralCategory::LogicChange),
+                    "href no longer creates a clickable link",
+                )],
+            ),
+            // Consumer demo file where MastheadLogo appears in behavioral changes
+            make_file_changes(
+                "packages/react-core/src/components/Masthead/examples/MastheadBasic.tsx",
+                vec![],
+                vec![make_behavioral(
+                    "MastheadBasic",
+                    Some(BehavioralCategory::DomStructure),
+                    "<MastheadLogo> element added to render output (1 instance)",
+                )],
+            ),
+        ];
+
+        let report = make_report_with_added(
+            changes,
+            vec![PathBuf::from(
+                "packages/react-core/src/components/Masthead/MastheadLogo.tsx",
+            )],
+        );
+
+        let mut pkg_cache = HashMap::new();
+        pkg_cache.insert(
+            "react-core".to_string(),
+            "@patternfly/react-core".to_string(),
+        );
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Should have a new-sibling rule for MastheadLogo
+        let sibling_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("new-sibling"))
+            .collect();
+        assert_eq!(
+            sibling_rules.len(),
+            1,
+            "Expected 1 new-sibling rule, got {}",
+            sibling_rules.len()
+        );
+
+        let rule = sibling_rules[0];
+        assert!(rule.message.contains("MastheadLogo"));
+        assert!(rule.message.contains("MastheadBrand"));
+        assert!(rule.message.contains("Consider wrapping"));
+        assert_eq!(rule.fix_strategy.as_ref().unwrap().strategy, "LlmAssisted");
+        assert_eq!(rule.category, "optional");
+    }
+
+    // No behavioral evidence → no sibling rule generated
+    #[test]
+    fn test_new_sibling_without_behavioral_evidence_is_skipped() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Masthead/MastheadBrand.tsx",
+            vec![make_api_change(
+                "MastheadBrandProps.component",
+                ApiChangeKind::Property,
+                ApiChangeType::Removed,
+                "component prop removed",
+            )],
+            vec![],
+        )];
+
+        // File was added but no behavioral evidence references it
+        let report = make_report_with_added(
+            changes,
+            vec![PathBuf::from(
+                "packages/react-core/src/components/Masthead/MastheadLogo.tsx",
+            )],
+        );
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let sibling_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("new-sibling"))
+            .collect();
+        assert_eq!(
+            sibling_rules.len(),
+            0,
+            "Should not generate sibling rule without behavioral evidence"
+        );
+    }
+
+    // ── Migration message enrichment ──
+    // Scenario: EmptyStateHeader has a migration_target mapping to EmptyState,
+    // plus behavioral changes. The P0-C message should include both.
+    #[test]
+    fn test_migration_message_with_migration_target_and_behavioral() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/EmptyState/EmptyStateHeader.tsx",
+            vec![
+                {
+                    let mut change = make_api_change(
+                        "EmptyStateHeaderProps",
+                        ApiChangeKind::Interface,
+                        ApiChangeType::Removed,
+                        "EmptyStateHeaderProps interface removed",
+                    );
+                    change.migration_target = Some(MigrationTarget {
+                        removed_symbol: "EmptyStateHeaderProps".to_string(),
+                        removed_qualified_name: "EmptyStateHeader.EmptyStateHeaderProps"
+                            .to_string(),
+                        replacement_symbol: "EmptyStateProps".to_string(),
+                        replacement_qualified_name: "EmptyState.EmptyStateProps".to_string(),
+                        matching_members: vec![
+                            MemberMapping {
+                                old_name: "titleText".to_string(),
+                                new_name: "titleText".to_string(),
+                            },
+                            MemberMapping {
+                                old_name: "icon".to_string(),
+                                new_name: "icon".to_string(),
+                            },
+                            MemberMapping {
+                                old_name: "headingLevel".to_string(),
+                                new_name: "headingLevel".to_string(),
+                            },
+                        ],
+                        removed_only_members: vec!["className".to_string(), "children".to_string()],
+                        overlap_ratio: 0.6,
+                    });
+                    change
+                },
+                make_api_change(
+                    "EmptyStateHeader",
+                    ApiChangeKind::Constant,
+                    ApiChangeType::Removed,
+                    "EmptyStateHeader component removed",
+                ),
+            ],
+            vec![make_behavioral(
+                "EmptyStateHeader",
+                Some(BehavioralCategory::RenderOutput),
+                "<EmptyStateHeader> element removed from render output",
+            )],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Find the P0-C component-import-deprecated rule
+        let p0c_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("component-import-deprecated"));
+        assert!(p0c_rule.is_some(), "Missing P0-C rule for EmptyStateHeader");
+
+        let msg = &p0c_rule.unwrap().message;
+
+        // Should include migration target info
+        assert!(
+            msg.contains("Replace <EmptyStateHeader>"),
+            "Missing migration header"
+        );
+        assert!(
+            msg.contains("EmptyState"),
+            "Missing replacement component name"
+        );
+
+        // Should include property mapping
+        assert!(
+            msg.contains("titleText"),
+            "Missing titleText in property mapping"
+        );
+        assert!(msg.contains("icon"), "Missing icon in property mapping");
+        assert!(
+            msg.contains("headingLevel"),
+            "Missing headingLevel in property mapping"
+        );
+
+        // Should include removed-only members
+        assert!(
+            msg.contains("className"),
+            "Missing className in removed-only members"
+        );
+        assert!(
+            msg.contains("children"),
+            "Missing children in removed-only members"
+        );
+
+        // Should include behavioral changes
+        assert!(
+            msg.contains("Behavioral changes"),
+            "Missing behavioral changes section"
+        );
+        assert!(
+            msg.contains("element removed from render output"),
+            "Missing behavioral description"
+        );
+    }
+
+    // ── Behavioral rule dedup ──
+    // Scenario: When a P0-C rule exists for EmptyStateHeader, standalone
+    // behavioral rules for the same component should be downgraded to Manual.
+    #[test]
+    fn test_behavioral_rule_dedup_when_p0c_covers_component() {
+        let changes = vec![
+            // Source file with both API and behavioral changes
+            make_file_changes(
+                "packages/react-core/src/components/EmptyState/EmptyStateHeader.tsx",
+                vec![make_api_change(
+                    "EmptyStateHeader",
+                    ApiChangeKind::Constant,
+                    ApiChangeType::Removed,
+                    "EmptyStateHeader component removed",
+                )],
+                vec![make_behavioral(
+                    "EmptyStateHeader",
+                    Some(BehavioralCategory::RenderOutput),
+                    "<EmptyStateHeader> element removed from render output",
+                )],
+            ),
+        ];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Find behavioral rule for EmptyStateHeader
+        let behavioral_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l.starts_with("change-type=behavioral"))
+                    && r.rule_id.contains("emptystateheader")
+            })
+            .collect();
+
+        // If a behavioral rule exists, it should be downgraded to Manual
+        // (not LlmAssisted) since the P0-C rule already covers EmptyStateHeader
+        for rule in &behavioral_rules {
+            let strat = rule.fix_strategy.as_ref().unwrap();
+            assert_eq!(
+                strat.strategy, "Manual",
+                "Behavioral rule for EmptyStateHeader should be Manual (covered by P0-C), got {}",
+                strat.strategy
+            );
+        }
+    }
+
+    // ── Strategy priority: LlmAssisted with member_mappings wins ──
+    #[test]
+    fn test_strategy_priority_llm_with_member_mappings_wins() {
+        // Simulate consolidation of rules where one has LlmAssisted with
+        // structural migration data and another has RemoveProp
+        let rules = vec![
+            KonveyorRule {
+                rule_id: "semver-modal-actions-removed".to_string(),
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=removed".to_string(),
+                ],
+                effort: 1,
+                category: "mandatory".to_string(),
+                description: "actions prop removed from Modal".to_string(),
+                message: "actions removed".to_string(),
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^actions$".to_string(),
+                        location: "JSX_PROP".to_string(),
+                        component: Some("^Modal$".to_string()),
+                        parent: None,
+                        value: None,
+                        from: Some("@patternfly/react-core".to_string()),
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry {
+                    strategy: "RemoveProp".to_string(),
+                    component: Some("Modal".to_string()),
+                    ..Default::default()
+                }),
+            },
+            KonveyorRule {
+                rule_id: "semver-modal-structural-migration".to_string(),
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=removed".to_string(),
+                ],
+                effort: 5,
+                category: "mandatory".to_string(),
+                description: "Modal decomposed into ModalHeader/ModalBody/ModalFooter".to_string(),
+                message: "Modal restructured".to_string(),
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^actions$".to_string(),
+                        location: "JSX_PROP".to_string(),
+                        component: Some("^Modal$".to_string()),
+                        parent: None,
+                        value: None,
+                        from: Some("@patternfly/react-core".to_string()),
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry {
+                    strategy: "LlmAssisted".to_string(),
+                    member_mappings: vec![MemberMappingEntry {
+                        old_name: "title".to_string(),
+                        new_name: "ModalHeader.title".to_string(),
+                    }],
+                    ..Default::default()
+                }),
+            },
+        ];
+
+        let (consolidated, _) = consolidate_rules(rules);
+
+        // After consolidation, the merged rule should have LlmAssisted strategy
+        // (not RemoveProp), because LlmAssisted with member_mappings wins
+        let merged = consolidated.iter().find(|r| r.rule_id.contains("modal"));
+        assert!(merged.is_some(), "Expected a merged modal rule");
+        let strat = merged.unwrap().fix_strategy.as_ref().unwrap();
+        assert_eq!(
+            strat.strategy, "LlmAssisted",
+            "LlmAssisted with member_mappings should win over RemoveProp, got {}",
+            strat.strategy
+        );
+    }
+
+    // ── Consolidation key isolation tests ────────────────────────────────
+    // Verify that rules with specific change types get unique consolidation
+    // keys and are never merged with unrelated rules.
+
+    fn make_rule_with_labels(rule_id: &str, labels: Vec<&str>) -> KonveyorRule {
+        KonveyorRule {
+            rule_id: rule_id.to_string(),
+            labels: labels.into_iter().map(|l| l.to_string()).collect(),
+            effort: 1,
+            category: "mandatory".to_string(),
+            description: "test rule".to_string(),
+            message: "test message".to_string(),
+            links: Vec::new(),
+            when: KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: "^Test$".to_string(),
+                    location: "IMPORT".to_string(),
+                    component: None,
+                    parent: None,
+                    value: None,
+                    from: None,
+                },
+            },
+            fix_strategy: Some(FixStrategyEntry::new("Manual")),
+        }
+    }
+
+    // CSS logical property rule must NOT be consolidated with CSS prefix rules
+    #[test]
+    fn test_consolidation_css_variable_rules_stay_separate() {
+        let css_prefix_rule = make_rule_with_labels(
+            "semver-consumer-css-stale-var-pf-v5",
+            vec!["source=semver-analyzer", "change-type=css-variable"],
+        );
+        let css_logical_rule = make_rule_with_labels(
+            "semver-css-logical-property-renames",
+            vec![
+                "source=semver-analyzer",
+                "change-type=css-variable",
+                "has-codemod=true",
+            ],
+        );
+
+        let key1 = consolidation_key(&css_prefix_rule);
+        let key2 = consolidation_key(&css_logical_rule);
+
+        assert_ne!(
+            key1, key2,
+            "CSS prefix and CSS logical property rules should have different consolidation keys"
+        );
+    }
+
+    // New sibling rules must NOT be consolidated together
+    #[test]
+    fn test_consolidation_sibling_rules_stay_separate() {
+        let sibling_a = make_rule_with_labels(
+            "semver-new-sibling-mastheadlogo-in-mastheadbrand",
+            vec![
+                "source=semver-analyzer",
+                "change-type=new-sibling-component",
+            ],
+        );
+        let sibling_b = make_rule_with_labels(
+            "semver-new-sibling-drawerdescription-in-drawer",
+            vec![
+                "source=semver-analyzer",
+                "change-type=new-sibling-component",
+            ],
+        );
+
+        let key_a = consolidation_key(&sibling_a);
+        let key_b = consolidation_key(&sibling_b);
+
+        assert_ne!(
+            key_a, key_b,
+            "Different sibling rules should have different consolidation keys"
+        );
+    }
+
+    // Component-removal (P0-C) rules must NOT be consolidated into mega-groups
+    #[test]
+    fn test_consolidation_component_removal_rules_stay_separate() {
+        let modal_rule = make_rule_with_labels(
+            "semver-modal-component-import-deprecated",
+            vec!["source=semver-analyzer", "change-type=component-removal"],
+        );
+        let emptystate_rule = make_rule_with_labels(
+            "semver-emptystateheader-component-import-deprecated",
+            vec!["source=semver-analyzer", "change-type=component-removal"],
+        );
+
+        let key_modal = consolidation_key(&modal_rule);
+        let key_empty = consolidation_key(&emptystate_rule);
+
+        assert_ne!(
+            key_modal, key_empty,
+            "P0-C rules for different components should NOT be consolidated together"
+        );
+    }
+
+    // Dependency-update rules must stay separate
+    #[test]
+    fn test_consolidation_dependency_update_rules_stay_separate() {
+        let dep_a = make_rule_with_labels(
+            "semver-dep-update-patternfly-react-core",
+            vec!["source=semver-analyzer", "change-type=dependency-update"],
+        );
+        let dep_b = make_rule_with_labels(
+            "semver-dep-update-patternfly-react-tokens",
+            vec!["source=semver-analyzer", "change-type=dependency-update"],
+        );
+
+        let key_a = consolidation_key(&dep_a);
+        let key_b = consolidation_key(&dep_b);
+
+        assert_ne!(
+            key_a, key_b,
+            "Dependency update rules for different packages should NOT be consolidated"
+        );
+    }
+
+    // Regular API rules (removed, type-changed) from the same file SHOULD still consolidate
+    #[test]
+    fn test_consolidation_regular_api_rules_still_merge() {
+        let mut rule_a = make_rule_with_labels(
+            "semver-modal-title-removed",
+            vec![
+                "source=semver-analyzer",
+                "change-type=removed",
+                "kind=property",
+            ],
+        );
+        rule_a.message =
+            "title was removed\nFile: packages/react-core/src/components/Modal/Modal.d.ts"
+                .to_string();
+
+        let mut rule_b = make_rule_with_labels(
+            "semver-modal-actions-removed",
+            vec![
+                "source=semver-analyzer",
+                "change-type=removed",
+                "kind=property",
+            ],
+        );
+        rule_b.message =
+            "actions was removed\nFile: packages/react-core/src/components/Modal/Modal.d.ts"
+                .to_string();
+
+        let key_a = consolidation_key(&rule_a);
+        let key_b = consolidation_key(&rule_b);
+
+        assert_eq!(
+            key_a, key_b,
+            "Regular API rules from the same file should still consolidate"
+        );
+    }
+
+    // End-to-end: consolidate_rules() should keep P0-C, CSS, and sibling rules intact
+    #[test]
+    fn test_consolidation_e2e_protected_rules_survive() {
+        let rules = vec![
+            // P0-C rule for Modal
+            {
+                let mut r = make_rule_with_labels(
+                    "semver-modal-component-import-deprecated",
+                    vec!["source=semver-analyzer", "change-type=component-removal"],
+                );
+                r.fix_strategy = Some(FixStrategyEntry::new("LlmAssisted"));
+                r
+            },
+            // P0-C rule for EmptyStateHeader
+            {
+                let mut r = make_rule_with_labels(
+                    "semver-emptystateheader-component-import-deprecated",
+                    vec!["source=semver-analyzer", "change-type=component-removal"],
+                );
+                r.fix_strategy = Some(FixStrategyEntry::new("LlmAssisted"));
+                r
+            },
+            // CSS logical property rule
+            {
+                let mut r = make_rule_with_labels(
+                    "semver-css-logical-property-renames",
+                    vec![
+                        "source=semver-analyzer",
+                        "change-type=css-variable",
+                        "has-codemod=true",
+                    ],
+                );
+                r.fix_strategy = Some(FixStrategyEntry {
+                    strategy: "Rename".to_string(),
+                    mappings: vec![MappingEntry {
+                        from: Some("--PaddingTop".to_string()),
+                        to: Some("--PaddingBlockStart".to_string()),
+                        component: None,
+                        prop: None,
+                    }],
+                    ..Default::default()
+                });
+                r
+            },
+            // Sibling detection rule
+            make_rule_with_labels(
+                "semver-new-sibling-mastheadlogo-in-mastheadbrand",
+                vec![
+                    "source=semver-analyzer",
+                    "change-type=new-sibling-component",
+                ],
+            ),
+        ];
+
+        let (consolidated, _) = consolidate_rules(rules);
+
+        // All 4 rules should survive consolidation unchanged
+        assert_eq!(
+            consolidated.len(),
+            4,
+            "Expected 4 rules after consolidation (all protected), got {}. IDs: {:?}",
+            consolidated.len(),
+            consolidated.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // Verify each is present by rule_id
+        assert!(
+            consolidated
+                .iter()
+                .any(|r| r.rule_id.contains("modal-component")),
+            "Modal P0-C rule lost in consolidation"
+        );
+        assert!(
+            consolidated
+                .iter()
+                .any(|r| r.rule_id.contains("emptystateheader-component")),
+            "EmptyStateHeader P0-C rule lost in consolidation"
+        );
+        assert!(
+            consolidated
+                .iter()
+                .any(|r| r.rule_id.contains("css-logical")),
+            "CSS logical property rule lost in consolidation"
+        );
+        assert!(
+            consolidated
+                .iter()
+                .any(|r| r.rule_id.contains("mastheadlogo")),
+            "MastheadLogo sibling rule lost in consolidation"
+        );
+
+        // Verify CSS rule still has its mappings
+        let css_rule = consolidated
+            .iter()
+            .find(|r| r.rule_id.contains("css-logical"))
+            .unwrap();
+        let strat = css_rule.fix_strategy.as_ref().unwrap();
+        assert_eq!(strat.strategy, "Rename");
+        assert!(
+            !strat.mappings.is_empty(),
+            "CSS rule lost its mappings during consolidation"
+        );
+    }
+
+    // Verify that suppress_redundant_prop_rules works with unconsolidated P0-C rules
+    #[test]
+    fn test_suppress_works_with_individual_p0c_rules() {
+        let rules = vec![
+            // Individual P0-C for Modal (not in a mega-group)
+            {
+                let mut r = make_rule_with_labels(
+                    "semver-modal-component-import-deprecated",
+                    vec!["source=semver-analyzer", "change-type=component-removal"],
+                );
+                r.when = KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: "^Modal$".to_string(),
+                        location: "IMPORT".to_string(),
+                        component: None,
+                        parent: None,
+                        value: None,
+                        from: Some("@patternfly/react-core".to_string()),
+                    },
+                };
+                r.fix_strategy = Some(FixStrategyEntry::new("LlmAssisted"));
+                r
+            },
+            // RemoveProp for Modal.title (should be suppressed)
+            {
+                let mut r = make_rule_with_labels(
+                    "semver-modal-title-removed",
+                    vec!["source=semver-analyzer", "change-type=removed"],
+                );
+                r.fix_strategy = Some(FixStrategyEntry {
+                    strategy: "RemoveProp".to_string(),
+                    component: Some("Modal".to_string()),
+                    ..Default::default()
+                });
+                r
+            },
+            // RemoveProp for Modal.actions (should be suppressed)
+            {
+                let mut r = make_rule_with_labels(
+                    "semver-modal-actions-removed",
+                    vec!["source=semver-analyzer", "change-type=removed"],
+                );
+                r.fix_strategy = Some(FixStrategyEntry {
+                    strategy: "RemoveProp".to_string(),
+                    component: Some("Modal".to_string()),
+                    ..Default::default()
+                });
+                r
+            },
+            // RemoveProp for ModalProps.footer (should also be suppressed — "ModalProps" matches "Modal")
+            {
+                let mut r = make_rule_with_labels(
+                    "semver-modalprops-footer-removed",
+                    vec!["source=semver-analyzer", "change-type=removed"],
+                );
+                r.fix_strategy = Some(FixStrategyEntry {
+                    strategy: "RemoveProp".to_string(),
+                    component: Some("ModalProps".to_string()),
+                    ..Default::default()
+                });
+                r
+            },
+            // RemoveProp for Card.isFlat (should NOT be suppressed — no Card P0-C rule)
+            {
+                let mut r = make_rule_with_labels(
+                    "semver-card-isflat-removed",
+                    vec!["source=semver-analyzer", "change-type=removed"],
+                );
+                r.fix_strategy = Some(FixStrategyEntry {
+                    strategy: "RemoveProp".to_string(),
+                    component: Some("Card".to_string()),
+                    ..Default::default()
+                });
+                r
+            },
+        ];
+
+        let result = suppress_redundant_prop_rules(rules);
+
+        // Modal P0-C + Card RemoveProp should survive. All 3 Modal RemoveProp should be suppressed.
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 rules after suppression (Modal P0-C + Card), got {}. IDs: {:?}",
+            result.len(),
+            result.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+        assert!(result
+            .iter()
+            .any(|r| r.rule_id.contains("modal-component-import")));
+        assert!(result.iter().any(|r| r.rule_id.contains("card-isflat")));
+    }
+
+    // ── Extract trailing suffix helper ──
+    #[test]
+    fn test_extract_trailing_suffix() {
+        assert_eq!(
+            extract_trailing_suffix("c_table__caption_PaddingTop"),
+            Some("PaddingTop")
+        );
+        assert_eq!(
+            extract_trailing_suffix("c_nav_PaddingInlineStart"),
+            Some("PaddingInlineStart")
+        );
+        assert_eq!(extract_trailing_suffix("global_Color_100"), None); // 100 is not PascalCase
+        assert_eq!(extract_trailing_suffix("c_button"), None); // no PascalCase suffix
+        assert_eq!(
+            extract_trailing_suffix("c_about_modal_box__brand_PaddingBlockEnd"),
+            Some("PaddingBlockEnd")
+        );
+    }
+
+    // ── API rule message enrichment with behavioral context ──
+    // Scenario: When an API change fires on a file that also has behavioral
+    // changes for the same component, the API rule message should include
+    // the behavioral context.
+    #[test]
+    fn test_api_rule_message_includes_behavioral_context() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Modal/Modal.tsx",
+            vec![make_api_change(
+                "ModalProps.title",
+                ApiChangeKind::Property,
+                ApiChangeType::Removed,
+                "title prop removed from ModalProps",
+            )],
+            vec![
+                make_behavioral(
+                    "Modal",
+                    Some(BehavioralCategory::RenderOutput),
+                    "title prop no longer renders ModalBoxHeader",
+                ),
+                make_behavioral(
+                    "Modal",
+                    Some(BehavioralCategory::DomStructure),
+                    "ModalBoxCloseButton no longer rendered inside ModalBoxHeader",
+                ),
+            ],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Find the per-change API rule for ModalProps.title
+        let api_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("modalprops") && r.rule_id.contains("title"));
+        assert!(api_rule.is_some(), "Missing API rule for ModalProps.title");
+
+        let msg = &api_rule.unwrap().message;
+        // Should include behavioral context
+        assert!(
+            msg.contains("Behavioral changes"),
+            "Missing behavioral changes section"
+        );
+        assert!(
+            msg.contains("title prop no longer renders ModalBoxHeader"),
+            "Missing behavioral description"
+        );
+    }
+
+    // ── Package scoping tests ─────────────────────────────────────────────
+    // Verify that the `from` field is correctly set on all rule conditions
+    // when a package cache is provided. Without this, rules would match
+    // imports from ANY library, not just the target package.
+
+    fn make_pkg_cache(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    // Per-change API rule should have `from` set to the resolved package
+    #[test]
+    fn test_api_rule_has_from_package() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/dist/esm/components/Modal/Modal.d.ts",
+            vec![make_api_change(
+                "Modal.title",
+                ApiChangeKind::Property,
+                ApiChangeType::Removed,
+                "Modal.title removed",
+            )],
+            vec![],
+        )];
+
+        let pkg_cache = make_pkg_cache(&[("react-core", "@patternfly/react-core")]);
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Every rule with a FrontendReferenced condition should have from set
+        for rule in &rules {
+            match &rule.when {
+                KonveyorCondition::FrontendReferenced { referenced } => {
+                    assert!(
+                        referenced.from.is_some(),
+                        "Rule {} has from=None — should be scoped to @patternfly/react-core",
+                        rule.rule_id
+                    );
+                    assert!(
+                        referenced
+                            .from
+                            .as_ref()
+                            .unwrap()
+                            .contains("@patternfly/react-core"),
+                        "Rule {} has wrong from: {:?}",
+                        rule.rule_id,
+                        referenced.from
+                    );
+                }
+                KonveyorCondition::Or { or } => {
+                    for cond in or {
+                        if let KonveyorCondition::FrontendReferenced { referenced } = cond {
+                            assert!(
+                                referenced.from.is_some(),
+                                "Rule {} has Or branch with from=None",
+                                rule.rule_id
+                            );
+                        }
+                    }
+                }
+                _ => {} // Non-FrontendReferenced conditions don't have from
+            }
+        }
+    }
+
+    // P0-C component-import-deprecated rule should have `from` set
+    #[test]
+    fn test_p0c_rule_has_from_package() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/EmptyState/EmptyStateHeader.tsx",
+            vec![make_api_change(
+                "EmptyStateHeader",
+                ApiChangeKind::Constant,
+                ApiChangeType::Removed,
+                "EmptyStateHeader removed",
+            )],
+            vec![],
+        )];
+
+        let pkg_cache = make_pkg_cache(&[("react-core", "@patternfly/react-core")]);
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let p0c_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("component-import-deprecated"));
+        assert!(p0c_rule.is_some(), "Missing P0-C rule");
+
+        match &p0c_rule.unwrap().when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(
+                    referenced.from.as_deref(),
+                    Some("@patternfly/react-core"),
+                    "P0-C rule should be scoped to @patternfly/react-core"
+                );
+            }
+            _ => panic!("P0-C rule should use FrontendReferenced condition"),
+        }
+    }
+
+    // Constant collapse combined rule should have `from` set
+    #[test]
+    fn test_constant_collapse_has_from_package() {
+        let mut api_changes = Vec::new();
+        for i in 0..15 {
+            api_changes.push(ApiChange {
+                symbol: format!("c_component_token_{}", i),
+                kind: ApiChangeKind::Constant,
+                change: ApiChangeType::Removed,
+                before: None,
+                after: None,
+                description: format!("Token {} removed", i),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            });
+        }
+
+        let changes = vec![make_file_changes(
+            "packages/react-tokens/dist/esm/tokens.d.ts",
+            api_changes,
+            vec![],
+        )];
+
+        let pkg_cache = make_pkg_cache(&[("react-tokens", "@patternfly/react-tokens")]);
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let combined = rules.iter().find(|r| r.rule_id.contains("combined"));
+        assert!(combined.is_some(), "Expected a combined constant rule");
+
+        match &combined.unwrap().when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(
+                    referenced.from.as_deref(),
+                    Some("@patternfly/react-tokens"),
+                    "Combined constant rule should be scoped to @patternfly/react-tokens"
+                );
+            }
+            _ => panic!("Combined constant rule should use FrontendReferenced condition"),
+        }
+    }
+
+    // New sibling detection rule should have `from` set
+    #[test]
+    fn test_new_sibling_rule_has_from_package() {
+        let changes = vec![
+            make_file_changes(
+                "packages/react-core/src/components/Masthead/MastheadBrand.tsx",
+                vec![make_api_change(
+                    "MastheadBrandProps.component",
+                    ApiChangeKind::Property,
+                    ApiChangeType::Removed,
+                    "component prop removed",
+                )],
+                vec![],
+            ),
+            make_file_changes(
+                "packages/react-core/src/components/Masthead/examples/Demo.tsx",
+                vec![],
+                vec![make_behavioral(
+                    "Demo",
+                    Some(BehavioralCategory::DomStructure),
+                    "<MastheadLogo> element added to render output",
+                )],
+            ),
+        ];
+
+        let pkg_cache = make_pkg_cache(&[("react-core", "@patternfly/react-core")]);
+        let report = make_report_with_added(
+            changes,
+            vec![PathBuf::from(
+                "packages/react-core/src/components/Masthead/MastheadLogo.tsx",
+            )],
+        );
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let sibling = rules.iter().find(|r| r.rule_id.contains("new-sibling"));
+        assert!(sibling.is_some(), "Expected a new-sibling rule");
+
+        match &sibling.unwrap().when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(
+                    referenced.from.as_deref(),
+                    Some("@patternfly/react-core"),
+                    "Sibling rule should be scoped to @patternfly/react-core"
+                );
+            }
+            _ => panic!("Sibling rule should use FrontendReferenced condition"),
+        }
+    }
+
+    // Rules from different packages must NOT share the same `from`
+    #[test]
+    fn test_rules_from_different_packages_have_distinct_from() {
+        let changes = vec![
+            make_file_changes(
+                "packages/react-core/dist/esm/components/Button/Button.d.ts",
+                vec![make_api_change(
+                    "Button.isActive",
+                    ApiChangeKind::Property,
+                    ApiChangeType::Removed,
+                    "isActive prop removed",
+                )],
+                vec![],
+            ),
+            make_file_changes(
+                "packages/react-icons/dist/esm/icons/CheckIcon.d.ts",
+                vec![make_api_change(
+                    "CheckIcon",
+                    ApiChangeKind::Constant,
+                    ApiChangeType::Removed,
+                    "CheckIcon removed",
+                )],
+                vec![],
+            ),
+        ];
+
+        let pkg_cache = make_pkg_cache(&[
+            ("react-core", "@patternfly/react-core"),
+            ("react-icons", "@patternfly/react-icons"),
+        ]);
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let core_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("button"))
+            .collect();
+        let icon_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("checkicon"))
+            .collect();
+
+        assert!(!core_rules.is_empty(), "Expected Button rules");
+        assert!(!icon_rules.is_empty(), "Expected CheckIcon rules");
+
+        for rule in &core_rules {
+            if let KonveyorCondition::FrontendReferenced { referenced } = &rule.when {
+                assert_eq!(
+                    referenced.from.as_deref(),
+                    Some("@patternfly/react-core"),
+                    "Button rule should be from react-core, got {:?}",
+                    referenced.from
+                );
+            }
+        }
+
+        for rule in &icon_rules {
+            if let KonveyorCondition::FrontendReferenced { referenced } = &rule.when {
+                assert_eq!(
+                    referenced.from.as_deref(),
+                    Some("@patternfly/react-icons"),
+                    "CheckIcon rule should be from react-icons, got {:?}",
+                    referenced.from
+                );
+            }
+        }
+    }
+
+    // Deprecated subpath should use anchored from: "^@patternfly/react-core/deprecated$"
+    #[test]
+    fn test_deprecated_subpath_uses_anchored_from() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/deprecated/components/Wizard/Wizard.d.ts",
+            vec![make_api_change(
+                "Wizard",
+                ApiChangeKind::Constant,
+                ApiChangeType::Removed,
+                "Deprecated Wizard removed",
+            )],
+            vec![],
+        )];
+
+        let pkg_cache = make_pkg_cache(&[("react-core", "@patternfly/react-core")]);
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Find a rule for the deprecated Wizard
+        let wizard_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.to_lowercase().contains("wizard"))
+            .collect();
+        assert!(!wizard_rules.is_empty(), "Expected Wizard rules");
+
+        // At least one should have the deprecated anchored from
+        let has_deprecated_from = wizard_rules.iter().any(|r| match &r.when {
+            KonveyorCondition::FrontendReferenced { referenced } => referenced
+                .from
+                .as_ref()
+                .map_or(false, |f| f.contains("deprecated")),
+            KonveyorCondition::Or { or } => or.iter().any(|c| {
+                if let KonveyorCondition::FrontendReferenced { referenced } = c {
+                    referenced
+                        .from
+                        .as_ref()
+                        .map_or(false, |f| f.contains("deprecated"))
+                } else {
+                    false
+                }
+            }),
+            _ => false,
+        });
+        assert!(
+            has_deprecated_from,
+            "Deprecated Wizard rules should have from containing 'deprecated'"
+        );
     }
 
     #[test]
@@ -3963,17 +7902,1203 @@ mod tests {
                 before: None,
                 after: None,
                 description: "DEFAULT_TIMEOUT removed".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
         let empty_cache = HashMap::new();
-        let rules = generate_rules(&report, "*.ts", &empty_cache, &RenamePatterns::empty());
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &empty_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
 
         assert_eq!(rules.len(), 1);
         let yaml = serde_yaml::to_string(&rules[0]).unwrap();
         assert!(yaml.contains("IMPORT"));
         assert!(yaml.contains("^DEFAULT_TIMEOUT$"));
+    }
+
+    // ── V2 package-based code path tests ────────────────────────────────
+    // These tests populate report.packages with ComponentSummary data to
+    // exercise the v2 code paths (instead of the legacy flat-changes scan).
+
+    // P0-C v2: component with high removal ratio triggers rule
+    #[test]
+    fn test_p0c_v2_triggers_for_heavily_removed_components() {
+        // Flat changes still present (for per-file rule generation)
+        let mut api_changes = Vec::new();
+        for i in 0..10 {
+            api_changes.push(make_api_change(
+                &format!("ModalProps.prop{}", i),
+                ApiChangeKind::Property,
+                ApiChangeType::Removed,
+                &format!("prop{} removed", i),
+            ));
+        }
+        for i in 10..14 {
+            api_changes.push(make_api_change(
+                &format!("ModalProps.prop{}", i),
+                ApiChangeKind::Property,
+                ApiChangeType::TypeChanged,
+                &format!("prop{} type changed", i),
+            ));
+        }
+
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Modal/Modal.tsx",
+            api_changes,
+            vec![],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+
+        // Populate packages with pre-aggregated ComponentSummary
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: Some("5.0.0".to_string()),
+            new_version: Some("6.0.0".to_string()),
+            components: vec![ComponentSummary {
+                name: "Modal".to_string(),
+                interface_name: "ModalProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary {
+                    total: 14,
+                    removed: 10,
+                    renamed: 0,
+                    type_changed: 4,
+                    added: 0,
+                    removal_ratio: 10.0 / 14.0,
+                },
+                removed_properties: (0..10)
+                    .map(|i| RemovedProperty {
+                        name: format!("prop{}", i),
+                        old_type: None,
+                        removal_disposition: None,
+                    })
+                    .collect(),
+                type_changes: (10..14)
+                    .map(|i| TypeChange {
+                        property: format!("prop{}", i),
+                        before: None,
+                        after: None,
+                    })
+                    .collect(),
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Modal has 10/14 removed (ratio > 0.5, removed >= 3) — should trigger
+        let p0c_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("component-import-deprecated"))
+            .collect();
+        assert!(
+            !p0c_rules.is_empty(),
+            "Modal with 10/14 removed props (v2 path) should get a P0-C rule"
+        );
+        assert_eq!(
+            p0c_rules[0].fix_strategy.as_ref().unwrap().strategy,
+            "LlmAssisted"
+        );
+        // Verify from field is set from pkg.name
+        match &p0c_rules[0].when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(
+                    referenced.from.as_deref(),
+                    Some("@patternfly/react-core"),
+                    "from should come from pkg.name"
+                );
+            }
+            _ => panic!("Expected FrontendReferenced condition"),
+        }
+        // Verify message uses v2 migration message builder
+        assert!(
+            p0c_rules[0].message.contains("MIGRATION"),
+            "Message should contain MIGRATION header"
+        );
+    }
+
+    // P0-C v2: component with low removal ratio does NOT trigger
+    #[test]
+    fn test_p0c_v2_skips_minor_prop_removals() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Button/Button.tsx",
+            vec![
+                make_api_change(
+                    "ButtonProps.isActive",
+                    ApiChangeKind::Property,
+                    ApiChangeType::Removed,
+                    "isActive prop removed",
+                ),
+                make_api_change(
+                    "ButtonProps.variant",
+                    ApiChangeKind::Property,
+                    ApiChangeType::TypeChanged,
+                    "variant type changed",
+                ),
+            ],
+            vec![],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "Button".to_string(),
+                interface_name: "ButtonProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary {
+                    total: 10,
+                    removed: 1,
+                    renamed: 0,
+                    type_changed: 1,
+                    added: 0,
+                    removal_ratio: 0.1,
+                },
+                removed_properties: vec![RemovedProperty {
+                    name: "isActive".to_string(),
+                    old_type: None,
+                    removal_disposition: None,
+                }],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let p0c_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("component-import-deprecated"))
+            .collect();
+        assert!(
+            p0c_rules.is_empty(),
+            "Button with 1/10 removed props (v2 path) should NOT get a P0-C rule. Got: {:?}",
+            p0c_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    // New sibling detection v2: uses child_components from packages
+    #[test]
+    fn test_new_sibling_v2_detection_from_child_components() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Masthead/MastheadBrand.tsx",
+            vec![
+                make_api_change(
+                    "MastheadBrandProps",
+                    ApiChangeKind::Interface,
+                    ApiChangeType::SignatureChanged,
+                    "Now extends HTMLDivElement instead of HTMLAnchorElement",
+                ),
+                make_api_change(
+                    "MastheadBrandProps.component",
+                    ApiChangeKind::Property,
+                    ApiChangeType::Removed,
+                    "component prop removed",
+                ),
+            ],
+            vec![],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        // Populate packages with child_components
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "MastheadBrand".to_string(),
+                interface_name: "MastheadBrandProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary {
+                    total: 5,
+                    removed: 1,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 0.2,
+                },
+                removed_properties: vec![RemovedProperty {
+                    name: "component".to_string(),
+                    old_type: None,
+                    removal_disposition: None,
+                }],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![ChildComponent {
+                    name: "MastheadLogo".to_string(),
+                    status: ChildComponentStatus::Added,
+                    known_props: vec!["href".to_string()],
+                    absorbed_props: vec![],
+                }],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let sibling_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("new-sibling"))
+            .collect();
+        assert_eq!(
+            sibling_rules.len(),
+            1,
+            "Expected 1 new-sibling rule via v2 path, got {}",
+            sibling_rules.len()
+        );
+
+        let rule = sibling_rules[0];
+        assert!(rule.message.contains("MastheadLogo"));
+        assert!(rule.message.contains("MastheadBrand"));
+        // MastheadLogo has no absorbed_props → generic child component message
+        assert!(
+            rule.message.contains("new child component"),
+            "Should show generic child component message. Msg:\n{}",
+            rule.message
+        );
+        assert_eq!(rule.fix_strategy.as_ref().unwrap().strategy, "LlmAssisted");
+        assert_eq!(rule.category, "optional");
+        // Verify from field comes from pkg.name
+        match &rule.when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(
+                    referenced.from.as_deref(),
+                    Some("@patternfly/react-core"),
+                    "from should come from pkg.name"
+                );
+            }
+            _ => panic!("Expected FrontendReferenced condition"),
+        }
+    }
+
+    // New sibling v2: only Added children generate rules (not Modified)
+    #[test]
+    fn test_new_sibling_v2_skips_modified_children() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Modal/Modal.tsx",
+            vec![make_api_change(
+                "ModalProps.title",
+                ApiChangeKind::Property,
+                ApiChangeType::Removed,
+                "title prop removed",
+            )],
+            vec![],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "Modal".to_string(),
+                interface_name: "ModalProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary::default(),
+                removed_properties: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![ChildComponent {
+                    name: "ModalHeader".to_string(),
+                    status: ChildComponentStatus::Modified, // Not Added
+                    known_props: vec![],
+                    absorbed_props: vec![],
+                }],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let sibling_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("new-sibling"))
+            .collect();
+        assert_eq!(
+            sibling_rules.len(),
+            0,
+            "Modified children should not generate sibling rules"
+        );
+    }
+
+    // P0-C v2: Removed component status triggers rule
+    #[test]
+    fn test_p0c_v2_removed_component_status_triggers() {
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/EmptyState/EmptyStateHeader.tsx",
+            vec![make_api_change(
+                "EmptyStateHeader",
+                ApiChangeKind::Constant,
+                ApiChangeType::Removed,
+                "EmptyStateHeader component removed",
+            )],
+            vec![],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "EmptyStateHeader".to_string(),
+                interface_name: "EmptyStateHeaderProps".to_string(),
+                status: ComponentStatus::Removed,
+                property_summary: PropertySummary {
+                    total: 5,
+                    removed: 5,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 1.0,
+                },
+                removed_properties: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let p0c_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("component-import-deprecated"))
+            .collect();
+        assert!(
+            !p0c_rules.is_empty(),
+            "Removed component (v2 path) should get a P0-C rule"
+        );
+        assert!(
+            p0c_rules[0].message.contains("MIGRATION"),
+            "Message should contain MIGRATION header"
+        );
+        assert!(
+            p0c_rules[0].message.contains("was removed"),
+            "Message should indicate component was removed"
+        );
+    }
+
+    // build_migration_message_v2 with migration_target
+    #[test]
+    fn test_build_migration_message_v2_with_migration_target() {
+        let comp = ComponentSummary {
+            name: "EmptyStateHeader".to_string(),
+            interface_name: "EmptyStateHeaderProps".to_string(),
+            status: ComponentStatus::Removed,
+            property_summary: PropertySummary {
+                total: 5,
+                removed: 5,
+                renamed: 0,
+                type_changed: 0,
+                added: 0,
+                removal_ratio: 1.0,
+            },
+            removed_properties: vec![],
+            type_changes: vec![],
+            migration_target: Some(MigrationTarget {
+                removed_symbol: "EmptyStateHeaderProps".to_string(),
+                removed_qualified_name: "EmptyStateHeader.EmptyStateHeaderProps".to_string(),
+                replacement_symbol: "EmptyStateProps".to_string(),
+                replacement_qualified_name: "EmptyState.EmptyStateProps".to_string(),
+                matching_members: vec![
+                    MemberMapping {
+                        old_name: "titleText".to_string(),
+                        new_name: "titleText".to_string(),
+                    },
+                    MemberMapping {
+                        old_name: "icon".to_string(),
+                        new_name: "icon".to_string(),
+                    },
+                ],
+                removed_only_members: vec!["className".to_string()],
+                overlap_ratio: 0.67,
+            }),
+            behavioral_changes: vec![make_behavioral(
+                "EmptyStateHeader",
+                Some(BehavioralCategory::RenderOutput),
+                "<EmptyStateHeader> element removed from render output",
+            )],
+            child_components: vec![],
+            source_files: vec![],
+        };
+
+        let msg = build_migration_message_v2(&comp);
+        assert!(
+            msg.contains("Replace <EmptyStateHeader>"),
+            "Should have migration header"
+        );
+        assert!(
+            msg.contains("EmptyState"),
+            "Should reference replacement component"
+        );
+        assert!(msg.contains("titleText"), "Should include property mapping");
+        assert!(msg.contains("icon"), "Should include icon in mapping");
+        assert!(
+            msg.contains("className"),
+            "Should include removed-only members"
+        );
+        assert!(
+            msg.contains("Behavioral changes"),
+            "Should include behavioral section"
+        );
+        assert!(
+            msg.contains("element removed from render output"),
+            "Should include behavioral description"
+        );
+    }
+
+    // build_migration_message_v2 for restructured component (with child components)
+    #[test]
+    fn test_build_migration_message_v2_restructured_with_children() {
+        let comp = ComponentSummary {
+            name: "Modal".to_string(),
+            interface_name: "ModalProps".to_string(),
+            status: ComponentStatus::Modified,
+            property_summary: PropertySummary {
+                total: 14,
+                removed: 10,
+                renamed: 0,
+                type_changed: 4,
+                added: 0,
+                removal_ratio: 10.0 / 14.0,
+            },
+            removed_properties: vec![
+                RemovedProperty {
+                    name: "title".to_string(),
+                    old_type: Some("string".to_string()),
+                    removal_disposition: None,
+                },
+                RemovedProperty {
+                    name: "actions".to_string(),
+                    old_type: None,
+                    removal_disposition: None,
+                },
+            ],
+            type_changes: vec![TypeChange {
+                property: "variant".to_string(),
+                before: Some("'default' | 'large'".to_string()),
+                after: Some("'default' | 'medium' | 'large'".to_string()),
+            }],
+            migration_target: None,
+            behavioral_changes: vec![],
+            child_components: vec![
+                ChildComponent {
+                    name: "ModalHeader".to_string(),
+                    status: ChildComponentStatus::Added,
+                    known_props: vec!["title".to_string(), "description".to_string()],
+                    absorbed_props: vec!["title".to_string(), "description".to_string()],
+                },
+                ChildComponent {
+                    name: "ModalFooter".to_string(),
+                    status: ChildComponentStatus::Added,
+                    known_props: vec![],
+                    absorbed_props: vec![],
+                },
+            ],
+            source_files: vec![],
+        };
+
+        let msg = build_migration_message_v2(&comp);
+        assert!(msg.contains("restructured"), "Should mention restructured");
+        assert!(
+            msg.contains("10 of 14 props removed"),
+            "Should show removal counts"
+        );
+        assert!(msg.contains("Removed props"), "Should list removed props");
+        assert!(
+            msg.contains("  - title"),
+            "Should include title in removed list"
+        );
+        assert!(
+            msg.contains("  - actions"),
+            "Should include actions in removed list"
+        );
+        assert!(
+            msg.contains("ModalHeader"),
+            "Should include ModalHeader child. Msg:\n{msg}"
+        );
+        assert!(
+            msg.contains("ModalFooter"),
+            "Should include ModalFooter child. Msg:\n{msg}"
+        );
+        // ModalHeader should show absorbed props with mechanism (pass as props since
+        // title and description are in ModalHeader's known_props)
+        assert!(
+            msg.contains("pass as props: title, description"),
+            "Should show absorbed props mapping for ModalHeader. Msg:\n{msg}"
+        );
+        assert!(
+            msg.contains("Type changes"),
+            "Should include type changes section"
+        );
+        assert!(
+            msg.contains("variant"),
+            "Should include variant type change"
+        );
+    }
+
+    // ── Tier 1: removal_disposition in migration messages ────────────
+
+    #[test]
+    fn test_migration_message_with_removal_dispositions() {
+        use semver_analyzer_core::RemovalDisposition;
+
+        let comp = ComponentSummary {
+            name: "Modal".to_string(),
+            interface_name: "ModalProps".to_string(),
+            status: ComponentStatus::Modified,
+            property_summary: PropertySummary {
+                total: 20,
+                removed: 8,
+                renamed: 0,
+                type_changed: 0,
+                added: 0,
+                removal_ratio: 8.0 / 20.0,
+            },
+            removed_properties: vec![
+                RemovedProperty {
+                    name: "title".to_string(),
+                    old_type: Some("string".to_string()),
+                    removal_disposition: Some(RemovalDisposition::MovedToChild {
+                        target_component: "ModalHeader".to_string(),
+                        mechanism: "prop".to_string(),
+                    }),
+                },
+                RemovedProperty {
+                    name: "actions".to_string(),
+                    old_type: None,
+                    removal_disposition: Some(RemovalDisposition::MovedToChild {
+                        target_component: "ModalFooter".to_string(),
+                        mechanism: "children".to_string(),
+                    }),
+                },
+                RemovedProperty {
+                    name: "footer".to_string(),
+                    old_type: None,
+                    removal_disposition: Some(RemovalDisposition::MovedToChild {
+                        target_component: "ModalFooter".to_string(),
+                        mechanism: "children".to_string(),
+                    }),
+                },
+                RemovedProperty {
+                    name: "showClose".to_string(),
+                    old_type: None,
+                    removal_disposition: Some(RemovalDisposition::TrulyRemoved),
+                },
+                RemovedProperty {
+                    name: "hasNoBodyWrapper".to_string(),
+                    old_type: None,
+                    removal_disposition: Some(RemovalDisposition::MadeAutomatic),
+                },
+            ],
+            type_changes: vec![],
+            migration_target: None,
+            behavioral_changes: vec![],
+            child_components: vec![
+                ChildComponent {
+                    name: "ModalHeader".to_string(),
+                    status: ChildComponentStatus::Added,
+                    known_props: vec!["title".to_string(), "description".to_string()],
+                    absorbed_props: vec!["title".to_string()],
+                },
+                ChildComponent {
+                    name: "ModalFooter".to_string(),
+                    status: ChildComponentStatus::Added,
+                    known_props: vec!["children".to_string(), "className".to_string()],
+                    absorbed_props: vec!["actions".to_string(), "footer".to_string()],
+                },
+            ],
+            source_files: vec![],
+        };
+
+        let msg = build_migration_message_v2(&comp);
+
+        // ModalHeader: title is a known prop → "pass as props"
+        assert!(
+            msg.contains("pass as props: title"),
+            "ModalHeader should show 'pass as props' for title. Msg:\n{msg}"
+        );
+
+        // ModalFooter: actions/footer have mechanism=children → "pass as children"
+        assert!(
+            msg.contains("pass as children: actions, footer"),
+            "ModalFooter should show 'pass as children' for actions, footer. Msg:\n{msg}"
+        );
+
+        // showClose is truly_removed → "safe to delete"
+        assert!(
+            msg.contains("safe to delete"),
+            "Should mention 'safe to delete' for truly removed props. Msg:\n{msg}"
+        );
+        assert!(
+            msg.contains("showClose"),
+            "showClose should be in safe to delete list. Msg:\n{msg}"
+        );
+
+        // hasNoBodyWrapper is made_automatic → also "safe to delete"
+        assert!(
+            msg.contains("hasNoBodyWrapper"),
+            "hasNoBodyWrapper should be in safe to delete list. Msg:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn test_p0c_suppression_covers_enriched_props() {
+        // When a component qualifies for P0-C (>= 5 removals), all its
+        // per-prop rules should be suppressed, including those with
+        // removal_disposition data.
+        use semver_analyzer_core::RemovalDisposition;
+
+        let prop_names = [
+            "title",
+            "actions",
+            "footer",
+            "description",
+            "header",
+            "help",
+        ];
+        let changes = vec![FileChanges {
+            file: "packages/react-core/src/components/Modal/Modal.ModalProps.d.ts".into(),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: prop_names
+                .iter()
+                .map(|name| ApiChange {
+                    symbol: format!("ModalProps.{}", name),
+                    kind: ApiChangeKind::Property,
+                    change: ApiChangeType::Removed,
+                    before: None,
+                    after: None,
+                    description: format!("{} removed", name),
+                    migration_target: None,
+                    removal_disposition: None,
+                    renders_element: None,
+                })
+                .collect(),
+            breaking_behavioral_changes: vec![],
+        }];
+
+        let mut report = make_report(changes, vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "Modal".to_string(),
+                interface_name: "ModalProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary {
+                    total: 20,
+                    removed: 6,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 6.0 / 20.0,
+                },
+                removed_properties: vec![
+                    RemovedProperty {
+                        name: "title".into(),
+                        old_type: None,
+                        removal_disposition: Some(RemovalDisposition::MovedToChild {
+                            target_component: "ModalHeader".into(),
+                            mechanism: "prop".into(),
+                        }),
+                    },
+                    RemovedProperty {
+                        name: "actions".into(),
+                        old_type: None,
+                        removal_disposition: Some(RemovalDisposition::MovedToChild {
+                            target_component: "ModalFooter".into(),
+                            mechanism: "children".into(),
+                        }),
+                    },
+                    RemovedProperty {
+                        name: "footer".into(),
+                        old_type: None,
+                        removal_disposition: None,
+                    },
+                    RemovedProperty {
+                        name: "description".into(),
+                        old_type: None,
+                        removal_disposition: None,
+                    },
+                    RemovedProperty {
+                        name: "header".into(),
+                        old_type: None,
+                        removal_disposition: None,
+                    },
+                    RemovedProperty {
+                        name: "help".into(),
+                        old_type: None,
+                        removal_disposition: None,
+                    },
+                ],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![
+                    ChildComponent {
+                        name: "ModalHeader".into(),
+                        status: ChildComponentStatus::Added,
+                        known_props: vec!["title".into()],
+                        absorbed_props: vec!["title".into()],
+                    },
+                    ChildComponent {
+                        name: "ModalFooter".into(),
+                        status: ChildComponentStatus::Added,
+                        known_props: vec!["children".into()],
+                        absorbed_props: vec!["actions".into()],
+                    },
+                ],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Should have a P0-C rule for Modal (6 removals >= 5 threshold)
+        let p0c_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("component-import-deprecated"));
+        assert!(
+            p0c_rule.is_some(),
+            "Should generate P0-C rule for Modal. Rule IDs: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // Per-prop removal rules should be suppressed
+        let prop_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.rule_id.contains("modalprops-title")
+                    || r.rule_id.contains("modalprops-actions")
+                    || r.rule_id.contains("modalprops-footer")
+            })
+            .collect();
+        assert!(
+            prop_rules.is_empty(),
+            "Per-prop removal rules should be suppressed by P0-C. Found: {:?}",
+            prop_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // New-sibling rules should exist and carry AST-driven prop mappings
+        let header_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("new-sibling-modalheader"));
+        assert!(
+            header_rule.is_some(),
+            "Should have enriched new-sibling rule for ModalHeader. IDs: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+        let header_msg = &header_rule.unwrap().message;
+        assert!(
+            header_msg.contains("title"),
+            "ModalHeader rule should mention title. Msg:\n{header_msg}"
+        );
+        assert!(
+            header_msg.contains("<ModalHeader title="),
+            "ModalHeader rule should show how to pass title as prop. Msg:\n{header_msg}"
+        );
+
+        let footer_rule = rules
+            .iter()
+            .find(|r| r.rule_id.contains("new-sibling-modalfooter"));
+        assert!(
+            footer_rule.is_some(),
+            "Should have enriched new-sibling rule for ModalFooter. IDs: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+        let footer_msg = &footer_rule.unwrap().message;
+        assert!(
+            footer_msg.contains("actions"),
+            "ModalFooter rule should mention actions. Msg:\n{footer_msg}"
+        );
+        assert!(
+            footer_msg.contains("pass as children"),
+            "ModalFooter rule should show 'pass as children' for actions. Msg:\n{footer_msg}"
+        );
+    }
+
+    // ── Fix #3: Internal component behavioral rules filtered ────────
+
+    #[test]
+    fn test_is_internal_only_behavioral_skipped() {
+        // A behavioral change with is_internal_only=true should not produce a rule
+        let mut internal_beh = make_behavioral(
+            "ModalBox",
+            Some(BehavioralCategory::DomStructure),
+            "Internal wrapper now uses div instead of section",
+        );
+        internal_beh.is_internal_only = Some(true);
+
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Modal/ModalBox.tsx",
+            vec![],
+            vec![internal_beh],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let modalbox_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("modalbox"))
+            .collect();
+        assert!(
+            modalbox_rules.is_empty(),
+            "is_internal_only=true should suppress rule. Found: {:?}",
+            modalbox_rules
+                .iter()
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_non_public_behavioral_skipped_when_packages_present() {
+        // A behavioral change for a symbol NOT in report.packages should be skipped
+        // when packages data is available (non-empty).
+        let internal_beh = make_behavioral(
+            "MenuBase",
+            Some(BehavioralCategory::DomStructure),
+            "Internal base component changed",
+        );
+
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Menu/MenuBase.tsx",
+            vec![],
+            vec![internal_beh],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        // Add packages with only "Menu" as a public component (not "MenuBase")
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "Menu".to_string(),
+                interface_name: "MenuProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary {
+                    total: 5,
+                    removed: 0,
+                    renamed: 0,
+                    type_changed: 1,
+                    added: 0,
+                    removal_ratio: 0.0,
+                },
+                removed_properties: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let menubase_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("menubase"))
+            .collect();
+        assert!(
+            menubase_rules.is_empty(),
+            "Non-public symbol 'MenuBase' should not produce a rule. Found: {:?}",
+            menubase_rules
+                .iter()
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Fix #4: prop-value-change suppressed by type-changed ──────
+
+    #[test]
+    fn test_suppress_redundant_prop_value_rules() {
+        // Create two rules that would overlap:
+        // 1. type-changed rule with value constraint (from per-value virtual file)
+        // 2. prop-value-change rule with same value constraint (from main props file)
+        let type_changed_rule = KonveyorRule {
+            rule_id: "semver-label-color-type-changed".to_string(),
+            labels: vec![
+                "source=semver-analyzer".to_string(),
+                "change-type=type-changed".to_string(),
+            ],
+            effort: 3,
+            category: "mandatory".to_string(),
+            description: "Type of color changed".to_string(),
+            message: "Full union type change".to_string(),
+            links: vec![],
+            when: KonveyorCondition::Or {
+                or: vec![
+                    KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern: "^color$".to_string(),
+                            location: "JSX_PROP".to_string(),
+                            component: Some("^Label$".to_string()),
+                            parent: None,
+                            value: Some("^cyan$".to_string()),
+                            from: Some("@patternfly/react-core".to_string()),
+                        },
+                    },
+                    KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern: "^color$".to_string(),
+                            location: "JSX_PROP".to_string(),
+                            component: Some("^Label$".to_string()),
+                            parent: None,
+                            value: Some("^gold$".to_string()),
+                            from: Some("@patternfly/react-core".to_string()),
+                        },
+                    },
+                ],
+            },
+            fix_strategy: None,
+        };
+
+        let prop_value_rule = KonveyorRule {
+            rule_id: "semver-label-color-prop-value-change".to_string(),
+            labels: vec![
+                "source=semver-analyzer".to_string(),
+                "change-type=prop-value-change".to_string(),
+            ],
+            effort: 1,
+            category: "mandatory".to_string(),
+            description: "Prop value removed".to_string(),
+            message: "Value cyan removed from color".to_string(),
+            links: vec![],
+            when: KonveyorCondition::Or {
+                or: vec![
+                    KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern: "^color$".to_string(),
+                            location: "JSX_PROP".to_string(),
+                            component: Some("^Label$".to_string()),
+                            parent: None,
+                            value: Some("^cyan$".to_string()),
+                            from: Some("@patternfly/react-core".to_string()),
+                        },
+                    },
+                    KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern: "^color$".to_string(),
+                            location: "JSX_PROP".to_string(),
+                            component: Some("^Label$".to_string()),
+                            parent: None,
+                            value: Some("^gold$".to_string()),
+                            from: Some("@patternfly/react-core".to_string()),
+                        },
+                    },
+                ],
+            },
+            fix_strategy: None,
+        };
+
+        // Also include an unrelated rule to verify it's kept
+        let unrelated_rule = KonveyorRule {
+            rule_id: "semver-button-variant-type-changed".to_string(),
+            labels: vec![
+                "source=semver-analyzer".to_string(),
+                "change-type=type-changed".to_string(),
+            ],
+            effort: 3,
+            category: "mandatory".to_string(),
+            description: "Button variant changed".to_string(),
+            message: "Variant type narrowed".to_string(),
+            links: vec![],
+            when: KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: "^variant$".to_string(),
+                    location: "JSX_PROP".to_string(),
+                    component: Some("^Button$".to_string()),
+                    parent: None,
+                    value: None,
+                    from: Some("@patternfly/react-core".to_string()),
+                },
+            },
+            fix_strategy: None,
+        };
+
+        let rules = vec![type_changed_rule, prop_value_rule, unrelated_rule];
+
+        let result = suppress_redundant_prop_value_rules(rules);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "Should suppress 1 prop-value-change rule, keeping 2. IDs: {:?}",
+            result.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // type-changed should survive
+        assert!(
+            result
+                .iter()
+                .any(|r| r.rule_id == "semver-label-color-type-changed"),
+            "type-changed rule should survive"
+        );
+        // prop-value-change should be suppressed
+        assert!(
+            !result
+                .iter()
+                .any(|r| r.rule_id == "semver-label-color-prop-value-change"),
+            "prop-value-change rule should be suppressed"
+        );
+        // Unrelated rule kept
+        assert!(
+            result
+                .iter()
+                .any(|r| r.rule_id == "semver-button-variant-type-changed"),
+            "Unrelated rule should be kept"
+        );
+    }
+
+    #[test]
+    fn test_public_behavioral_not_skipped() {
+        // A behavioral change for a public symbol should still produce a rule
+        let beh = make_behavioral(
+            "Menu",
+            Some(BehavioralCategory::DomStructure),
+            "Menu now renders nav element",
+        );
+
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Menu/Menu.tsx",
+            vec![],
+            vec![beh],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "Menu".to_string(),
+                interface_name: "MenuProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary {
+                    total: 5,
+                    removed: 0,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 0.0,
+                },
+                removed_properties: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let menu_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("menu") && r.rule_id.contains("behavioral"))
+            .collect();
+        assert!(
+            !menu_rules.is_empty(),
+            "Public symbol 'Menu' should produce a behavioral rule. IDs: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
     }
 }

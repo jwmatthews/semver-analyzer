@@ -159,6 +159,10 @@ pub struct FileBehavioralChange {
     #[serde(default)]
     pub category: Option<String>,
     pub description: String,
+    /// Whether this change only affects internal rendering and does NOT
+    /// require consumer code changes.
+    #[serde(default)]
+    pub is_internal_only: Option<bool>,
 }
 
 fn default_kind() -> String {
@@ -172,6 +176,31 @@ pub struct FileApiChange {
     #[serde(default = "default_change")]
     pub change: String,
     pub description: String,
+    /// Why a removed prop was removed and where its functionality went.
+    #[serde(default)]
+    pub removal_disposition: Option<LlmRemovalDisposition>,
+    /// HTML element the component renders (e.g., "ol", "div").
+    #[serde(default)]
+    pub renders_element: Option<String>,
+}
+
+/// LLM-provided disposition for a removed prop.
+/// Deserialized from the LLM's JSON response.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LlmRemovalDisposition {
+    /// Prop moved to a child component.
+    MovedToChild {
+        target_component: String,
+        /// "prop" or "children"
+        mechanism: String,
+    },
+    /// Replaced by a different prop on the same component.
+    ReplacedByProp { new_prop: String },
+    /// Functionality is now automatic.
+    MadeAutomatic,
+    /// Truly removed with no replacement.
+    TrulyRemoved,
 }
 
 fn default_change() -> String {
@@ -480,6 +509,266 @@ The function validates email addresses."#;
         let (beh, api) = parse_file_behavioral_response(response).unwrap();
         assert!(beh.is_empty());
         assert!(api.is_empty());
+    }
+
+    // ── Tier 1 structured field parsing ─────────────────────────────
+
+    #[test]
+    fn parse_removal_disposition_moved_to_child() {
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [],
+  "breaking_api_changes": [
+    {
+      "symbol": "ModalProps.actions",
+      "change": "removed",
+      "description": "actions prop removed, pass as children of ModalFooter",
+      "removal_disposition": {
+        "type": "moved_to_child",
+        "target_component": "ModalFooter",
+        "mechanism": "children"
+      }
+    }
+  ]
+}
+```"#;
+        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
+        assert_eq!(api.len(), 1);
+        assert_eq!(api[0].symbol, "ModalProps.actions");
+        let disp = api[0]
+            .removal_disposition
+            .as_ref()
+            .expect("Should have disposition");
+        match disp {
+            LlmRemovalDisposition::MovedToChild {
+                target_component,
+                mechanism,
+            } => {
+                assert_eq!(target_component, "ModalFooter");
+                assert_eq!(mechanism, "children");
+            }
+            _ => panic!("Expected MovedToChild, got {:?}", disp),
+        }
+    }
+
+    #[test]
+    fn parse_removal_disposition_moved_to_child_as_prop() {
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [],
+  "breaking_api_changes": [
+    {
+      "symbol": "ModalProps.title",
+      "change": "removed",
+      "description": "title prop moved to ModalHeader",
+      "removal_disposition": {
+        "type": "moved_to_child",
+        "target_component": "ModalHeader",
+        "mechanism": "prop"
+      }
+    }
+  ]
+}
+```"#;
+        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
+        let disp = api[0].removal_disposition.as_ref().unwrap();
+        match disp {
+            LlmRemovalDisposition::MovedToChild {
+                target_component,
+                mechanism,
+            } => {
+                assert_eq!(target_component, "ModalHeader");
+                assert_eq!(mechanism, "prop");
+            }
+            _ => panic!("Expected MovedToChild, got {:?}", disp),
+        }
+    }
+
+    #[test]
+    fn parse_removal_disposition_replaced_by_prop() {
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [],
+  "breaking_api_changes": [
+    {
+      "symbol": "ButtonProps.isFlat",
+      "change": "removed",
+      "description": "isFlat replaced by isPlain",
+      "removal_disposition": {
+        "type": "replaced_by_prop",
+        "new_prop": "isPlain"
+      }
+    }
+  ]
+}
+```"#;
+        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
+        let disp = api[0].removal_disposition.as_ref().unwrap();
+        match disp {
+            LlmRemovalDisposition::ReplacedByProp { new_prop } => {
+                assert_eq!(new_prop, "isPlain");
+            }
+            _ => panic!("Expected ReplacedByProp, got {:?}", disp),
+        }
+    }
+
+    #[test]
+    fn parse_removal_disposition_truly_removed() {
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [],
+  "breaking_api_changes": [
+    {
+      "symbol": "ModalProps.showClose",
+      "change": "removed",
+      "description": "showClose removed, close button now controlled by onClose presence",
+      "removal_disposition": {"type": "truly_removed"}
+    }
+  ]
+}
+```"#;
+        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
+        let disp = api[0].removal_disposition.as_ref().unwrap();
+        assert!(matches!(disp, LlmRemovalDisposition::TrulyRemoved));
+    }
+
+    #[test]
+    fn parse_removal_disposition_made_automatic() {
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [],
+  "breaking_api_changes": [
+    {
+      "symbol": "SelectProps.isDynamic",
+      "change": "removed",
+      "description": "isDynamic now inferred automatically",
+      "removal_disposition": {"type": "made_automatic"}
+    }
+  ]
+}
+```"#;
+        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
+        let disp = api[0].removal_disposition.as_ref().unwrap();
+        assert!(matches!(disp, LlmRemovalDisposition::MadeAutomatic));
+    }
+
+    #[test]
+    fn parse_removal_disposition_null_is_none() {
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [],
+  "breaking_api_changes": [
+    {
+      "symbol": "FooProps.bar",
+      "change": "removed",
+      "description": "bar removed",
+      "removal_disposition": null
+    }
+  ]
+}
+```"#;
+        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
+        assert!(api[0].removal_disposition.is_none());
+    }
+
+    #[test]
+    fn parse_removal_disposition_missing_is_none() {
+        // Backward compat: old responses without the field should still parse
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [],
+  "breaking_api_changes": [
+    {
+      "symbol": "FooProps.bar",
+      "change": "removed",
+      "description": "bar removed"
+    }
+  ]
+}
+```"#;
+        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
+        assert!(api[0].removal_disposition.is_none());
+    }
+
+    #[test]
+    fn parse_is_internal_only() {
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [
+    {
+      "symbol": "ClipboardCopyButton",
+      "kind": "class",
+      "category": "render_output",
+      "description": "CopyIcon now passed via icon prop internally",
+      "is_internal_only": true
+    },
+    {
+      "symbol": "Modal",
+      "kind": "class",
+      "category": "dom_structure",
+      "description": "Modal no longer renders ModalBoxBody wrapper",
+      "is_internal_only": false
+    }
+  ],
+  "breaking_api_changes": []
+}
+```"#;
+        let (beh, _api) = parse_file_behavioral_response(response).unwrap();
+        assert_eq!(beh.len(), 2);
+        assert_eq!(beh[0].is_internal_only, Some(true));
+        assert_eq!(beh[1].is_internal_only, Some(false));
+    }
+
+    #[test]
+    fn parse_is_internal_only_missing_is_none() {
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [
+    {"symbol": "Foo", "kind": "class", "description": "changed"}
+  ],
+  "breaking_api_changes": []
+}
+```"#;
+        let (beh, _api) = parse_file_behavioral_response(response).unwrap();
+        assert!(beh[0].is_internal_only.is_none());
+    }
+
+    #[test]
+    fn parse_renders_element() {
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [],
+  "breaking_api_changes": [
+    {
+      "symbol": "TextList",
+      "change": "removed",
+      "description": "TextList removed, use Content instead",
+      "renders_element": "ol"
+    }
+  ]
+}
+```"#;
+        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
+        assert_eq!(api[0].renders_element.as_deref(), Some("ol"));
+    }
+
+    #[test]
+    fn parse_renders_element_null_is_none() {
+        let response = r#"```json
+{
+  "breaking_behavioral_changes": [],
+  "breaking_api_changes": [
+    {
+      "symbol": "ModalProps.title",
+      "change": "removed",
+      "description": "title removed",
+      "renders_element": null
+    }
+  ]
+}
+```"#;
+        let (_beh, api) = parse_file_behavioral_response(response).unwrap();
+        assert!(api[0].renders_element.is_none());
     }
 
     #[test]
