@@ -928,7 +928,10 @@ fn build_package_summaries(
                 s.name == component_name
                     && matches!(
                         s.kind,
-                        SymbolKind::Variable | SymbolKind::Class | SymbolKind::Function
+                        SymbolKind::Variable
+                            | SymbolKind::Class
+                            | SymbolKind::Function
+                            | SymbolKind::Constant
                     )
             });
             if component_still_exists {
@@ -1227,13 +1230,15 @@ fn discover_child_components(
         }
 
         // Only consider component-like symbols (Variable = function component,
-        // Class = class component, Function = function component).
-        // Skip enums, interfaces, type aliases, constants -- those are types,
+        // Class = class component, Function = function component,
+        // Constant = `export const Foo = ...` function component).
+        // Skip enums, interfaces, type aliases -- those are types,
         // not renderable components.
         match sym.kind {
             semver_analyzer_core::SymbolKind::Variable
             | semver_analyzer_core::SymbolKind::Class
-            | semver_analyzer_core::SymbolKind::Function => {}
+            | semver_analyzer_core::SymbolKind::Function
+            | semver_analyzer_core::SymbolKind::Constant => {}
             _ => continue,
         }
         if children_map.contains_key(name) {
