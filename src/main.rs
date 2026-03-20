@@ -246,6 +246,22 @@ async fn cmd_analyze(
         }
     }
 
+    // ── Merge hierarchy deltas into the report ─────────────────────────
+    //
+    // The orchestrator computed hierarchy deltas (added/removed children
+    // per component). Now enrich them with prop migration data by
+    // matching removed parent props against child component props from
+    // the new API surface, and populate expected_children on each
+    // ComponentSummary.
+    if !result.hierarchy_deltas.is_empty() || !result.new_hierarchies.is_empty() {
+        enrich_hierarchy_deltas(
+            &mut report,
+            result.hierarchy_deltas,
+            &result.new_surface,
+            &result.new_hierarchies,
+        );
+    }
+
     let total_breaking = report.summary.total_breaking_changes;
     eprintln!();
     if total_breaking == 0 {
@@ -671,6 +687,7 @@ fn build_report(
         packages,
         member_renames: std::collections::HashMap::new(), // Populated in Phase 2e
         inferred_rename_patterns,
+        hierarchy_deltas: Vec::new(), // Populated by hierarchy inference phase
         metadata: AnalysisMetadata {
             call_graph_analysis: call_graph_info.to_string(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1019,6 +1036,7 @@ fn build_package_summaries(
             migration_target,
             behavioral_changes: component_behavioral,
             child_components,
+            expected_children: Vec::new(), // Populated by hierarchy inference phase
             source_files: source_file.into_iter().collect(),
         };
 
@@ -1675,6 +1693,145 @@ fn qualified_name_to_file(qualified_name: &str) -> std::path::PathBuf {
     } else {
         std::path::PathBuf::from(qualified_name)
     }
+}
+
+// ─── Hierarchy Delta Enrichment ──────────────────────────────────────────
+
+/// Enrich hierarchy deltas with prop migration data and populate
+/// `expected_children` on each `ComponentSummary`.
+///
+/// For each hierarchy delta:
+///  1. Find the parent component's `ComponentSummary` and its `removed_properties`.
+///  2. For each added child, check if the child component's props (from the new
+///     surface AST) include any of the removed parent props.
+///  3. Store the matches as `MigratedProp` entries on the delta.
+///  4. Populate `expected_children` on the parent's `ComponentSummary`.
+fn enrich_hierarchy_deltas(
+    report: &mut semver_analyzer_core::AnalysisReport,
+    mut deltas: Vec<semver_analyzer_core::HierarchyDelta>,
+    new_surface: &semver_analyzer_core::ApiSurface,
+    new_hierarchies: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, Vec<semver_analyzer_llm::LlmExpectedChild>>,
+    >,
+) {
+    use semver_analyzer_core::{ExpectedChild, MigratedProp, SymbolKind};
+    use std::collections::{HashMap, HashSet};
+
+    // Build a lookup of component name → props from the new surface.
+    // For each exported interface/class ending in "Props", extract member names.
+    // Also check the component symbol's own members.
+    let mut component_props: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for sym in &new_surface.symbols {
+        // Interface/TypeAlias: FooProps → component "Foo" gets these props
+        if matches!(sym.kind, SymbolKind::Interface | SymbolKind::TypeAlias) {
+            if let Some(comp_name) = sym.name.strip_suffix("Props") {
+                let props: HashSet<String> = sym.members.iter().map(|m| m.name.clone()).collect();
+                component_props
+                    .entry(comp_name.to_string())
+                    .or_default()
+                    .extend(props);
+            }
+        }
+
+        // Component symbol itself may have members (from destructured props)
+        if matches!(
+            sym.kind,
+            SymbolKind::Variable
+                | SymbolKind::Function
+                | SymbolKind::Class
+                | SymbolKind::Constant
+        ) && sym.name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+        {
+            let props: HashSet<String> = sym.members.iter().map(|m| m.name.clone()).collect();
+            if !props.is_empty() {
+                component_props
+                    .entry(sym.name.clone())
+                    .or_default()
+                    .extend(props);
+            }
+        }
+    }
+
+    // Enrich each delta with migrated props
+    for delta in &mut deltas {
+        // Find the parent component's removed properties
+        let removed_props: Vec<String> = report
+            .packages
+            .iter()
+            .flat_map(|pkg| &pkg.components)
+            .find(|c| c.name == delta.component)
+            .map(|c| {
+                c.removed_properties
+                    .iter()
+                    .map(|rp| rp.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if removed_props.is_empty() {
+            continue;
+        }
+
+        // For each added child, check if its props overlap with removed parent props
+        for child in &delta.added_children {
+            let child_props = match component_props.get(&child.name) {
+                Some(props) => props,
+                None => continue,
+            };
+
+            for removed_prop in &removed_props {
+                // Direct name match: parent had "title", child has "title"
+                if child_props.contains(removed_prop) {
+                    delta.migrated_props.push(MigratedProp {
+                        prop_name: removed_prop.clone(),
+                        target_child: child.name.clone(),
+                        target_prop_name: None, // same name
+                    });
+                }
+                // TODO: fuzzy matching (bodyAriaRole → role) could be added
+                // later via the purpose field from LLM or string similarity
+            }
+        }
+    }
+
+    // Populate expected_children on ComponentSummary entries from the FULL
+    // new-version hierarchy (not just deltas). This ensures every component
+    // gets its complete expected_children list, including children that
+    // existed in both old and new versions (no delta).
+    for (_family, family_hierarchy) in new_hierarchies {
+        for (comp_name, children) in family_hierarchy {
+            for pkg in &mut report.packages {
+                for comp in &mut pkg.components {
+                    if comp.name == *comp_name {
+                        for child in children {
+                            if !comp.expected_children.iter().any(|ec| ec.name == child.name) {
+                                comp.expected_children.push(ExpectedChild {
+                                    name: child.name.clone(),
+                                    required: child.required,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Store deltas on the report
+    report.hierarchy_deltas = deltas;
+
+    let total_migrated: usize = report
+        .hierarchy_deltas
+        .iter()
+        .map(|d| d.migrated_props.len())
+        .sum();
+    eprintln!(
+        "[Hierarchy] Enriched {} deltas with {} migrated props, populated expected_children",
+        report.hierarchy_deltas.len(),
+        total_migrated,
+    );
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────

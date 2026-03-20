@@ -604,6 +604,7 @@ mod tests {
             "src/Modal.tsx",
             "- <div>old</div>\n+ <section>new</section>",
             &funcs,
+            None,
         );
         assert!(prompt.contains("Modal"));
         assert!(prompt.contains("src/Modal.tsx"));
@@ -811,5 +812,64 @@ Rules:
         to_ref = to_ref,
         removed_list = removed_list,
         added_list = added_list,
+    )
+}
+
+/// Build a prompt to infer the component hierarchy for a component family.
+///
+/// The LLM receives the full source code of all files in a component family
+/// directory and determines the expected parent-child composition structure
+/// for consumers of the library.
+///
+/// Props are NOT included in the prompt — they come from the AST surface.
+/// The LLM only needs to determine the hierarchy (what goes inside what).
+pub fn build_hierarchy_inference_prompt(family_name: &str, files_content: &str) -> String {
+    format!(
+        r#"Analyze this component family and determine the expected parent-child composition hierarchy for consumers of this library.
+
+## Component family: `{family_name}`
+
+## Source files:
+{files_content}
+
+## Task:
+For each **exported** component in this family, determine:
+1. What other components from this family should be used as its direct children?
+2. Is each child required (must be present) or optional?
+
+Base your analysis on:
+- What each component renders internally in its JSX return (components rendered internally are NOT expected children — consumers don't provide them)
+- The relationship between wrapper components and their base components (e.g., if Dropdown renders Menu+MenuContent internally but NOT MenuList, then DropdownList which wraps MenuList is an expected child)
+- Standard React/HTML composition patterns (ul→li, table→tr, etc.)
+- Export structure (index.ts) — only include exported components
+
+## What to EXCLUDE from expected_children:
+- Internal/private components not exported from index.ts
+- Base components from other families (e.g., Menu, MenuList — those are internal)
+- HTML elements
+- The component itself
+
+## Output format:
+Return ONLY a JSON object inside a ```json fenced block:
+```json
+{{
+  "components": {{
+    "<ComponentName>": {{
+      "expected_children": [
+        {{ "name": "<ChildComponentName>", "required": true }}
+      ]
+    }}
+  }}
+}}
+```
+
+Rules:
+- Only include components that are exported to consumers (appear in index.ts or are publicly exported)
+- A child is "required" if the parent component functionally needs it (e.g., items need a list wrapper)
+- A child is "optional" if it enhances the parent but the parent works without it
+- If a component has no expected children from this family, use an empty array
+- Do NOT include components from other families as children"#,
+        family_name = family_name,
+        files_content = files_content,
     )
 }

@@ -24,7 +24,7 @@ mod spec_compare;
 use anyhow::Result;
 pub use invoke::{
     FileApiChange, FileBehavioralChange, LlmCompositionChange, LlmConstantRenamePattern,
-    LlmInterfaceRenameMapping, LlmRemovalDisposition,
+    LlmExpectedChild, LlmInterfaceRenameMapping, LlmRemovalDisposition,
 };
 use semver_analyzer_core::{
     BehaviorAnalyzer, BreakingVerdict, ChangedFunction, EvidenceSource, FunctionSpec, TestDiff,
@@ -121,6 +121,20 @@ impl LlmBehaviorAnalyzer {
         );
         let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
         invoke::parse_constant_rename_response(&response)
+    }
+
+    /// Infer the component hierarchy for a single component family.
+    ///
+    /// Takes the concatenated source files of a component directory and returns
+    /// the expected parent-child composition structure.
+    pub fn infer_component_hierarchy(
+        &self,
+        family_name: &str,
+        files_content: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<LlmExpectedChild>>> {
+        let prompt = prompts::build_hierarchy_inference_prompt(family_name, files_content);
+        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        invoke::parse_hierarchy_response(&response)
     }
 
     /// Infer interface/component rename mappings from removed/added interface data.

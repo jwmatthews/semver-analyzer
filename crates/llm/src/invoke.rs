@@ -431,6 +431,49 @@ pub fn parse_interface_rename_response(response: &str) -> Result<Vec<LlmInterfac
     Ok(mappings)
 }
 
+// ── Hierarchy inference response parsing ─────────────────────────────
+
+/// An expected child from the LLM hierarchy response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmExpectedChild {
+    pub name: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// The top-level LLM hierarchy response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmHierarchyResponse {
+    pub components: std::collections::HashMap<String, LlmComponentHierarchy>,
+}
+
+/// A single component's hierarchy entry from the LLM.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmComponentHierarchy {
+    #[serde(default)]
+    pub expected_children: Vec<LlmExpectedChild>,
+}
+
+/// Parse the LLM response for hierarchy inference.
+/// Returns a map of component name → expected children.
+pub fn parse_hierarchy_response(
+    response: &str,
+) -> Result<std::collections::HashMap<String, Vec<LlmExpectedChild>>> {
+    let json_str =
+        extract_json(response).with_context(|| "No JSON found in hierarchy inference response")?;
+    let parsed: LlmHierarchyResponse = serde_json::from_str(&json_str).with_context(|| {
+        format!(
+            "Failed to parse hierarchy response: {}",
+            truncate(&json_str, 300)
+        )
+    })?;
+    Ok(parsed
+        .components
+        .into_iter()
+        .map(|(name, h)| (name, h.expected_children))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,5 +936,96 @@ The function validates email addresses."#;
         assert!(verdict.is_breaking);
         assert_eq!(verdict.reasons.len(), 1);
         assert!((verdict.confidence - 0.75).abs() < f64::EPSILON);
+    }
+
+    // ── Hierarchy inference tests ───────────────────────────────────
+
+    #[test]
+    fn parse_hierarchy_response_dropdown_family() {
+        let response = r#"```json
+{
+  "components": {
+    "Dropdown": {
+      "expected_children": [
+        { "name": "DropdownList", "required": true },
+        { "name": "DropdownGroup", "required": false }
+      ]
+    },
+    "DropdownList": {
+      "expected_children": [
+        { "name": "DropdownItem", "required": true }
+      ]
+    },
+    "DropdownGroup": {
+      "expected_children": [
+        { "name": "DropdownItem", "required": true }
+      ]
+    },
+    "DropdownItem": {
+      "expected_children": []
+    }
+  }
+}
+```"#;
+        let result = parse_hierarchy_response(response).unwrap();
+        assert_eq!(result.len(), 4);
+
+        let dropdown = &result["Dropdown"];
+        assert_eq!(dropdown.len(), 2);
+        assert_eq!(dropdown[0].name, "DropdownList");
+        assert!(dropdown[0].required);
+        assert_eq!(dropdown[1].name, "DropdownGroup");
+        assert!(!dropdown[1].required);
+
+        let list = &result["DropdownList"];
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "DropdownItem");
+
+        let item = &result["DropdownItem"];
+        assert!(item.is_empty());
+    }
+
+    #[test]
+    fn parse_hierarchy_response_modal_family() {
+        let response = r#"```json
+{
+  "components": {
+    "Modal": {
+      "expected_children": [
+        { "name": "ModalHeader", "required": false },
+        { "name": "ModalBody", "required": true },
+        { "name": "ModalFooter", "required": false }
+      ]
+    },
+    "ModalHeader": { "expected_children": [] },
+    "ModalBody": { "expected_children": [] },
+    "ModalFooter": { "expected_children": [] }
+  }
+}
+```"#;
+        let result = parse_hierarchy_response(response).unwrap();
+        assert_eq!(result.len(), 4);
+
+        let modal = &result["Modal"];
+        assert_eq!(modal.len(), 3);
+        assert!(!modal[0].required); // ModalHeader optional
+        assert!(modal[1].required); // ModalBody required
+        assert!(!modal[2].required); // ModalFooter optional
+    }
+
+    #[test]
+    fn parse_hierarchy_response_empty_components() {
+        let response = r#"```json
+{
+  "components": {
+    "Badge": {
+      "expected_children": []
+    }
+  }
+}
+```"#;
+        let result = parse_hierarchy_response(response).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result["Badge"].is_empty());
     }
 }

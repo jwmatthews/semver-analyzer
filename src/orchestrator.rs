@@ -158,6 +158,31 @@ pub async fn run_concurrent_analysis(
         .cloned()
         .unwrap_or_else(|| semver_analyzer_core::ApiSurface { symbols: vec![] });
 
+    // ── Hierarchy Inference Phase ──────────────────────────────────────
+    //
+    // Infer component hierarchy for both versions by giving the LLM each
+    // component family's source code.  Then diff the hierarchies to find
+    // structural composition changes (e.g., DropdownList became a required
+    // child of Dropdown).  This replaces P0-C's heuristic-based approach.
+    let (hierarchy_deltas, new_hierarchies) = if !no_llm {
+        let llm_cmd = phase1
+            .llm_command
+            .as_deref()
+            .unwrap_or("goose run --no-session -q -t");
+        infer_and_diff_hierarchies(
+            repo,
+            from_ref,
+            to_ref,
+            llm_cmd,
+            &td.structural_changes,
+            &old_surface,
+            &new_surface,
+        )
+        .await
+    } else {
+        (Vec::new(), std::collections::HashMap::new())
+    };
+
     Ok(AnalysisResult {
         structural_changes: td.structural_changes,
         behavioral_changes,
@@ -169,6 +194,8 @@ pub async fn run_concurrent_analysis(
         new_surface,
         inferred_rename_patterns,
         composition_changes,
+        hierarchy_deltas,
+        new_hierarchies,
     })
 }
 
@@ -192,6 +219,15 @@ pub struct AnalysisResult {
     /// Composition pattern changes from test/example diffs.
     /// Keyed by source file path (the component these patterns are about).
     pub composition_changes: Vec<(String, Vec<semver_analyzer_core::CompositionPatternChange>)>,
+    /// Component hierarchy deltas computed from LLM hierarchy inference on
+    /// both old and new versions. Each delta describes how a component's
+    /// expected children changed between versions.
+    pub hierarchy_deltas: Vec<semver_analyzer_core::HierarchyDelta>,
+    /// Full new-version hierarchy from LLM inference. Maps component name
+    /// to expected children. Used to populate `expected_children` on all
+    /// ComponentSummary entries, not just those with deltas.
+    pub new_hierarchies:
+        std::collections::HashMap<String, std::collections::HashMap<String, Vec<semver_analyzer_llm::LlmExpectedChild>>>,
 }
 
 /// An API change detected by the LLM during file-level analysis.
@@ -1591,6 +1627,347 @@ fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> 
     } else {
         None
     }
+}
+
+// ── Component Hierarchy Inference ────────────────────────────────────────
+//
+// Infers the component parent-child hierarchy for both versions by giving
+// the LLM each component family's source code, then diffs the hierarchies
+// to produce HierarchyDelta entries.
+
+/// Identify component family directories that qualify for hierarchy inference.
+///
+/// A family qualifies when:
+///  1. It has 2+ exported `.tsx` component files in the directory.
+///  2. At least one component in the family has breaking changes.
+fn find_qualifying_families(
+    repo: &Path,
+    git_ref: &str,
+    structural_changes: &[semver_analyzer_core::StructuralChange],
+    surface: &semver_analyzer_core::ApiSurface,
+) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+
+    // Collect directories with breaking changes
+    let changed_dirs: HashSet<String> = structural_changes
+        .iter()
+        .filter(|c| c.is_breaking)
+        .filter_map(|c| {
+            c.qualified_name
+                .rsplit_once('/')
+                .map(|(dir, _)| dir.rsplit_once('/').map(|(_, d)| d.to_string()))
+                .flatten()
+        })
+        .collect();
+
+    // Group surface symbols by component directory
+    let mut dir_components: HashMap<String, HashSet<String>> = HashMap::new();
+    for sym in &surface.symbols {
+        // Only count component-like exported symbols
+        match sym.kind {
+            semver_analyzer_core::SymbolKind::Variable
+            | semver_analyzer_core::SymbolKind::Class
+            | semver_analyzer_core::SymbolKind::Function
+            | semver_analyzer_core::SymbolKind::Constant => {}
+            _ => continue,
+        }
+        if !sym.name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            continue;
+        }
+        // Extract component directory from qualified name
+        // e.g., "packages/react-core/src/components/Dropdown/Dropdown.DropdownProps" → "Dropdown"
+        if let Some((dir_path, _)) = sym.qualified_name.rsplit_once('/') {
+            if let Some((_, dir_name)) = dir_path.rsplit_once('/') {
+                dir_components
+                    .entry(dir_name.to_string())
+                    .or_default()
+                    .insert(sym.name.clone());
+            }
+        }
+    }
+
+    // Filter to families with 2+ components AND breaking changes
+    dir_components
+        .into_iter()
+        .filter(|(dir, components)| components.len() >= 2 && changed_dirs.contains(dir))
+        .map(|(dir, _)| dir)
+        .collect()
+}
+
+/// Read all source files for a component family from a git ref.
+///
+/// Returns concatenated file contents with file path separators,
+/// ready for the LLM prompt.
+fn read_family_files(repo: &Path, git_ref: &str, family_dir: &str) -> Option<String> {
+    // List all files in the component directory at this git ref
+    let output = std::process::Command::new("git")
+        .args([
+            "ls-tree",
+            "-r",
+            "--name-only",
+            git_ref,
+        ])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let all_files = String::from_utf8_lossy(&output.stdout);
+
+    // Find files matching this family directory pattern
+    // Look in both main and next/deprecated paths for component directories
+    let mut family_files: Vec<String> = Vec::new();
+    for line in all_files.lines() {
+        // Match patterns like:
+        //   packages/*/src/components/{family_dir}/*.tsx
+        //   packages/*/src/next/components/{family_dir}/*.tsx
+        if !line.ends_with(".tsx") && !line.ends_with(".ts") {
+            continue;
+        }
+        // Skip test, example, story files
+        if line.contains("__tests__")
+            || line.contains("__mocks__")
+            || line.contains("__snapshots__")
+            || line.contains("/stories/")
+        {
+            continue;
+        }
+        // Check if this file is in the family directory
+        let parts: Vec<&str> = line.rsplitn(2, '/').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let dir = parts[1];
+        let is_family_dir = dir.ends_with(&format!("/{}", family_dir))
+            || dir.ends_with(&format!("/components/{}", family_dir))
+            || dir.ends_with(&format!("/next/components/{}", family_dir));
+        if !is_family_dir {
+            continue;
+        }
+
+        family_files.push(line.to_string());
+    }
+
+    if family_files.is_empty() {
+        return None;
+    }
+
+    // Read each file and concatenate
+    let mut content = String::new();
+    // Include up to 2 example files if they exist
+    let mut example_files: Vec<String> = Vec::new();
+    let mut source_files: Vec<String> = Vec::new();
+
+    for file_path in &family_files {
+        if file_path.contains("/examples/") {
+            example_files.push(file_path.clone());
+        } else {
+            source_files.push(file_path.clone());
+        }
+    }
+
+    // Read source files first
+    for file_path in &source_files {
+        if let Some(file_content) = read_git_file(repo, git_ref, file_path) {
+            content.push_str(&format!("\n--- File: {} ---\n", file_path));
+            content.push_str(&file_content);
+            content.push('\n');
+        }
+    }
+
+    // Include first 2 example files (sorted for determinism)
+    example_files.sort();
+    for file_path in example_files.iter().take(2) {
+        if let Some(file_content) = read_git_file(repo, git_ref, file_path) {
+            content.push_str(&format!("\n--- Example: {} ---\n", file_path));
+            content.push_str(&file_content);
+            content.push('\n');
+        }
+    }
+
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
+/// Infer hierarchies for both versions and compute deltas.
+async fn infer_and_diff_hierarchies(
+    repo: &Path,
+    from_ref: &str,
+    to_ref: &str,
+    llm_command: &str,
+    structural_changes: &[semver_analyzer_core::StructuralChange],
+    old_surface: &semver_analyzer_core::ApiSurface,
+    new_surface: &semver_analyzer_core::ApiSurface,
+) -> (
+    Vec<semver_analyzer_core::HierarchyDelta>,
+    std::collections::HashMap<String, std::collections::HashMap<String, Vec<semver_analyzer_llm::LlmExpectedChild>>>,
+) {
+    use semver_analyzer_core::{ExpectedChild, FamilyHierarchy, HierarchyDelta};
+    use std::collections::{HashMap, HashSet};
+
+    // Find families to analyze (from new surface, filtered to those with breaking changes)
+    let families = find_qualifying_families(repo, to_ref, structural_changes, new_surface);
+
+    if families.is_empty() {
+        return (Vec::new(), HashMap::new());
+    }
+
+    eprintln!(
+        "[Hierarchy] Analyzing {} component families for both versions...",
+        families.len()
+    );
+
+    // Run LLM calls concurrently (5 at a time)
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let total = families.len();
+
+    // For each family, infer hierarchy for BOTH old and new refs
+    let mut handles = Vec::new();
+
+    for family in &families {
+        let sem = semaphore.clone();
+        let done = completed.clone();
+        let repo = repo.to_path_buf();
+        let from_ref = from_ref.to_string();
+        let to_ref = to_ref.to_string();
+        let llm_cmd = llm_command.to_string();
+        let family = family.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let idx = done.fetch_add(1, Ordering::Relaxed) + 1;
+
+            eprintln!("[Hierarchy] [{}/{}] {}", idx, total, family);
+
+            // Read family source from both refs
+            let old_content = read_family_files(&repo, &from_ref, &family);
+            let new_content = read_family_files(&repo, &to_ref, &family);
+
+            let analyzer = semver_analyzer_llm::LlmBehaviorAnalyzer::new(&llm_cmd);
+
+            // Infer old hierarchy (if family existed in old version)
+            let old_hierarchy = if let Some(content) = old_content {
+                tokio::task::spawn_blocking({
+                    let analyzer_cmd = llm_cmd.clone();
+                    let family_name = family.clone();
+                    move || {
+                        let a = semver_analyzer_llm::LlmBehaviorAnalyzer::new(&analyzer_cmd);
+                        a.infer_component_hierarchy(&family_name, &content).ok()
+                    }
+                })
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
+
+            // Infer new hierarchy
+            let new_hierarchy = if let Some(content) = new_content {
+                tokio::task::spawn_blocking({
+                    let family_name = family.clone();
+                    move || {
+                        analyzer
+                            .infer_component_hierarchy(&family_name, &content)
+                            .ok()
+                    }
+                })
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
+
+            (family, old_hierarchy, new_hierarchy)
+        });
+
+        handles.push(handle);
+    }
+
+    // Collect results
+    let mut all_old: HashMap<String, HashMap<String, Vec<semver_analyzer_llm::LlmExpectedChild>>> =
+        HashMap::new();
+    let mut all_new: HashMap<String, HashMap<String, Vec<semver_analyzer_llm::LlmExpectedChild>>> =
+        HashMap::new();
+
+    for handle in handles {
+        if let Ok((family, old_h, new_h)) = handle.await {
+            let old_count: usize = old_h.values().map(|v| v.len()).sum();
+            let new_count: usize = new_h.values().map(|v| v.len()).sum();
+            eprintln!(
+                "[Hierarchy]   {}: old={} children, new={} children",
+                family, old_count, new_count
+            );
+            all_old.insert(family.clone(), old_h);
+            all_new.insert(family, new_h);
+        }
+    }
+
+    // Compute deltas
+    let mut deltas = Vec::new();
+
+    for (family, new_hierarchy) in &all_new {
+        let old_hierarchy = all_old.get(family).cloned().unwrap_or_default();
+
+        for (component, new_children) in new_hierarchy {
+            let old_children = old_hierarchy.get(component).cloned().unwrap_or_default();
+
+            let old_child_names: HashSet<String> =
+                old_children.iter().map(|c| c.name.clone()).collect();
+            let new_child_names: HashSet<String> =
+                new_children.iter().map(|c| c.name.clone()).collect();
+
+            let added: Vec<ExpectedChild> = new_children
+                .iter()
+                .filter(|c| !old_child_names.contains(&c.name))
+                .map(|c| ExpectedChild {
+                    name: c.name.clone(),
+                    required: c.required,
+                })
+                .collect();
+
+            let removed: Vec<String> = old_children
+                .iter()
+                .filter(|c| !new_child_names.contains(&c.name))
+                .map(|c| c.name.clone())
+                .collect();
+
+            if !added.is_empty() || !removed.is_empty() {
+                deltas.push(HierarchyDelta {
+                    component: component.clone(),
+                    added_children: added,
+                    removed_children: removed,
+                    migrated_props: Vec::new(), // Populated during report building
+                });
+            }
+        }
+
+        // Check for components that existed in old but not in new
+        for (component, _old_children) in &old_hierarchy {
+            if !new_hierarchy.contains_key(component) {
+                // Component was removed entirely — not a hierarchy change,
+                // handled by component removal rules
+            }
+        }
+    }
+
+    eprintln!(
+        "[Hierarchy] {} hierarchy deltas detected across {} families",
+        deltas.len(),
+        all_new.len()
+    );
+
+    (deltas, all_new)
 }
 
 #[cfg(test)]

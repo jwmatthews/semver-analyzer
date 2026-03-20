@@ -65,6 +65,13 @@ pub struct AnalysisReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inferred_rename_patterns: Option<InferredRenamePatterns>,
 
+    /// Hierarchy changes between versions, computed by diffing LLM-inferred
+    /// component hierarchies from both refs. Each entry describes how a
+    /// component's expected children changed (added/removed children,
+    /// migrated props). None when --no-llm is set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hierarchy_deltas: Vec<HierarchyDelta>,
+
     /// Metadata about the analysis run.
     pub metadata: AnalysisMetadata,
 }
@@ -375,6 +382,13 @@ pub struct ComponentSummary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub child_components: Vec<ChildComponent>,
 
+    /// Expected direct children of this component, derived from LLM
+    /// hierarchy inference on the component family's source code.
+    /// Each entry is a component name that can be looked up in another
+    /// `ComponentSummary` within the same package.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_children: Vec<ExpectedChild>,
+
     /// Source files containing this component's definitions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_files: Vec<PathBuf>,
@@ -487,6 +501,59 @@ pub enum ChildComponentStatus {
     Added,
     /// Existed before but was modified.
     Modified,
+}
+
+/// An expected direct child component, derived from LLM hierarchy inference.
+///
+/// Each entry names a component that should be used as a direct child of the
+/// parent component. The `name` resolves to another `ComponentSummary` in the
+/// same package.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedChild {
+    /// Component name (e.g., "DropdownList").
+    pub name: String,
+    /// Whether this child is required or optional.
+    pub required: bool,
+}
+
+/// A change in the component hierarchy between versions, computed by diffing
+/// the old and new hierarchy inference results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HierarchyDelta {
+    /// The parent component whose children changed.
+    pub component: String,
+    /// Children added in the new version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_children: Vec<ExpectedChild>,
+    /// Children removed in the new version (no longer direct children).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_children: Vec<String>,
+    /// Props removed from this component that now exist on a child component.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub migrated_props: Vec<MigratedProp>,
+}
+
+/// A prop that migrated from a parent component to a child component.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigratedProp {
+    /// The prop name on the old parent component.
+    pub prop_name: String,
+    /// The child component the prop moved to.
+    pub target_child: String,
+    /// The prop name on the child, if different from the parent prop name
+    /// (e.g., parent `bodyAriaRole` → child ModalBody `role`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_prop_name: Option<String>,
+}
+
+/// The hierarchy of a single component family, as inferred by the LLM.
+///
+/// Maps component names to their expected children. Used for both old and new
+/// versions; the delta is computed by diffing two `FamilyHierarchy` values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FamilyHierarchy {
+    /// Component name → expected children.
+    pub components: HashMap<String, Vec<ExpectedChild>>,
 }
 
 /// Pre-grouped bulk constant/token changes within a package.

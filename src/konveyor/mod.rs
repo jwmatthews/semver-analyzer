@@ -1285,6 +1285,163 @@ pub fn generate_rules(
     let mut id_counts: HashMap<String, usize> = HashMap::new();
     let mut seen_composition_keys: HashSet<String> = HashSet::new();
 
+    // ── Pre-scan: collect components referenced in composition pattern changes ──
+    //
+    // Components that appear as the `component` in a composition_pattern_change
+    // with a `new_parent` are structurally required in the new version.
+    // New-sibling rules for these components should be mandatory, not optional.
+    let composition_required_components: HashSet<String> = report
+        .changes
+        .iter()
+        .flat_map(|fc| &fc.composition_pattern_changes)
+        .filter(|c| c.new_parent.is_some())
+        .map(|c| c.component.clone())
+        .collect();
+
+    // ── Pre-scan: consolidate children→prop composition patterns ─────────
+    //
+    // When the AST data shows that a component (e.g., TimesIcon) moved from
+    // being passed as children of a parent (e.g., Button) to being passed via
+    // a specific prop (e.g., `icon`), generate ONE parent-level rule on the
+    // parent component instead of individual rules per child.
+    //
+    // This is generically better because:
+    //  1. The parent-level rule fires on the parent's IMPORT, which kantra
+    //     matches reliably (no `parent` regex issues).
+    //  2. It catches ALL components passed as children — including app-level
+    //     components not from the library (e.g., a custom ContextIcon).
+    //  3. The individual per-child rules had broken `parent` patterns like
+    //     "^Button (as children)$" that never match actual JSX parent "Button".
+    //
+    // Consolidated entries are tracked so the per-child composition loop
+    // can skip them and avoid duplicate rules.
+    struct ChildrenToPropMigration {
+        child_components: Vec<String>,
+        from_pkg: Option<String>,
+    }
+
+    let mut children_to_prop: BTreeMap<(String, String), ChildrenToPropMigration> = BTreeMap::new();
+    let mut consolidated_composition_keys: HashSet<String> = HashSet::new();
+
+    for file_changes in &report.changes {
+        let file_str = file_changes.file.to_string_lossy();
+        let from_pkg = resolve_npm_package(&file_str, pkg_cache);
+
+        for comp_change in &file_changes.composition_pattern_changes {
+            let (old_parent, new_parent) = match (&comp_change.old_parent, &comp_change.new_parent)
+            {
+                (Some(old), Some(new)) => (old.as_str(), new.as_str()),
+                _ => continue,
+            };
+
+            // Extract parent component names from the AST data.
+            // old_parent/new_parent may have context qualifiers added by
+            // the LLM (e.g., "Button (as children)") — extract just the
+            // component name by splitting at " (".
+            let old_name = old_parent.split(" (").next().unwrap_or(old_parent).trim();
+            let new_name = new_parent.split(" (").next().unwrap_or(new_parent).trim();
+
+            // Only consolidate when the parent component is the same on
+            // both sides — this is a children→prop migration on that parent,
+            // NOT a nesting restructure (component moved to a different parent).
+            if !old_name.eq_ignore_ascii_case(new_name) {
+                continue;
+            }
+
+            // The old context must mention "children" and the new context
+            // must mention a prop name.
+            let old_is_children = old_parent.contains("children");
+            let target_prop = extract_target_prop(new_parent);
+
+            if !old_is_children {
+                continue;
+            }
+            let target_prop = match target_prop {
+                Some(p) => p.to_string(),
+                None => continue,
+            };
+
+            let key = (old_name.to_string(), target_prop.clone());
+            let entry = children_to_prop
+                .entry(key)
+                .or_insert_with(|| ChildrenToPropMigration {
+                    child_components: Vec::new(),
+                    from_pkg: from_pkg.clone(),
+                });
+            // Deduplicate child component names
+            let child = &comp_change.component;
+            if !entry.child_components.iter().any(|c| c == child) {
+                entry.child_components.push(child.clone());
+            }
+
+            // Mark this composition change for skipping in the per-child loop
+            let dedup_key = format!("{}|{}|{}", comp_change.component, old_parent, new_parent,);
+            consolidated_composition_keys.insert(dedup_key);
+        }
+    }
+
+    // Generate consolidated parent-level rules
+    for ((parent, prop), migration) in &children_to_prop {
+        let child_list = migration.child_components.join(", ");
+        let base_id = format!(
+            "semver-composition-{}-children-to-{}-prop",
+            sanitize_id(parent),
+            sanitize_id(prop),
+        );
+        let rule_id = unique_id(base_id, &mut id_counts);
+
+        let msg = format!(
+            "MIGRATION: Children that serve as the `{prop}` of <{parent}> should be \
+             passed via the `{prop}` prop instead of as children.\n\n\
+             Change: <{parent}><SomeIcon /></{parent}> → <{parent} {prop}={{<SomeIcon />}} />\n\n\
+             This applies to ALL components that represent the `{prop}`, including \
+             custom/app-level components. The library internally migrated {count} \
+             components to this pattern: {children}.\n\n\
+             For non-plain variants, the `{prop}` prop wraps the content in a styled \
+             <span> with proper spacing. Passing it as children bypasses this styling.",
+            parent = parent,
+            prop = prop,
+            count = migration.child_components.len(),
+            children = child_list,
+        );
+
+        eprintln!(
+            "Consolidated {} children→{} composition changes on <{}> into parent-level rule: {}",
+            migration.child_components.len(),
+            prop,
+            parent,
+            rule_id,
+        );
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".to_string(),
+                "change-type=composition".to_string(),
+                "has-codemod=false".to_string(),
+            ],
+            effort: 3,
+            category: "mandatory".to_string(),
+            description: format!(
+                "Children serving as the `{}` of <{}> should use the `{}` prop instead",
+                prop, parent, prop,
+            ),
+            message: msg,
+            links: Vec::new(),
+            when: KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: format!("^{}$", regex_escape(parent)),
+                    location: "IMPORT".to_string(),
+                    component: None,
+                    parent: None,
+                    value: None,
+                    from: migration.from_pkg.clone(),
+                },
+            },
+            fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+        });
+    }
+
     // ── Pre-scan: build set of changes covered by component-level (P0-C) rules ──
     //
     // When a component qualifies for a P0-C composition rule (its child
@@ -1592,6 +1749,12 @@ pub fn generate_rules(
         // Generate rules from composition pattern changes (from test/example diffs).
         // Deduplicate by (component, old_parent, new_parent) since multiple
         // test/example files may report the same nesting change.
+        //
+        // Children→prop migrations are already handled by the consolidated
+        // parent-level rules above — skip them here. Remaining composition
+        // changes (nesting restructures like MastheadToggle moving from
+        // Masthead to MastheadMain) get individual rules with fixed `parent`
+        // regex patterns (bare component name, not LLM descriptive text).
         for comp_change in &file_changes.composition_pattern_changes {
             let component = &comp_change.component;
 
@@ -1605,7 +1768,12 @@ pub fn generate_rules(
             if seen_composition_keys.contains(&dedup_key) {
                 continue;
             }
-            seen_composition_keys.insert(dedup_key);
+            seen_composition_keys.insert(dedup_key.clone());
+
+            // Skip entries consolidated into parent-level children→prop rules
+            if consolidated_composition_keys.contains(&dedup_key) {
+                continue;
+            }
 
             // Skip hallucinated template variables
             if component.contains('{') || component.contains('}') {
@@ -1616,41 +1784,73 @@ pub fn generate_rules(
             let base_id = format!("semver-composition-{}-nesting-changed", slug);
             let rule_id = unique_id(base_id, &mut id_counts);
 
+            // Extract bare component names from old_parent/new_parent for
+            // the rule message (strip LLM context qualifiers).
+            let old_parent_name = comp_change
+                .old_parent
+                .as_deref()
+                .map(|p| p.split(" (").next().unwrap_or(p).trim());
+            let new_parent_name = comp_change
+                .new_parent
+                .as_deref()
+                .map(|p| p.split(" (").next().unwrap_or(p).trim());
+
             let mut msg = format!(
                 "MIGRATION: <{}> nesting structure has changed.\n\n",
                 component
             );
-            if let (Some(old_parent), Some(new_parent)) =
-                (&comp_change.old_parent, &comp_change.new_parent)
-            {
+            if let (Some(old_display), Some(new_display)) = (old_parent_name, new_parent_name) {
                 msg.push_str(&format!(
                     "In the previous version, <{}> was a direct child of <{}>.\n\
                      In the new version, <{}> should be a child of <{}>.\n\n\
                      Change:\n  <{}><{}> → <{}><{}>...</{}>...</{}>\n\n",
                     component,
-                    old_parent,
+                    old_display,
                     component,
-                    new_parent,
-                    old_parent,
+                    new_display,
+                    old_display,
                     component,
-                    old_parent,
-                    new_parent,
-                    new_parent,
-                    old_parent,
+                    old_display,
+                    new_display,
+                    new_display,
+                    old_display,
                 ));
             }
             msg.push_str(&comp_change.description);
 
-            let from_str = from_pkg.as_deref().map(|s| s.to_string());
-            let condition = if let Some(ref _new_parent) = comp_change.new_parent {
+            // For composition rules, broaden the `from` to match sibling
+            // packages within the same npm scope.  This handles cases where a
+            // child component (e.g., TimesIcon from @scope/react-icons) is used
+            // inside a parent component from a different package in the same
+            // scope (e.g., Button from @scope/react-core).  The test diff that
+            // detected the composition change lives in the parent's package, but
+            // the child may be imported from a sibling package.
+            let from_scope = from_pkg.as_deref().and_then(|pkg| {
+                if pkg.starts_with('@') {
+                    // Scoped package: extract @scope/ prefix as regex
+                    pkg.find('/').map(|idx| format!("^{}", &pkg[..=idx]))
+                } else {
+                    // Unscoped package: use exact match
+                    Some(format!("^{}$", pkg))
+                }
+            });
+
+            // Use bare component name for the parent regex so it matches
+            // actual JSX parent names (not LLM descriptive text).
+            let parent_regex = comp_change.old_parent.as_deref().map(|p| {
+                let bare = p.split(" (").next().unwrap_or(p).trim();
+                format!("^{}$", regex_escape(bare))
+            });
+
+            let condition = if comp_change.new_parent.is_some() {
                 KonveyorCondition::FrontendReferenced {
                     referenced: FrontendReferencedFields {
                         pattern: format!("^{}$", component),
                         location: "JSX_COMPONENT".to_string(),
                         component: None,
-                        parent: comp_change.old_parent.as_ref().map(|p| format!("^{}$", p)),
+                        parent: parent_regex,
                         value: None,
-                        from: from_str.clone(),
+                        from: from_scope.clone(),
                     },
                 }
             } else {
@@ -1661,7 +1861,7 @@ pub fn generate_rules(
                         component: None,
                         parent: None,
                         value: None,
-                        from: from_str,
+                        from: from_scope,
                     },
                 }
             };
@@ -1689,9 +1889,18 @@ pub fn generate_rules(
     // When a component has significant removals or was fully removed,
     // emit an IMPORT rule for the component itself.
     //
+    // SKIPPED when hierarchy deltas are present — the hierarchy-based
+    // composition rules supersede P0-C with richer, LLM-inferred data
+    // about parent-child relationships and prop migrations.
+    //
     // V2 path: iterate pre-aggregated report.packages[].components.
     // Legacy path: scan dotted symbols to aggregate by parent interface.
-    {
+    if !report.hierarchy_deltas.is_empty() {
+        eprintln!(
+            "Skipping P0-C rule generation ({} hierarchy deltas present)",
+            report.hierarchy_deltas.len(),
+        );
+    } else {
         let has_package_components = report.packages.iter().any(|pkg| !pkg.components.is_empty());
 
         if has_package_components {
@@ -2344,6 +2553,23 @@ pub fn generate_rules(
                         );
                         let rule_id = unique_id(base_id, &mut id_counts);
 
+                        // Mandatory if the child absorbs removed props from the parent
+                        // OR if composition pattern changes show the component is
+                        // structurally required in the new version.
+                        // Truly optional new-siblings (no absorbed props, not
+                        // composition-required) are skipped — they add noise and
+                        // the fix engine may apply them unnecessarily.
+                        let is_mandatory = !child.absorbed_props.is_empty()
+                            || composition_required_components.contains(new_component);
+                        if !is_mandatory {
+                            eprintln!(
+                                "Skipping optional new-sibling rule: <{}> in <{}> (no absorbed props, not composition-required)",
+                                new_component, component_name,
+                            );
+                            continue;
+                        }
+                        let category = "mandatory";
+
                         rules.push(KonveyorRule {
                             rule_id,
                             labels: vec![
@@ -2352,9 +2578,9 @@ pub fn generate_rules(
                                 "has-codemod=false".to_string(),
                             ],
                             effort: 3,
-                            category: "optional".to_string(),
+                            category: category.to_string(),
                             description: format!(
-                                "New component <{}> may be needed alongside <{}>",
+                                "<{}> is required inside <{}> — absorbs removed props",
                                 new_component, component_name
                             ),
                             message: msg,
@@ -2526,11 +2752,308 @@ pub fn generate_rules(
                 }
             }
         }
+    } // end else (P0-C skipped when hierarchy deltas present)
+
+    // ── Hierarchy-based composition rules ──
+    //
+    // Generate migration rules from hierarchy deltas. These describe how
+    // a component's expected children changed between versions:
+    //  - New required children (e.g., DropdownList added inside Dropdown)
+    //  - Removed direct children (e.g., DropdownItem moved under DropdownList)
+    //  - Prop migrations (e.g., Modal.title → ModalHeader.title)
+    //
+    // The rule message incorporates removed property data from the
+    // ComponentSummary to produce rich per-prop migration instructions,
+    // replacing the P0-C message format.
+    for delta in &report.hierarchy_deltas {
+        if delta.added_children.is_empty() && delta.removed_children.is_empty() {
+            continue;
+        }
+
+        let component = &delta.component;
+
+        // Look up the parent ComponentSummary for removed props + behavioral data
+        let comp_summary = report
+            .packages
+            .iter()
+            .flat_map(|pkg| &pkg.components)
+            .find(|c| c.name == *component);
+
+        let removed_props: Vec<&semver_analyzer_core::RemovedProperty> = comp_summary
+            .map(|c| c.removed_properties.iter().collect())
+            .unwrap_or_default();
+
+        let behavioral_changes: Vec<&semver_analyzer_core::BehavioralChange> = comp_summary
+            .map(|c| {
+                c.behavioral_changes
+                    .iter()
+                    .filter(|b| b.is_internal_only != Some(true))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let prop_summary = comp_summary.map(|c| &c.property_summary);
+
+        let base_id = format!(
+            "semver-hierarchy-{}-composition-changed",
+            sanitize_id(component),
+        );
+        let rule_id = unique_id(base_id, &mut id_counts);
+
+        // Build the migration message
+        let mut msg = format!("MIGRATION: <{}> has been restructured", component,);
+        if let Some(ps) = prop_summary {
+            if ps.removed > 0 {
+                msg.push_str(&format!(" ({} of {} props removed)", ps.removed, ps.total,));
+            }
+        }
+        msg.push_str(".\n\n");
+
+        // List ALL expected children from the full new-version hierarchy,
+        // not just delta-added ones. This ensures the rule describes the
+        // complete composition structure (e.g., Dropdown → DropdownList
+        // even if DropdownList existed in both versions).
+        let all_expected = comp_summary
+            .map(|c| &c.expected_children)
+            .filter(|ec| !ec.is_empty());
+
+        if let Some(expected_children) = all_expected {
+            msg.push_str("Use these child components inside <");
+            msg.push_str(component);
+            msg.push_str(">:\n");
+            for child in expected_children {
+                let req = if child.required {
+                    "required"
+                } else {
+                    "optional"
+                };
+
+                // Find props that migrated to this child
+                let child_migrated: Vec<&semver_analyzer_core::MigratedProp> = delta
+                    .migrated_props
+                    .iter()
+                    .filter(|mp| mp.target_child == child.name)
+                    .collect();
+
+                // Also check removal_disposition for props that moved to this child
+                let disposition_props: Vec<(&str, &str)> = removed_props
+                    .iter()
+                    .filter_map(|rp| {
+                        if let Some(semver_analyzer_core::RemovalDisposition::MovedToChild {
+                            target_component,
+                            mechanism,
+                        }) = &rp.removal_disposition
+                        {
+                            if target_component == &child.name {
+                                Some((rp.name.as_str(), mechanism.as_str()))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                msg.push_str(&format!("  <{}> ({}) —", child.name, req));
+
+                let mut prop_instructions: Vec<String> = Vec::new();
+                let mut seen_props: BTreeSet<String> = BTreeSet::new();
+
+                // Props from disposition data (richer — has mechanism)
+                for (prop_name, mechanism) in &disposition_props {
+                    if seen_props.insert(prop_name.to_string()) {
+                        prop_instructions.push(format!(
+                            "pass {} as {}",
+                            prop_name,
+                            if *mechanism == "children" {
+                                "children"
+                            } else {
+                                "prop"
+                            },
+                        ));
+                    }
+                }
+
+                // Props from hierarchy migrated_props (name match)
+                for mp in &child_migrated {
+                    if seen_props.insert(mp.prop_name.clone()) {
+                        if let Some(ref target_name) = mp.target_prop_name {
+                            prop_instructions.push(format!("{} → {}", mp.prop_name, target_name));
+                        } else {
+                            prop_instructions.push(format!("pass {} as prop", mp.prop_name));
+                        }
+                    }
+                }
+
+                if prop_instructions.is_empty() {
+                    msg.push_str(" wrap content inside this component\n");
+                } else {
+                    msg.push_str(&format!(" {}\n", prop_instructions.join(", ")));
+                }
+            }
+            msg.push('\n');
+        }
+
+        // List children that moved or were removed
+        if !delta.removed_children.is_empty() {
+            msg.push_str("Children no longer direct:\n");
+            for child_name in &delta.removed_children {
+                // Check if the child moved under a new parent
+                let new_parent = delta.added_children.iter().find(|added| {
+                    report.hierarchy_deltas.iter().any(|d| {
+                        d.component == added.name
+                            && d.added_children.iter().any(|c| c.name == *child_name)
+                    })
+                });
+                if let Some(parent) = new_parent {
+                    msg.push_str(&format!(
+                        "  - <{}> → now wrap inside <{}>\n",
+                        child_name, parent.name,
+                    ));
+                } else {
+                    msg.push_str(&format!(
+                        "  - <{}> (no longer a direct child)\n",
+                        child_name,
+                    ));
+                }
+            }
+            msg.push('\n');
+        }
+
+        // List remaining removed props not covered by child migration
+        let migrated_prop_names: BTreeSet<String> = delta
+            .migrated_props
+            .iter()
+            .map(|mp| mp.prop_name.clone())
+            .chain(removed_props.iter().filter_map(|rp| {
+                if let Some(semver_analyzer_core::RemovalDisposition::MovedToChild { .. }) =
+                    &rp.removal_disposition
+                {
+                    Some(rp.name.clone())
+                } else {
+                    None
+                }
+            }))
+            .collect();
+
+        let uncovered_removed: Vec<&&semver_analyzer_core::RemovedProperty> = removed_props
+            .iter()
+            .filter(|rp| !migrated_prop_names.contains(&rp.name))
+            .collect();
+
+        if !uncovered_removed.is_empty() {
+            msg.push_str("Other removed props:\n");
+            for rp in &uncovered_removed {
+                let disposition_hint = match &rp.removal_disposition {
+                    Some(semver_analyzer_core::RemovalDisposition::ReplacedByProp { new_prop }) => {
+                        format!(" → use '{}' instead", new_prop)
+                    }
+                    Some(semver_analyzer_core::RemovalDisposition::MadeAutomatic) => {
+                        " (now automatic)".to_string()
+                    }
+                    Some(semver_analyzer_core::RemovalDisposition::TrulyRemoved) => {
+                        " (removed, no replacement)".to_string()
+                    }
+                    _ => String::new(),
+                };
+                msg.push_str(&format!("  - {}{}\n", rp.name, disposition_hint));
+            }
+            msg.push('\n');
+        }
+
+        // Include behavioral changes if present
+        if !behavioral_changes.is_empty() {
+            msg.push_str("Behavioral changes:\n");
+            for bc in &behavioral_changes {
+                msg.push_str(&format!("  - {}\n", bc.description));
+            }
+            msg.push('\n');
+        }
+
+        // Build example showing new composition using full expected_children
+        if let Some(expected_children) = all_expected {
+            msg.push_str("Example:\n  <");
+            msg.push_str(component);
+            msg.push_str(">\n");
+            for child in expected_children {
+                // Show absorbed props on the child element
+                let child_props: Vec<String> = delta
+                    .migrated_props
+                    .iter()
+                    .filter(|mp| mp.target_child == child.name)
+                    .map(|mp| {
+                        if let Some(ref tn) = mp.target_prop_name {
+                            format!("{}={{...}}", tn)
+                        } else {
+                            format!("{}={{...}}", mp.prop_name)
+                        }
+                    })
+                    .collect();
+
+                let props_str = if child_props.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", child_props.join(" "))
+                };
+
+                msg.push_str(&format!(
+                    "    <{}{}> ... </{}>\n",
+                    child.name, props_str, child.name,
+                ));
+            }
+            msg.push_str(&format!("  </{}>\n", component));
+        }
+
+        // Resolve the from package
+        let from_pkg = report
+            .packages
+            .iter()
+            .find(|pkg| pkg.components.iter().any(|c| c.name == *component))
+            .map(|pkg| pkg.name.clone());
+
+        // Track components covered by hierarchy rules for prop/behavioral dedup
+        covered_components.insert(component.clone());
+        if let Some(cs) = comp_summary {
+            covered_components.insert(cs.interface_name.clone());
+            for rp in &cs.removed_properties {
+                covered_props.insert((cs.interface_name.clone(), rp.name.clone()));
+                covered_props.insert((cs.name.clone(), rp.name.clone()));
+            }
+        }
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".to_string(),
+                "change-type=hierarchy-composition".to_string(),
+                "has-codemod=false".to_string(),
+            ],
+            effort: 5,
+            category: "mandatory".to_string(),
+            description: format!(
+                "<{}> composition structure changed — use child components",
+                component,
+            ),
+            message: msg,
+            links: Vec::new(),
+            when: KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: format!("^{}$", regex_escape(component)),
+                    location: "IMPORT".to_string(),
+                    component: None,
+                    parent: None,
+                    value: None,
+                    from: from_pkg,
+                },
+            },
+            fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+        });
     }
 
     // ── Post-generation: deduplicate behavioral rules ──
     //
-    // When an API rule (especially a P0-C component-import-deprecated rule)
+    // When an API rule (P0-C component-import-deprecated or hierarchy-composition)
     // already includes behavioral context in its message, standalone behavioral
     // rules for the same component are redundant.  Downgrade them from
     // LlmAssisted to Manual to avoid duplicate goose invocations.
@@ -2538,9 +3061,9 @@ pub fn generate_rules(
         let enriched_components: BTreeSet<String> = rules
             .iter()
             .filter(|r| {
-                r.labels
-                    .iter()
-                    .any(|l| l == "change-type=component-removal")
+                r.labels.iter().any(|l| {
+                    l == "change-type=component-removal" || l == "change-type=hierarchy-composition"
+                })
             })
             .filter_map(|r| match &r.when {
                 KonveyorCondition::FrontendReferenced { referenced } => {
@@ -3123,7 +3646,8 @@ fn consolidation_key(rule: &KonveyorRule) -> String {
         | "new-sibling-component"
         | "component-removal"
         | "dependency-update"
-        | "composition" => {
+        | "composition"
+        | "hierarchy-composition" => {
             return rule.rule_id.clone();
         }
         _ => {}
@@ -4134,6 +4658,48 @@ fn api_change_to_rules(
         }
     }
 
+    // Enrich type-changed rules with explicit value diff information.
+    // When a union type has values removed and/or added, enumerate them
+    // so the fix-engine LLM knows exactly which values to replace.
+    let mut value_mappings: Vec<MappingEntry> = Vec::new();
+    if change.change == ApiChangeType::TypeChanged {
+        let removed = extract_removed_union_values(change);
+        let added = extract_added_union_values(change);
+        if !removed.is_empty() {
+            message.push_str("\n\nValue changes:");
+            if removed.len() == 1 && added.len() == 1 {
+                // Tier 1: exact 1:1 mapping
+                message.push_str(&format!(
+                    "\n  '{}' → '{}' (direct replacement)",
+                    removed[0], added[0],
+                ));
+                let parent_component = if change.symbol.contains('.') {
+                    change.symbol.split('.').next().map(|s| s.to_string())
+                } else {
+                    None
+                };
+                value_mappings.push(MappingEntry {
+                    from: Some(removed[0].clone()),
+                    to: Some(added[0].clone()),
+                    component: parent_component,
+                    prop: Some(extract_leaf_symbol(&change.symbol).to_string()),
+                });
+            } else {
+                // Tier 2+3: list removed and added values
+                message.push_str("\n  Removed values:");
+                for v in &removed {
+                    message.push_str(&format!("\n    - '{}'", v));
+                }
+                if !added.is_empty() {
+                    message.push_str("\n  New values available:");
+                    for v in &added {
+                        message.push_str(&format!("\n    - '{}'", v));
+                    }
+                }
+            }
+        }
+    }
+
     let mut labels = vec![
         "source=semver-analyzer".to_string(),
         format!("change-type={}", change_type_label),
@@ -4151,7 +4717,19 @@ fn api_change_to_rules(
     }
 
     let condition = build_frontend_condition(change, leaf_symbol, from_pkg);
-    let fix_strategy = api_change_to_strategy(change, rename_patterns, member_renames, &file_path);
+    let mut fix_strategy =
+        api_change_to_strategy(change, rename_patterns, member_renames, &file_path);
+
+    // Attach value mappings to the fix strategy for Tier 1 cases
+    if !value_mappings.is_empty() {
+        if let Some(ref mut strat) = fix_strategy {
+            strat.mappings.extend(value_mappings.clone());
+        } else {
+            let mut strat = FixStrategyEntry::new("PropValueChange");
+            strat.mappings = value_mappings.clone();
+            fix_strategy = Some(strat);
+        }
+    }
 
     let mut rules = vec![KonveyorRule {
         rule_id,
@@ -4167,11 +4745,32 @@ fn api_change_to_rules(
 
     // P4-B: For type_changed Property/Field changes, check for removed union
     // member values and emit per-value rules so the `value` constraint fires.
+    //
+    // When the before/after types have string literal unions, we can compute
+    // which values were removed and which were added. This enables:
+    //  - Tier 1 (1:1): When exactly 1 removed & 1 added, auto-map directly.
+    //  - Tier 2+3: List removed/added values explicitly so the fix-engine
+    //    LLM can pick the correct replacement instead of guessing.
     if matches!(change.kind, ApiChangeKind::Property | ApiChangeKind::Field)
         && change.change == ApiChangeType::TypeChanged
     {
         let removed_values = extract_removed_union_values(change);
-        if removed_values.len() >= 2 {
+        if !removed_values.is_empty() {
+            // Compute added values (new values not in the old type)
+            let added_values = extract_added_union_values(change);
+
+            // Build value mappings for Tier 1 (1:1) cases.
+            // When there's exactly one removed and one added value, the
+            // mapping is unambiguous.
+            let value_map: HashMap<&str, &str> =
+                if removed_values.len() == 1 && added_values.len() == 1 {
+                    let mut m = HashMap::new();
+                    m.insert(removed_values[0].as_str(), added_values[0].as_str());
+                    m
+                } else {
+                    HashMap::new()
+                };
+
             // Extract parent component for scoping
             let parent_component = if change.symbol.contains('.') {
                 let parts: Vec<&str> = change.symbol.splitn(2, '.').collect();
@@ -4182,8 +4781,53 @@ fn api_change_to_rules(
             let from = from_pkg.map(|s| s.to_string());
 
             for value in &removed_values {
+                // Build an actionable message with value mapping or options
+                let migration_hint = if let Some(replacement) = value_map.get(value.as_str()) {
+                    // Tier 1: exact 1:1 mapping
+                    format!(
+                        "The value '{}' is no longer accepted for '{}'. \
+                         Replace with '{}'.",
+                        value, change.symbol, replacement,
+                    )
+                } else if !added_values.is_empty() {
+                    // Tier 2+3: list available replacements
+                    let options: Vec<String> =
+                        added_values.iter().map(|v| format!("'{}'", v)).collect();
+                    format!(
+                        "The value '{}' is no longer accepted for '{}'. \
+                         Replace with one of the new values: {}.",
+                        value,
+                        change.symbol,
+                        options.join(", "),
+                    )
+                } else {
+                    // No new values — just removed
+                    format!(
+                        "The value '{}' is no longer accepted for '{}'. \
+                         This value has been removed with no direct replacement.",
+                        value, change.symbol,
+                    )
+                };
+
                 let val_id =
                     unique_id(format!("{}-val-{}", base_id, sanitize_id(value)), id_counts);
+
+                // Build fix strategy with mapping when available
+                let fix_strategy = if let Some(replacement) = value_map.get(value.as_str()) {
+                    let mut strat = FixStrategyEntry::new("PropValueChange");
+                    strat.mappings = vec![MappingEntry {
+                        from: Some(value.clone()),
+                        to: Some(replacement.to_string()),
+                        component: parent_component
+                            .as_ref()
+                            .map(|p| p.trim_matches('^').trim_matches('$').to_string()),
+                        prop: Some(extract_leaf_symbol(&change.symbol).to_string()),
+                    }];
+                    strat
+                } else {
+                    FixStrategyEntry::new("PropValueChange")
+                };
+
                 rules.push(KonveyorRule {
                     rule_id: val_id,
                     labels: vec![
@@ -4195,11 +4839,7 @@ fn api_change_to_rules(
                     effort: 1,
                     category: "mandatory".to_string(),
                     description: format!("Value '{}' removed from '{}'", value, change.symbol),
-                    message: format!(
-                        "The value '{}' is no longer accepted for '{}'. \
-                         Update to one of the new accepted values.\n\nFile: {}",
-                        value, change.symbol, file_path
-                    ),
+                    message: format!("{}\n\nFile: {}", migration_hint, file_path),
                     links: Vec::new(),
                     when: KonveyorCondition::FrontendReferenced {
                         referenced: FrontendReferencedFields {
@@ -4214,7 +4854,7 @@ fn api_change_to_rules(
                             from: from.clone(),
                         },
                     },
-                    fix_strategy: Some(FixStrategyEntry::new("PropValueChange")),
+                    fix_strategy: Some(fix_strategy),
                 });
             }
         }
@@ -5115,6 +5755,25 @@ fn extract_removed_union_values(change: &ApiChange) -> Vec<String> {
     before_vals.difference(&after_vals).cloned().collect()
 }
 
+/// Compute the added union member values between before and after type
+/// expressions.  Returns values present in `after` but missing from `before`.
+fn extract_added_union_values(change: &ApiChange) -> Vec<String> {
+    let before = match change.before.as_deref() {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let after = match change.after.as_deref() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    if change.change != ApiChangeType::TypeChanged {
+        return Vec::new();
+    }
+    let before_vals = parse_union_string_values(before);
+    let after_vals = parse_union_string_values(after);
+    after_vals.difference(&before_vals).cloned().collect()
+}
+
 /// Build the condition and message for a manifest change.
 fn build_manifest_condition_and_message(
     change: &ManifestChange,
@@ -5347,6 +6006,24 @@ fn extract_trailing_suffix(name: &str) -> Option<&str> {
     }
 }
 
+/// Extract the target prop name from a composition change's `new_parent` field.
+///
+/// The LLM-generated `new_parent` strings use patterns like:
+///   "Button (as icon prop)"  → Some("icon")
+///   "Button (via icon prop)" → Some("icon")
+///   "MastheadMain"           → None (no prop migration)
+fn extract_target_prop(new_parent: &str) -> Option<&str> {
+    // The prop context is inside parentheses: "(as X prop)" or "(via X prop)"
+    let ctx = new_parent.split('(').nth(1)?;
+    let ctx = ctx.trim_end_matches(')').trim();
+    if !ctx.contains(" prop") {
+        return None;
+    }
+    // Extract the word before " prop"
+    let prop_part = ctx.split(" prop").next()?;
+    prop_part.split_whitespace().last()
+}
+
 /// Sanitize a string for use in a Konveyor rule ID.
 /// Replaces non-alphanumeric characters with hyphens, lowercases, and deduplicates.
 fn sanitize_id(s: &str) -> String {
@@ -5454,6 +6131,7 @@ mod tests {
             packages: vec![],
             member_renames: std::collections::HashMap::new(),
             inferred_rename_patterns: None,
+            hierarchy_deltas: Vec::new(),
             metadata: AnalysisMetadata {
                 call_graph_analysis: "none".to_string(),
                 tool_version: "0.1.0".to_string(),
@@ -8130,6 +8808,7 @@ mod tests {
                 migration_target: None,
                 behavioral_changes: vec![],
                 child_components: vec![],
+                expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
@@ -8223,6 +8902,7 @@ mod tests {
                 migration_target: None,
                 behavioral_changes: vec![],
                 child_components: vec![],
+                expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
@@ -8251,6 +8931,8 @@ mod tests {
     // New sibling detection v2: uses child_components from packages
     #[test]
     fn test_new_sibling_v2_detection_from_child_components() {
+        // MastheadLogo has no absorbed_props and is not composition-required,
+        // so it should be SKIPPED as a truly optional new-sibling.
         let changes = vec![make_file_changes(
             "packages/react-core/src/components/Masthead/MastheadBrand.tsx",
             vec![
@@ -8302,6 +8984,80 @@ mod tests {
                     known_props: vec!["href".to_string()],
                     absorbed_props: vec![],
                 }],
+                expected_children: vec![],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let sibling_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("new-sibling"))
+            .collect();
+        assert_eq!(
+            sibling_rules.len(),
+            0,
+            "Expected 0 new-sibling rules (MastheadLogo has no absorbed_props, should be skipped), got {}",
+            sibling_rules.len()
+        );
+    }
+
+    #[test]
+    fn test_new_sibling_v2_mandatory_with_absorbed_props() {
+        // A child component WITH absorbed_props should produce a mandatory
+        // new-sibling rule.
+        let changes = vec![make_file_changes(
+            "packages/react-core/src/components/Modal/Modal.tsx",
+            vec![make_api_change(
+                "ModalProps.title",
+                ApiChangeKind::Property,
+                ApiChangeType::Removed,
+                "title prop removed",
+            )],
+            vec![],
+        )];
+
+        let mut report = make_report(changes, vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "Modal".to_string(),
+                interface_name: "ModalProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary {
+                    total: 20,
+                    removed: 1,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 0.05,
+                },
+                removed_properties: vec![RemovedProperty {
+                    name: "title".to_string(),
+                    old_type: None,
+                    removal_disposition: None,
+                }],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![ChildComponent {
+                    name: "ModalHeader".to_string(),
+                    status: ChildComponentStatus::Added,
+                    known_props: vec!["title".to_string()],
+                    absorbed_props: vec!["title".to_string()],
+                }],
+                expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
@@ -8323,32 +9079,12 @@ mod tests {
         assert_eq!(
             sibling_rules.len(),
             1,
-            "Expected 1 new-sibling rule via v2 path, got {}",
+            "Expected 1 new-sibling rule (ModalHeader absorbs title), got {}",
             sibling_rules.len()
         );
-
-        let rule = sibling_rules[0];
-        assert!(rule.message.contains("MastheadLogo"));
-        assert!(rule.message.contains("MastheadBrand"));
-        // MastheadLogo has no absorbed_props → generic child component message
-        assert!(
-            rule.message.contains("new child component"),
-            "Should show generic child component message. Msg:\n{}",
-            rule.message
-        );
-        assert_eq!(rule.fix_strategy.as_ref().unwrap().strategy, "LlmAssisted");
-        assert_eq!(rule.category, "optional");
-        // Verify from field comes from pkg.name
-        match &rule.when {
-            KonveyorCondition::FrontendReferenced { referenced } => {
-                assert_eq!(
-                    referenced.from.as_deref(),
-                    Some("@patternfly/react-core"),
-                    "from should come from pkg.name"
-                );
-            }
-            _ => panic!("Expected FrontendReferenced condition"),
-        }
+        assert_eq!(sibling_rules[0].category, "mandatory");
+        assert!(sibling_rules[0].message.contains("ModalHeader"));
+        assert!(sibling_rules[0].message.contains("title"));
     }
 
     // New sibling v2: only Added children generate rules (not Modified)
@@ -8385,6 +9121,7 @@ mod tests {
                     known_props: vec![],
                     absorbed_props: vec![],
                 }],
+                expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
@@ -8446,6 +9183,7 @@ mod tests {
                 migration_target: None,
                 behavioral_changes: vec![],
                 child_components: vec![],
+                expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
@@ -8519,6 +9257,7 @@ mod tests {
                 "<EmptyStateHeader> element removed from render output",
             )],
             child_components: vec![],
+            expected_children: vec![],
             source_files: vec![],
         };
 
@@ -8595,6 +9334,7 @@ mod tests {
                     absorbed_props: vec![],
                 },
             ],
+            expected_children: vec![],
             source_files: vec![],
         };
 
@@ -8708,6 +9448,7 @@ mod tests {
                     absorbed_props: vec!["actions".to_string(), "footer".to_string()],
                 },
             ],
+            expected_children: vec![],
             source_files: vec![],
         };
 
@@ -8851,6 +9592,7 @@ mod tests {
                         absorbed_props: vec!["actions".into()],
                     },
                 ],
+                expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
@@ -9008,6 +9750,7 @@ mod tests {
                 migration_target: None,
                 behavioral_changes: vec![],
                 child_components: vec![],
+                expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
@@ -9215,6 +9958,7 @@ mod tests {
                 migration_target: None,
                 behavioral_changes: vec![],
                 child_components: vec![],
+                expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
@@ -9238,5 +9982,931 @@ mod tests {
             "Public symbol 'Menu' should produce a behavioral rule. IDs: {:?}",
             rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
+    }
+
+    // ── extract_target_prop tests ───────────────────────────────────────
+
+    #[test]
+    fn test_extract_target_prop_as_pattern() {
+        assert_eq!(extract_target_prop("Button (as icon prop)"), Some("icon"));
+    }
+
+    #[test]
+    fn test_extract_target_prop_via_pattern() {
+        assert_eq!(extract_target_prop("Button (via icon prop)"), Some("icon"));
+    }
+
+    #[test]
+    fn test_extract_target_prop_with_wrapper() {
+        assert_eq!(
+            extract_target_prop("Button (as icon prop via Icon wrapper)"),
+            Some("icon")
+        );
+    }
+
+    #[test]
+    fn test_extract_target_prop_no_parens() {
+        assert_eq!(extract_target_prop("MastheadMain"), None);
+    }
+
+    #[test]
+    fn test_extract_target_prop_children_context() {
+        assert_eq!(extract_target_prop("Button (as children)"), None);
+    }
+
+    #[test]
+    fn test_extract_target_prop_children_via_wrapper() {
+        assert_eq!(
+            extract_target_prop("Button (as children via div wrapper)"),
+            None
+        );
+    }
+
+    // ── children→prop consolidation tests ───────────────────────────────
+
+    /// Helper: create a FileChanges with composition pattern changes.
+    fn make_composition_changes(file: &str, changes: Vec<CompositionPatternChange>) -> FileChanges {
+        FileChanges {
+            file: PathBuf::from(file),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![],
+            breaking_behavioral_changes: vec![],
+            composition_pattern_changes: changes,
+        }
+    }
+
+    #[test]
+    fn test_children_to_prop_consolidated_into_parent_rule() {
+        // Two different icons both moved from Button children to Button icon prop.
+        // Should produce ONE parent-level rule on Button, not two per-icon rules.
+        let changes = vec![make_composition_changes(
+            "packages/react-core/src/components/Button/CloseButton.tsx",
+            vec![
+                CompositionPatternChange {
+                    component: "TimesIcon".to_string(),
+                    old_parent: Some("Button (as children)".to_string()),
+                    new_parent: Some("Button (as icon prop)".to_string()),
+                    description: "TimesIcon moved to icon prop".to_string(),
+                },
+                CompositionPatternChange {
+                    component: "CopyIcon".to_string(),
+                    old_parent: Some("Button (as children)".to_string()),
+                    new_parent: Some("Button (as icon prop)".to_string()),
+                    description: "CopyIcon moved to icon prop".to_string(),
+                },
+            ],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Should have exactly one consolidated rule
+        let composition_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.labels.iter().any(|l| l == "change-type=composition"))
+            .collect();
+        assert_eq!(
+            composition_rules.len(),
+            1,
+            "Expected 1 consolidated rule, got {}: {:?}",
+            composition_rules.len(),
+            composition_rules
+                .iter()
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
+        );
+
+        let rule = composition_rules[0];
+        assert!(
+            rule.rule_id.contains("children-to-icon-prop"),
+            "Rule ID should indicate children→prop consolidation: {}",
+            rule.rule_id,
+        );
+
+        // Should match on Button IMPORT, not on individual icon components
+        match &rule.when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(referenced.pattern, "^Button$");
+                assert_eq!(referenced.location, "IMPORT");
+            }
+            other => panic!("Expected FrontendReferenced, got {:?}", other),
+        }
+
+        // Message should mention both child components
+        assert!(
+            rule.message.contains("TimesIcon"),
+            "Message should list TimesIcon"
+        );
+        assert!(
+            rule.message.contains("CopyIcon"),
+            "Message should list CopyIcon"
+        );
+        assert!(
+            rule.message.contains("icon"),
+            "Message should mention the icon prop"
+        );
+    }
+
+    #[test]
+    fn test_single_children_to_prop_still_consolidated() {
+        // Even a single composition change should produce a parent-level rule
+        // (no threshold — always consolidate children→prop patterns).
+        let changes = vec![make_composition_changes(
+            "packages/react-core/src/components/MenuToggle/MenuToggle.tsx",
+            vec![CompositionPatternChange {
+                component: "EllipsisVIcon".to_string(),
+                old_parent: Some("MenuToggle (as children)".to_string()),
+                new_parent: Some("MenuToggle (as icon prop)".to_string()),
+                description: "EllipsisVIcon moved to icon prop".to_string(),
+            }],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let composition_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.labels.iter().any(|l| l == "change-type=composition"))
+            .collect();
+        assert_eq!(composition_rules.len(), 1);
+
+        let rule = composition_rules[0];
+        // Should match on MenuToggle IMPORT
+        match &rule.when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(referenced.pattern, "^MenuToggle$");
+                assert_eq!(referenced.location, "IMPORT");
+            }
+            other => panic!("Expected FrontendReferenced, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_nesting_change_not_consolidated() {
+        // A nesting restructure (component moves to a DIFFERENT parent) should
+        // NOT be consolidated — it should remain an individual composition rule.
+        let changes = vec![make_composition_changes(
+            "packages/react-core/src/components/Masthead/Masthead.tsx",
+            vec![CompositionPatternChange {
+                component: "MastheadToggle".to_string(),
+                old_parent: Some("Masthead".to_string()),
+                new_parent: Some("MastheadMain".to_string()),
+                description: "MastheadToggle moved from Masthead to MastheadMain".to_string(),
+            }],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let composition_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.labels.iter().any(|l| l == "change-type=composition"))
+            .collect();
+        assert_eq!(composition_rules.len(), 1);
+
+        let rule = composition_rules[0];
+        // Should match on the CHILD component (MastheadToggle), not the parent
+        assert!(
+            rule.rule_id.contains("mastheadtoggle-nesting-changed"),
+            "Nesting changes should keep per-component rule IDs: {}",
+            rule.rule_id,
+        );
+        match &rule.when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(referenced.pattern, "^MastheadToggle$");
+                assert_eq!(referenced.location, "JSX_COMPONENT");
+            }
+            other => panic!("Expected FrontendReferenced, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_nesting_change_parent_field_uses_bare_name() {
+        // The parent regex should use the bare component name, not the
+        // LLM-generated descriptive text like "Masthead (with display=inline)".
+        let changes = vec![make_composition_changes(
+            "packages/react-core/src/components/Masthead/Masthead.tsx",
+            vec![CompositionPatternChange {
+                component: "MastheadToggle".to_string(),
+                old_parent: Some("Masthead (with display=inline)".to_string()),
+                new_parent: Some("MastheadMain (inner wrapper)".to_string()),
+                description: "MastheadToggle restructured".to_string(),
+            }],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let composition_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.labels.iter().any(|l| l == "change-type=composition"))
+            .collect();
+        assert_eq!(composition_rules.len(), 1);
+
+        match &composition_rules[0].when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                // Parent regex should be bare "Masthead", not "Masthead (with display=inline)"
+                assert_eq!(
+                    referenced.parent.as_deref(),
+                    Some("^Masthead$"),
+                    "Parent regex should use bare component name, got: {:?}",
+                    referenced.parent,
+                );
+            }
+            other => panic!("Expected FrontendReferenced, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mixed_composition_and_nesting_changes() {
+        // When the same file has both children→prop AND nesting changes,
+        // only the children→prop ones get consolidated. Nesting changes
+        // remain as individual rules.
+        let changes = vec![make_composition_changes(
+            "packages/react-core/src/components/Mixed/Mixed.tsx",
+            vec![
+                // children→prop: should be consolidated
+                CompositionPatternChange {
+                    component: "SearchIcon".to_string(),
+                    old_parent: Some("Button (as children)".to_string()),
+                    new_parent: Some("Button (as icon prop)".to_string()),
+                    description: "SearchIcon moved to icon prop".to_string(),
+                },
+                // nesting restructure: should remain individual
+                CompositionPatternChange {
+                    component: "MastheadToggle".to_string(),
+                    old_parent: Some("Masthead".to_string()),
+                    new_parent: Some("MastheadMain".to_string()),
+                    description: "MastheadToggle moved under MastheadMain".to_string(),
+                },
+            ],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let composition_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.labels.iter().any(|l| l == "change-type=composition"))
+            .collect();
+
+        // Should have 2 rules: 1 consolidated parent-level + 1 nesting change
+        assert_eq!(
+            composition_rules.len(),
+            2,
+            "Expected 2 composition rules (1 consolidated + 1 nesting), got {}: {:?}",
+            composition_rules.len(),
+            composition_rules
+                .iter()
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
+        );
+
+        let consolidated = composition_rules
+            .iter()
+            .find(|r| r.rule_id.contains("children-to-icon-prop"));
+        assert!(consolidated.is_some(), "Should have a consolidated rule");
+
+        let nesting = composition_rules
+            .iter()
+            .find(|r| r.rule_id.contains("mastheadtoggle-nesting-changed"));
+        assert!(nesting.is_some(), "Should have a nesting change rule");
+    }
+
+    #[test]
+    fn test_children_to_prop_deduplicates_across_files() {
+        // The same icon→prop change detected in multiple test files should
+        // produce only one consolidated rule (not duplicates).
+        let changes = vec![
+            make_composition_changes(
+                "packages/react-core/src/components/Modal/CloseButton.tsx",
+                vec![CompositionPatternChange {
+                    component: "TimesIcon".to_string(),
+                    old_parent: Some("Button (as children)".to_string()),
+                    new_parent: Some("Button (as icon prop)".to_string()),
+                    description: "TimesIcon in CloseButton".to_string(),
+                }],
+            ),
+            make_composition_changes(
+                "packages/react-core/src/components/Popover/PopoverClose.tsx",
+                vec![CompositionPatternChange {
+                    component: "TimesIcon".to_string(),
+                    old_parent: Some("Button (as children)".to_string()),
+                    new_parent: Some("Button (as icon prop)".to_string()),
+                    description: "TimesIcon in PopoverClose".to_string(),
+                }],
+            ),
+        ];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let composition_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.labels.iter().any(|l| l == "change-type=composition"))
+            .collect();
+
+        // Should be exactly 1 consolidated rule (TimesIcon appears once in child list)
+        assert_eq!(composition_rules.len(), 1);
+        // TimesIcon should appear only once in the message (deduplicated)
+        let times_count = composition_rules[0].message.matches("TimesIcon").count();
+        assert_eq!(
+            times_count, 1,
+            "TimesIcon should be deduplicated in the message, found {} occurrences",
+            times_count,
+        );
+    }
+
+    // ── Value diff / value mapping tests ─────────────────────────────────
+
+    #[test]
+    fn test_value_diff_tier1_one_to_one_mapping() {
+        // When exactly 1 value is removed and 1 is added, the per-value rule
+        // should include an explicit "Replace with 'X'" mapping.
+        let changes = vec![FileChanges {
+            file: PathBuf::from("packages/react-core/src/components/Tabs/Tabs.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Tabs.variant".to_string(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("'default' | 'light300'".to_string()),
+                after: Some("'default' | 'secondary'".to_string()),
+                description: "light300 renamed to secondary".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
+        }];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let val_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=prop-value-change")
+            })
+            .collect();
+
+        // Should have exactly 1 per-value rule (light300)
+        assert_eq!(val_rules.len(), 1, "Expected 1 per-value rule");
+        let rule = val_rules[0];
+
+        // Message should contain explicit replacement
+        assert!(
+            rule.message.contains("Replace with 'secondary'"),
+            "Tier 1 rule should have explicit mapping. Message: {}",
+            rule.message,
+        );
+        assert!(
+            !rule.message.contains("one of the new values"),
+            "Tier 1 rule should NOT use generic 'one of' phrasing",
+        );
+
+        // Fix strategy should have the mapping
+        let strat = rule.fix_strategy.as_ref().unwrap();
+        assert_eq!(strat.mappings.len(), 1);
+        assert_eq!(strat.mappings[0].from.as_deref(), Some("light300"));
+        assert_eq!(strat.mappings[0].to.as_deref(), Some("secondary"));
+    }
+
+    #[test]
+    fn test_value_diff_tier3_lists_new_values() {
+        // When removed/added counts differ, the message should list available
+        // replacement values so the fix-engine LLM can pick correctly.
+        let changes = vec![FileChanges {
+            file: PathBuf::from("packages/react-core/src/components/Toolbar/ToolbarGroup.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "ToolbarGroup.variant".to_string(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("'button-group' | 'filter-group' | 'icon-button-group'".to_string()),
+                after: Some("'action-group' | 'action-group-plain' | 'filter-group'".to_string()),
+                description: "variant values changed".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
+        }];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let val_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=prop-value-change")
+            })
+            .collect();
+
+        // Should have 2 per-value rules (button-group, icon-button-group)
+        assert_eq!(val_rules.len(), 2, "Expected 2 per-value rules");
+
+        // Each rule should list the new values
+        for rule in &val_rules {
+            assert!(
+                rule.message.contains("action-group")
+                    && rule.message.contains("action-group-plain"),
+                "Tier 3 rule should list available replacements. Message: {}",
+                rule.message,
+            );
+            assert!(
+                rule.message.contains("one of the new values"),
+                "Tier 3 rule should use 'one of the new values' phrasing",
+            );
+        }
+    }
+
+    #[test]
+    fn test_value_diff_no_added_values() {
+        // When values are removed with no new values added, the message
+        // should indicate there's no direct replacement.
+        let changes = vec![FileChanges {
+            file: PathBuf::from("packages/react-core/src/components/Page/PageSection.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "PageSection.variant".to_string(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("'dark' | 'darker' | 'default' | 'light'".to_string()),
+                after: Some("'default'".to_string()),
+                description: "variant simplified".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
+        }];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let val_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=prop-value-change")
+            })
+            .collect();
+
+        // Should have 3 per-value rules (dark, darker, light)
+        assert_eq!(val_rules.len(), 3);
+
+        for rule in &val_rules {
+            assert!(
+                rule.message.contains("no direct replacement"),
+                "Rule with no added values should say no replacement. Message: {}",
+                rule.message,
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_added_union_values() {
+        let change = ApiChange {
+            symbol: "Foo.bar".to_string(),
+            kind: ApiChangeKind::Property,
+            change: ApiChangeType::TypeChanged,
+            before: Some("'a' | 'b' | 'c'".to_string()),
+            after: Some("'b' | 'c' | 'd' | 'e'".to_string()),
+            description: "values changed".to_string(),
+            migration_target: None,
+            removal_disposition: None,
+            renders_element: None,
+        };
+
+        let removed = extract_removed_union_values(&change);
+        let added = extract_added_union_values(&change);
+
+        assert_eq!(removed, vec!["a"]);
+        assert_eq!(added, vec!["d", "e"]);
+    }
+
+    // ── Type-changed rule message enrichment tests ──────────────────────
+
+    #[test]
+    fn test_type_changed_rule_tier1_message_has_direct_mapping() {
+        // A type-changed rule with 1 removed + 1 added value should have
+        // the explicit mapping in its message (not just before/after types).
+        let changes = vec![FileChanges {
+            file: PathBuf::from("packages/react-core/src/components/Tabs/Tabs.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Tabs.variant".to_string(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("'default' | 'light300'".to_string()),
+                after: Some("'default' | 'secondary'".to_string()),
+                description: "variant values changed".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
+        }];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        // Find the type-changed rule (not the prop-value-change one)
+        let tc_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.labels.iter().any(|l| l == "change-type=type-changed"))
+            .collect();
+        assert!(!tc_rules.is_empty(), "Should have a type-changed rule");
+
+        let rule = tc_rules[0];
+        assert!(
+            rule.message.contains("'light300' → 'secondary'"),
+            "Type-changed message should contain Tier 1 mapping. Message:\n{}",
+            rule.message,
+        );
+        assert!(
+            rule.message.contains("direct replacement"),
+            "Tier 1 should indicate direct replacement",
+        );
+
+        // Fix strategy should have the mapping
+        let strat = rule.fix_strategy.as_ref().unwrap();
+        assert!(
+            strat
+                .mappings
+                .iter()
+                .any(|m| m.from.as_deref() == Some("light300")
+                    && m.to.as_deref() == Some("secondary")),
+            "Fix strategy should contain value mapping. Mappings: {:?}",
+            strat.mappings,
+        );
+    }
+
+    #[test]
+    fn test_type_changed_rule_tier3_message_lists_values() {
+        // A type-changed rule with different removed/added counts should
+        // list removed and new values separately.
+        let changes = vec![FileChanges {
+            file: PathBuf::from("packages/react-core/src/components/Toolbar/ToolbarGroup.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "ToolbarGroup.variant".to_string(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("'button-group' | 'filter-group' | 'icon-button-group'".to_string()),
+                after: Some("'action-group' | 'action-group-plain' | 'filter-group'".to_string()),
+                description: "variant values changed".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            composition_pattern_changes: vec![],
+        }];
+
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let tc_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.labels.iter().any(|l| l == "change-type=type-changed"))
+            .collect();
+        assert!(!tc_rules.is_empty());
+
+        let rule = tc_rules[0];
+        assert!(
+            rule.message.contains("Removed values:")
+                && rule.message.contains("'button-group'")
+                && rule.message.contains("'icon-button-group'"),
+            "Should list removed values. Message:\n{}",
+            rule.message,
+        );
+        assert!(
+            rule.message.contains("New values available:")
+                && rule.message.contains("'action-group'")
+                && rule.message.contains("'action-group-plain'"),
+            "Should list new values. Message:\n{}",
+            rule.message,
+        );
+    }
+
+    // ── Hierarchy delta rule generation tests ────────────────────────
+
+    #[test]
+    fn test_hierarchy_delta_generates_composition_rule() {
+        // When hierarchy_deltas exist on the report, generate
+        // hierarchy-composition rules with the correct structure.
+        let changes = vec![];
+        let mut report = make_report(changes, vec![]);
+
+        // Add a package with the Dropdown component
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "Dropdown".to_string(),
+                interface_name: "DropdownProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary::default(),
+                removed_properties: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![
+                    ExpectedChild {
+                        name: "DropdownList".to_string(),
+                        required: true,
+                    },
+                    ExpectedChild {
+                        name: "DropdownGroup".to_string(),
+                        required: false,
+                    },
+                ],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        // Add a hierarchy delta: Dropdown gained DropdownList as required child,
+        // and DropdownItem moved from Dropdown to DropdownList
+        report.hierarchy_deltas = vec![HierarchyDelta {
+            component: "Dropdown".to_string(),
+            added_children: vec![ExpectedChild {
+                name: "DropdownList".to_string(),
+                required: true,
+            }],
+            removed_children: vec!["DropdownItem".to_string()],
+            migrated_props: vec![],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let hierarchy_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=hierarchy-composition")
+            })
+            .collect();
+
+        assert_eq!(
+            hierarchy_rules.len(),
+            1,
+            "Expected 1 hierarchy-composition rule"
+        );
+
+        let rule = hierarchy_rules[0];
+        assert!(
+            rule.rule_id.contains("hierarchy-dropdown"),
+            "Rule ID should reference Dropdown: {}",
+            rule.rule_id,
+        );
+        assert!(
+            rule.message.contains("DropdownList"),
+            "Message should mention DropdownList"
+        );
+        assert!(
+            rule.message.contains("required"),
+            "Message should indicate DropdownList is required"
+        );
+        assert!(
+            rule.message.contains("DropdownItem"),
+            "Message should mention DropdownItem was removed as direct child"
+        );
+
+        // Should match on Dropdown IMPORT
+        match &rule.when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(referenced.pattern, "^Dropdown$");
+                assert_eq!(referenced.location, "IMPORT");
+                assert_eq!(referenced.from.as_deref(), Some("@patternfly/react-core"),);
+            }
+            other => panic!("Expected FrontendReferenced, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hierarchy_delta_with_migrated_props() {
+        // When a hierarchy delta includes migrated props, the rule message
+        // should describe where each prop moved.
+        let changes = vec![];
+        let mut report = make_report(changes, vec![]);
+
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "Modal".to_string(),
+                interface_name: "ModalProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary::default(),
+                removed_properties: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![
+                    ExpectedChild {
+                        name: "ModalHeader".to_string(),
+                        required: false,
+                    },
+                    ExpectedChild {
+                        name: "ModalBody".to_string(),
+                        required: true,
+                    },
+                    ExpectedChild {
+                        name: "ModalFooter".to_string(),
+                        required: false,
+                    },
+                ],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        report.hierarchy_deltas = vec![HierarchyDelta {
+            component: "Modal".to_string(),
+            added_children: vec![
+                ExpectedChild {
+                    name: "ModalHeader".to_string(),
+                    required: false,
+                },
+                ExpectedChild {
+                    name: "ModalBody".to_string(),
+                    required: true,
+                },
+                ExpectedChild {
+                    name: "ModalFooter".to_string(),
+                    required: false,
+                },
+            ],
+            removed_children: vec![],
+            migrated_props: vec![
+                MigratedProp {
+                    prop_name: "title".to_string(),
+                    target_child: "ModalHeader".to_string(),
+                    target_prop_name: None,
+                },
+                MigratedProp {
+                    prop_name: "actions".to_string(),
+                    target_child: "ModalFooter".to_string(),
+                    target_prop_name: None,
+                },
+            ],
+        }];
+
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let hierarchy_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=hierarchy-composition")
+            })
+            .collect();
+
+        assert_eq!(hierarchy_rules.len(), 1);
+
+        let rule = hierarchy_rules[0];
+        assert!(
+            rule.message.contains("ModalHeader") && rule.message.contains("title"),
+            "Should show title migrated to ModalHeader. Message:\n{}",
+            rule.message,
+        );
+        assert!(
+            rule.message.contains("ModalFooter") && rule.message.contains("actions"),
+            "Should show actions migrated to ModalFooter. Message:\n{}",
+            rule.message,
+        );
+        assert!(
+            rule.message.contains("ModalBody") && rule.message.contains("required"),
+            "Should show ModalBody as required",
+        );
+    }
+
+    #[test]
+    fn test_hierarchy_delta_empty_no_rules() {
+        // When hierarchy_deltas is empty, no hierarchy-composition rules
+        // should be generated.
+        let report = make_report(vec![], vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.ts",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+
+        let hierarchy_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| {
+                r.labels
+                    .iter()
+                    .any(|l| l == "change-type=hierarchy-composition")
+            })
+            .collect();
+
+        assert_eq!(hierarchy_rules.len(), 0);
     }
 }
