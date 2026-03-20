@@ -3085,11 +3085,24 @@ fn consolidation_key(rule: &KonveyorRule) -> String {
         }
     }
 
+    // Type-changed constants: consolidate by package when many constants
+    // from the same package have the same kind of type change (e.g., 1746
+    // IconConfig type changes in react-icons). These are systematic changes
+    // that should be collapsed into a single informational rule per package.
+    if change_type == "type-changed" && kind == "constant" {
+        let package = extract_package_from_path(file_key);
+        return format!("{}-constant-type-changed", package);
+    }
+
     // Rules with these change types should NOT be consolidated — they are
     // standalone rules with specific conditions that would be lost in merging.
     // Use the rule_id as the key to prevent any grouping.
     match change_type {
-        "css-variable" | "new-sibling-component" | "component-removal" | "dependency-update" => {
+        "css-variable"
+        | "new-sibling-component"
+        | "component-removal"
+        | "dependency-update"
+        | "composition" => {
             return rule.rule_id.clone();
         }
         _ => {}
