@@ -823,34 +823,49 @@ Rules:
 ///
 /// Props are NOT included in the prompt — they come from the AST surface.
 /// The LLM only needs to determine the hierarchy (what goes inside what).
-pub fn build_hierarchy_inference_prompt(family_name: &str, files_content: &str) -> String {
-    format!(
-        r#"Analyze this component family and determine the expected parent-child composition hierarchy for consumers of this library.
+pub fn build_hierarchy_inference_prompt(
+    family_name: &str,
+    files_content: &str,
+    related_components: Option<&str>,
+) -> String {
+    let related_section = related_components
+        .map(|rc| {
+            format!(
+                r#"
 
-## Component family: `{family_name}`
+## Related components from other families
+
+These components share React context with this family. If a related
+component is designed to be placed INSIDE a family component, include
+it as an expected child of that family component. Match by naming
+(e.g., a "ToggleButton" goes inside a "Toggle" container).
+
+Do NOT include a related component if the family component goes inside
+IT (reversed direction).
+
+{rc}"#
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        r#"You are a JSON-only API. Do NOT output any explanation, reasoning, or markdown headers.
+Output ONLY a single ```json fenced code block.
+
+Analyze the `{family_name}` component family and determine the expected parent-child composition hierarchy.
 
 ## Source files:
-{files_content}
+{files_content}{related_section}
 
-## Task:
-For each **exported** component in this family, determine:
-1. What other components from this family should be used as its direct children?
-2. Is each child required (must be present) or optional?
+## Rules:
+- For each **exported** component, list what other components from this family (or related components listed above) that CONSUMERS must provide as direct JSX children
+- A child is "required" if the parent needs it to function, "optional" otherwise
+- CRITICAL: If a parent component WRAPS children in another component internally (e.g., `return <div><SomeWrapper>{{children}}</SomeWrapper></div>` or `{{hasWrapper ? <SomeWrapper>{{children}}</SomeWrapper> : children}}`), that wrapper is an INTERNAL implementation detail. Do NOT list it as an expected child. The consumer passes `children` to the parent and the parent handles the wrapping automatically.
+- This rule applies even if the wrapper component is exported from index.ts.
+- Only include components that consumers must explicitly add in their JSX
+- Exclude: internally-rendered components, base components from other families, HTML elements, the component itself
 
-Base your analysis on:
-- What each component renders internally in its JSX return (components rendered internally are NOT expected children — consumers don't provide them)
-- The relationship between wrapper components and their base components (e.g., if Dropdown renders Menu+MenuContent internally but NOT MenuList, then DropdownList which wraps MenuList is an expected child)
-- Standard React/HTML composition patterns (ul→li, table→tr, etc.)
-- Export structure (index.ts) — only include exported components
-
-## What to EXCLUDE from expected_children:
-- Internal/private components not exported from index.ts
-- Base components from other families (e.g., Menu, MenuList — those are internal)
-- HTML elements
-- The component itself
-
-## Output format:
-Return ONLY a JSON object inside a ```json fenced block:
+## Output format — respond with ONLY this JSON, no other text:
 ```json
 {{
   "components": {{
@@ -861,15 +876,88 @@ Return ONLY a JSON object inside a ```json fenced block:
     }}
   }}
 }}
-```
-
-Rules:
-- Only include components that are exported to consumers (appear in index.ts or are publicly exported)
-- A child is "required" if the parent component functionally needs it (e.g., items need a list wrapper)
-- A child is "optional" if it enhances the parent but the parent works without it
-- If a component has no expected children from this family, use an empty array
-- Do NOT include components from other families as children"#,
+```"#,
         family_name = family_name,
         files_content = files_content,
     )
+}
+
+// ── CSS Suffix Rename Inference Prompt ───────────────────────────────────
+
+/// Build a prompt for LLM inference of CSS property suffix renames.
+///
+/// Given two sets of suffixes (removed from old version, added in new version),
+/// the LLM identifies which removed suffixes are CSS physical property names
+/// that were renamed to their logical equivalents in the new version.
+pub fn build_suffix_rename_prompt(removed_suffixes: &[&str], added_suffixes: &[&str]) -> String {
+    let removed_list = removed_suffixes.join(", ");
+    let added_list = added_suffixes.join(", ");
+
+    format!(
+        r#"A CSS design system library changed its CSS custom property naming between versions. The library encodes CSS property names as PascalCase suffixes in variable names (e.g., `--pf-c-button--PaddingTop` uses suffix `PaddingTop` for the CSS property `padding-top`).
+
+Between versions, some suffixes were removed and new ones were added. Your task is to identify which removed suffixes were **renamed** to new suffixes — specifically, CSS physical property names that were replaced with their CSS Logical Properties equivalents.
+
+## CSS Logical Properties background
+
+CSS Logical Properties replace physical direction words with flow-relative ones:
+- `top` → `block-start`, `bottom` → `block-end`
+- `left` → `inline-start`, `right` → `inline-end`
+- Position properties like `top`/`left` → `inset-block-start`/`inset-inline-start`
+
+## Removed suffixes (from old version):
+{removed}
+
+## Added suffixes (in new version):
+{added}
+
+## Task:
+Identify pairs where a removed suffix is the PascalCase form of a CSS physical property and the corresponding added suffix is its CSS logical property equivalent.
+
+Only include pairs where you are confident the rename is a CSS physical→logical property change. Do NOT include pairs that are unrelated property changes (e.g., Color→FontWeight is NOT a logical property rename).
+
+## Output format:
+Return ONLY a JSON object inside a ```json fenced block:
+```json
+{{
+  "renames": [
+    {{ "from": "PaddingTop", "to": "PaddingBlockStart" }}
+  ]
+}}
+```
+
+Rules:
+- Only include CSS physical→logical property renames
+- The "from" must be a removed suffix, the "to" must be an added suffix
+- If no valid renames are found, return `{{"renames": []}}`"#,
+        removed = removed_list,
+        added = added_list,
+    )
+}
+
+#[cfg(test)]
+mod hierarchy_tests {
+    use super::*;
+
+    #[test]
+    fn hierarchy_prompt_without_related() {
+        let prompt = build_hierarchy_inference_prompt("Dropdown", "source code here", None);
+        assert!(prompt.contains("Dropdown"));
+        assert!(prompt.contains("source code here"));
+        // Should NOT have the related components section header
+        assert!(
+            !prompt.contains("Related components from other families"),
+            "Prompt should not include related section when None",
+        );
+    }
+
+    #[test]
+    fn hierarchy_prompt_with_related() {
+        let related =
+            "--- Related: Page/PageToggleButton.tsx ---\nexport interface PageToggleButtonProps {}";
+        let prompt = build_hierarchy_inference_prompt("Masthead", "masthead source", Some(related));
+        assert!(prompt.contains("Masthead"));
+        assert!(prompt.contains("Related components from other families"));
+        assert!(prompt.contains("PageToggleButtonProps"));
+    }
 }

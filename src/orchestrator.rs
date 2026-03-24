@@ -1629,6 +1629,208 @@ fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> 
     }
 }
 
+// ── Cross-Family Context Detection ──────────────────────────────────────
+//
+// Detects when components in one family import React context from another
+// family (e.g., Masthead imports PageContext from Page). This indicates
+// cross-family composition relationships that should be included in the
+// hierarchy LLM call so the LLM can determine if a provider family's
+// component is an expected child of a consumer family's component.
+
+/// A cross-family context relationship detected from imports.
+#[derive(Debug, Clone)]
+struct ContextRelationship {
+    /// Family that consumes the context (e.g., "Masthead")
+    consumer_family: String,
+    /// Family that provides the context (e.g., "Page")
+    provider_family: String,
+    /// The context symbol imported (e.g., "PageContext")
+    context_name: String,
+}
+
+/// Scan component source files for cross-directory context imports.
+///
+/// Returns a list of relationships where one family imports a React context
+/// from another family's directory.
+fn detect_cross_family_context(repo: &Path, git_ref: &str) -> Vec<ContextRelationship> {
+    use regex::Regex;
+
+    let output = match std::process::Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", git_ref])
+        .current_dir(repo)
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+
+    // Match: import { SomeContext } from '../OtherFamily/...'
+    // Captures the context name and the other family directory
+    let re = Regex::new(
+        r"import\s+\{[^}]*?(\w*Context\w*)[^}]*\}\s+from\s+'\.\./([\w]+)/",
+    )
+    .unwrap();
+
+    let mut relationships = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for file_path in output.lines() {
+        // Only scan component .tsx/.ts files
+        if (!file_path.ends_with(".tsx") && !file_path.ends_with(".ts"))
+            || file_path.contains("__tests__")
+            || file_path.contains("/examples/")
+            || file_path.contains("/deprecated/")
+            || file_path.contains("/stories/")
+        {
+            continue;
+        }
+
+        // Must be in a components directory
+        if !file_path.contains("/components/") {
+            continue;
+        }
+
+        // Extract this file's family directory
+        let consumer_family = match extract_family_from_path(file_path) {
+            Some(f) => f,
+            None => continue,
+        };
+
+        // Read the file and scan for cross-family context imports
+        let content = match read_git_file(repo, git_ref, file_path) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        for cap in re.captures_iter(&content) {
+            let context_name = cap[1].to_string();
+            let provider_family = cap[2].to_string();
+
+            // Skip same-family imports
+            if provider_family == consumer_family {
+                continue;
+            }
+
+            let key = (
+                consumer_family.clone(),
+                provider_family.clone(),
+                context_name.clone(),
+            );
+            if seen.insert(key) {
+                relationships.push(ContextRelationship {
+                    consumer_family: consumer_family.clone(),
+                    provider_family: provider_family.clone(),
+                    context_name,
+                });
+            }
+        }
+    }
+
+    if !relationships.is_empty() {
+        eprintln!("[Context] Detected {} cross-family context relationships:", relationships.len());
+        for rel in &relationships {
+            eprintln!("  {} ← {} ({})", rel.consumer_family, rel.provider_family, rel.context_name);
+        }
+    }
+
+    relationships
+}
+
+/// Extract the component family directory name from a file path.
+/// e.g., "packages/react-core/src/components/Masthead/Masthead.tsx" → "Masthead"
+fn extract_family_from_path(path: &str) -> Option<String> {
+    // Find the last "/components/X/" segment
+    let parts: Vec<&str> = path.split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if *part == "components" && i + 1 < parts.len() && i + 2 < parts.len() {
+            return Some(parts[i + 1].to_string());
+        }
+    }
+    None
+}
+
+/// Read provider family component signatures for inclusion in the
+/// consumer family's hierarchy LLM call.
+///
+/// Extracts only export signatures and interface definitions — not full
+/// source — to keep the context lean. Only includes components that use
+/// the specified context names.
+fn read_family_signatures(
+    repo: &Path,
+    git_ref: &str,
+    family_dir: &str,
+    context_names: &[String],
+) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", git_ref])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let all_files = String::from_utf8_lossy(&output.stdout);
+    let mut content = String::new();
+
+    for line in all_files.lines() {
+        if !line.ends_with(".tsx") && !line.ends_with(".ts") {
+            continue;
+        }
+        if line.contains("__tests__")
+            || line.contains("/examples/")
+            || line.contains("/deprecated/")
+            || line.contains("/stories/")
+            || line.contains("index.ts")
+        {
+            continue;
+        }
+
+        // Check if this file is in the target family directory
+        let file_family = match extract_family_from_path(line) {
+            Some(f) => f,
+            None => continue,
+        };
+        if file_family != family_dir {
+            continue;
+        }
+
+        let file_content = match read_git_file(repo, git_ref, line) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Check if this file uses any of the relevant context names
+        let uses_context = context_names
+            .iter()
+            .any(|ctx| file_content.contains(ctx));
+
+        if !uses_context {
+            continue;
+        }
+
+        // Include the full source for related components. These files are
+        // typically small (20-50 lines) and the JSX render body contains
+        // critical information about what the component renders — e.g.,
+        // PageToggleButton renders a <Button> with aria-expanded and
+        // sidebar toggle, which tells the LLM it belongs in MastheadToggle.
+        content.push_str(&format!(
+            "\n--- Related: {} (uses {}) ---\n",
+            line,
+            context_names.join(", "),
+        ));
+        content.push_str(&file_content);
+        content.push('\n');
+    }
+
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
 // ── Component Hierarchy Inference ────────────────────────────────────────
 //
 // Infers the component parent-child hierarchy for both versions by giving
@@ -1687,11 +1889,18 @@ fn find_qualifying_families(
     }
 
     // Filter to families with 2+ components AND breaking changes
-    dir_components
+    let result: Vec<String> = dir_components
         .into_iter()
         .filter(|(dir, components)| components.len() >= 2 && changed_dirs.contains(dir))
         .map(|(dir, _)| dir)
-        .collect()
+        .collect();
+
+    eprintln!(
+        "[Hierarchy] {} qualifying families",
+        result.len(),
+    );
+
+    result
 }
 
 /// Read all source files for a component family from a git ref.
@@ -1818,9 +2027,40 @@ async fn infer_and_diff_hierarchies(
         return (Vec::new(), HashMap::new());
     }
 
+    // Detect cross-family context relationships for the new version.
+    // This tells us which families share React context and should include
+    // related component signatures in their hierarchy LLM calls.
+    let context_rels = detect_cross_family_context(repo, to_ref);
+
+    // Build lookup: consumer_family → [(provider_family, [context_names])]
+    let mut context_providers: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    for rel in &context_rels {
+        context_providers
+            .entry(rel.consumer_family.clone())
+            .or_default()
+            .entry(rel.provider_family.clone())
+            .or_default()
+            .push(rel.context_name.clone());
+    }
+
+    // Pre-read related component signatures for each consumer family
+    let mut related_signatures: HashMap<String, String> = HashMap::new();
+    for (consumer, providers) in &context_providers {
+        let mut combined = String::new();
+        for (provider, ctx_names) in providers {
+            if let Some(sigs) = read_family_signatures(repo, to_ref, provider, ctx_names) {
+                combined.push_str(&sigs);
+            }
+        }
+        if !combined.is_empty() {
+            related_signatures.insert(consumer.clone(), combined);
+        }
+    }
+
     eprintln!(
-        "[Hierarchy] Analyzing {} component families for both versions...",
-        families.len()
+        "[Hierarchy] Analyzing {} component families for both versions ({} with cross-family context)...",
+        families.len(),
+        related_signatures.len(),
     );
 
     // Run LLM calls concurrently (5 at a time)
@@ -1839,27 +2079,38 @@ async fn infer_and_diff_hierarchies(
         let to_ref = to_ref.to_string();
         let llm_cmd = llm_command.to_string();
         let family = family.clone();
+        let related = related_signatures.get(&family).cloned();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let idx = done.fetch_add(1, Ordering::Relaxed) + 1;
 
-            eprintln!("[Hierarchy] [{}/{}] {}", idx, total, family);
+            eprintln!("[Hierarchy] [{}/{}] {}{}", idx, total, family,
+                if related.is_some() { " (+ cross-family context)" } else { "" });
 
             // Read family source from both refs
             let old_content = read_family_files(&repo, &from_ref, &family);
             let new_content = read_family_files(&repo, &to_ref, &family);
 
-            let analyzer = semver_analyzer_llm::LlmBehaviorAnalyzer::new(&llm_cmd);
-
             // Infer old hierarchy (if family existed in old version)
+            // Old version doesn't get related signatures — conformance is
+            // about the new version's expected structure.
             let old_hierarchy = if let Some(content) = old_content {
                 tokio::task::spawn_blocking({
                     let analyzer_cmd = llm_cmd.clone();
                     let family_name = family.clone();
                     move || {
                         let a = semver_analyzer_llm::LlmBehaviorAnalyzer::new(&analyzer_cmd);
-                        a.infer_component_hierarchy(&family_name, &content).ok()
+                        match a.infer_component_hierarchy(&family_name, &content, None) {
+                            Ok(h) => Some(h),
+                            Err(e) => {
+                                eprintln!(
+                                    "[Hierarchy] WARN: {} old hierarchy failed: {}",
+                                    family_name, e
+                                );
+                                None
+                            }
+                        }
                     }
                 })
                 .await
@@ -1870,14 +2121,44 @@ async fn infer_and_diff_hierarchies(
                 HashMap::new()
             };
 
-            // Infer new hierarchy
+            // Infer new hierarchy — include related signatures if available.
+            // Retry once on failure since the LLM sometimes returns prose
+            // instead of the expected JSON block.
             let new_hierarchy = if let Some(content) = new_content {
                 tokio::task::spawn_blocking({
                     let family_name = family.clone();
+                    let related_sigs = related;
                     move || {
-                        analyzer
-                            .infer_component_hierarchy(&family_name, &content)
-                            .ok()
+                        let analyzer =
+                            semver_analyzer_llm::LlmBehaviorAnalyzer::new(&llm_cmd);
+                        match analyzer.infer_component_hierarchy(
+                            &family_name,
+                            &content,
+                            related_sigs.as_deref(),
+                        ) {
+                            Ok(h) => Some(h),
+                            Err(e) => {
+                                eprintln!(
+                                    "[Hierarchy] WARN: {} new hierarchy failed: {} — retrying...",
+                                    family_name, e
+                                );
+                                // Retry once
+                                match analyzer.infer_component_hierarchy(
+                                    &family_name,
+                                    &content,
+                                    related_sigs.as_deref(),
+                                ) {
+                                    Ok(h) => Some(h),
+                                    Err(e2) => {
+                                        eprintln!(
+                                            "[Hierarchy] WARN: {} new hierarchy retry also failed: {}",
+                                            family_name, e2
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                        }
                     }
                 })
                 .await

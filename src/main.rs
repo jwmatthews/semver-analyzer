@@ -262,6 +262,82 @@ async fn cmd_analyze(
         );
     }
 
+    // ── Infer CSS suffix renames via LLM ─────────────────────────────
+    //
+    // Extract suffix inventory from compound token diffs, then ask the
+    // LLM to identify CSS physical→logical property renames (e.g.,
+    // PaddingTop → PaddingBlockStart). Store the resulting member_renames
+    // in the report so the konveyor step can generate CSS var rules.
+    if !no_llm {
+        if let Some(llm_cmd) = llm_command {
+            let (removed_suffixes, added_suffixes) =
+                konveyor::extract_suffix_inventory(&report);
+            if !removed_suffixes.is_empty() && !added_suffixes.is_empty() {
+                eprintln!(
+                    "[Suffix] Extracted {} removed, {} added suffixes from token diffs",
+                    removed_suffixes.len(),
+                    added_suffixes.len()
+                );
+
+                let suffix_result = tokio::task::spawn_blocking({
+                    let cmd = llm_cmd.to_string();
+                    let removed: Vec<String> =
+                        removed_suffixes.into_iter().collect();
+                    let added: Vec<String> =
+                        added_suffixes.into_iter().collect();
+                    move || {
+                        let analyzer =
+                            semver_analyzer_llm::LlmBehaviorAnalyzer::new(&cmd);
+                        let removed_refs: Vec<&str> =
+                            removed.iter().map(|s| s.as_str()).collect();
+                        let added_refs: Vec<&str> =
+                            added.iter().map(|s| s.as_str()).collect();
+                        analyzer.infer_suffix_renames(&removed_refs, &added_refs)
+                    }
+                })
+                .await;
+
+                match suffix_result {
+                    Ok(Ok(renames)) if !renames.is_empty() => {
+                        eprintln!(
+                            "[Suffix] LLM identified {} CSS suffix renames:",
+                            renames.len()
+                        );
+                        let suffix_map: HashMap<String, String> = renames
+                            .iter()
+                            .map(|r| {
+                                eprintln!("  {} → {}", r.from, r.to);
+                                (r.from.clone(), r.to.clone())
+                            })
+                            .collect();
+
+                        // Apply suffix mappings to compound tokens and store
+                        // the resulting member renames on the report
+                        let member_renames =
+                            konveyor::apply_suffix_renames(&report, &suffix_map);
+
+                        if !member_renames.is_empty() {
+                            eprintln!(
+                                "[Suffix] Applied suffix mappings: {} member renames",
+                                member_renames.len()
+                            );
+                            report.member_renames = member_renames;
+                        }
+                    }
+                    Ok(Ok(_)) => {
+                        eprintln!("[Suffix] LLM returned no suffix renames");
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("[Suffix] WARN: LLM suffix inference failed: {}", e);
+                    }
+                    Err(e) => {
+                        eprintln!("[Suffix] WARN: spawn_blocking failed: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
     let total_breaking = report.summary.total_breaking_changes;
     eprintln!();
     if total_breaking == 0 {
@@ -358,9 +434,16 @@ async fn cmd_konveyor(
         .map(|(k, v)| (k.clone(), v.name.clone()))
         .collect();
 
-    // Analyze token member objects for redundancy suppression and member renames
-    let (covered_symbols, member_renames) =
+    // Analyze token member objects for redundancy suppression and member renames.
+    // The report may already contain member_renames from the analyze step
+    // (populated via LLM suffix inference). analyze_token_members adds any
+    // additional renames from explicit rename patterns.
+    let (covered_symbols, mut member_renames) =
         konveyor::analyze_token_members(&report, &rename_patterns);
+    // Merge in any LLM-inferred renames already on the report
+    for (k, v) in &report.member_renames {
+        member_renames.entry(k.clone()).or_insert_with(|| v.clone());
+    }
     if !covered_symbols.is_empty() {
         eprintln!(
             "Found {} token member keys covered by parent objects, {} member renames",
@@ -470,6 +553,17 @@ async fn cmd_konveyor(
     // Write fix strategies
     konveyor::write_fix_strategies(&fix_dir, &strategies)?;
 
+    // Generate conformance rules (separate from migration rules)
+    let conformance_rules = konveyor::generate_conformance_rules(&report);
+    if !conformance_rules.is_empty() {
+        let conformance_strategies = konveyor::extract_fix_strategies(&conformance_rules);
+        konveyor::write_conformance_rules(output_dir, &conformance_rules)?;
+
+        // Merge conformance strategies into the main strategies file
+        strategies.extend(conformance_strategies);
+        konveyor::write_fix_strategies(&fix_dir, &strategies)?;
+    }
+
     eprintln!(
         "Generated {} Konveyor rules in {}",
         rule_count,
@@ -477,6 +571,13 @@ async fn cmd_konveyor(
     );
     eprintln!("  Ruleset:  {}/ruleset.yaml", output_dir.display());
     eprintln!("  Rules:    {}/breaking-changes.yaml", output_dir.display());
+    if !conformance_rules.is_empty() {
+        eprintln!(
+            "  Conformance: {}/conformance-rules.yaml ({} rules)",
+            output_dir.display(),
+            conformance_rules.len(),
+        );
+    }
     eprintln!("  Fixes:    {}/fix-guidance.yaml", fix_dir.display());
     eprintln!("  Strategies: {}/fix-strategies.json ({} entries)", fix_dir.display(), strategies.len());
     eprintln!(
@@ -1800,22 +1901,247 @@ fn enrich_hierarchy_deltas(
     // new-version hierarchy (not just deltas). This ensures every component
     // gets its complete expected_children list, including children that
     // existed in both old and new versions (no delta).
-    for (_family, family_hierarchy) in new_hierarchies {
+    //
+    // When a component from the hierarchy inference doesn't have a
+    // ComponentSummary (because it has no breaking API changes), create
+    // one so that conformance rules can be generated for it.
+    for (family, family_hierarchy) in new_hierarchies {
         for (comp_name, children) in family_hierarchy {
+            if children.is_empty() {
+                continue;
+            }
+
+            let expected: Vec<ExpectedChild> = children
+                .iter()
+                .map(|c| ExpectedChild {
+                    name: c.name.clone(),
+                    required: c.required,
+                })
+                .collect();
+
+            // Try to find existing ComponentSummary
+            let mut found = false;
             for pkg in &mut report.packages {
                 for comp in &mut pkg.components {
                     if comp.name == *comp_name {
-                        for child in children {
-                            if !comp.expected_children.iter().any(|ec| ec.name == child.name) {
-                                comp.expected_children.push(ExpectedChild {
-                                    name: child.name.clone(),
-                                    required: child.required,
-                                });
+                        found = true;
+                        for ec in &expected {
+                            if !comp.expected_children.iter().any(|e| e.name == ec.name) {
+                                comp.expected_children.push(ec.clone());
                             }
                         }
                     }
                 }
             }
+
+            // If no ComponentSummary exists, create one in the package that
+            // contains sibling components from the same family. The family
+            // name (e.g., "Masthead") matches the directory where the
+            // component lives, so look for a package that already has a
+            // component whose name starts with the family prefix.
+            if !found {
+                // First pass: find the target package index
+                let target_idx = report
+                    .packages
+                    .iter()
+                    .position(|p| {
+                        p.components
+                            .iter()
+                            .any(|c| c.name.starts_with(family))
+                    })
+                    .or_else(|| {
+                        report
+                            .packages
+                            .iter()
+                            .position(|p| !p.components.is_empty())
+                    });
+
+                if let Some(idx) = target_idx {
+                    report.packages[idx]
+                        .components
+                        .push(semver_analyzer_core::ComponentSummary {
+                            name: comp_name.clone(),
+                            interface_name: format!("{}Props", comp_name),
+                            status: semver_analyzer_core::ComponentStatus::Modified,
+                            property_summary: semver_analyzer_core::PropertySummary::default(),
+                            removed_properties: vec![],
+                            type_changes: vec![],
+                            migration_target: None,
+                            behavioral_changes: vec![],
+                            child_components: vec![],
+                            expected_children: expected,
+                            source_files: vec![],
+                        });
+                }
+            }
+        }
+    }
+
+    // ── Extends-based fallback for empty expected_children ─────────
+    //
+    // When the LLM hierarchy inference returns empty expected_children
+    // for a component (non-deterministic), check if the component's Props
+    // interface extends a base component that DOES have expected_children.
+    // If so, infer the wrapper's children by mapping through the extends
+    // chain (e.g., DropdownProps extends MenuProps, MenuList → DropdownList).
+    //
+    // This provides a deterministic fallback for the delegation pattern
+    // (Dropdown/Select/etc. wrapping Menu).
+    {
+        // Build extends map: "DropdownProps" → "MenuProps"
+        // Handles Omit<MenuGroupProps, 'ref'> → extracts "MenuGroupProps"
+        let mut extends_map: HashMap<String, String> = HashMap::new();
+        for sym in &new_surface.symbols {
+            if matches!(sym.kind, SymbolKind::Interface | SymbolKind::TypeAlias) {
+                if let Some(ref parent) = sym.extends {
+                    // Extract the base type from utility wrappers like Omit<T, K>
+                    let base = if parent.starts_with("Omit<")
+                        || parent.starts_with("Pick<")
+                        || parent.starts_with("Partial<")
+                        || parent.starts_with("Required<")
+                    {
+                        parent
+                            .split('<')
+                            .nth(1)
+                            .and_then(|s| s.split(&[',', '>'][..]).next())
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_else(|| parent.clone())
+                    } else {
+                        parent.clone()
+                    };
+                    extends_map.insert(sym.name.clone(), base);
+                }
+            }
+        }
+
+        // Build component→expected_children lookup from current report data
+        let mut comp_children: HashMap<String, Vec<ExpectedChild>> = HashMap::new();
+        for pkg in &report.packages {
+            for comp in &pkg.components {
+                if !comp.expected_children.is_empty() {
+                    comp_children.insert(comp.name.clone(), comp.expected_children.clone());
+                }
+            }
+        }
+
+        // Build reverse map: base interface → base component name
+        // e.g., "MenuProps" → "Menu", "MenuListProps" → "MenuList"
+        let mut interface_to_component: HashMap<String, String> = HashMap::new();
+        for pkg in &report.packages {
+            for comp in &pkg.components {
+                interface_to_component.insert(comp.interface_name.clone(), comp.name.clone());
+            }
+        }
+
+        // For each component with empty expected_children, try the extends fallback
+        let mut inferred_count = 0;
+        let mut inferred: Vec<(String, Vec<ExpectedChild>)> = Vec::new();
+
+        for pkg in &report.packages {
+            for comp in &pkg.components {
+                if !comp.expected_children.is_empty() {
+                    continue;
+                }
+
+                // Check if this component's Props extends a base Props
+                let base_interface = match extends_map.get(&comp.interface_name) {
+                    Some(b) => b,
+                    None => continue,
+                };
+
+                // Find the base component name
+                let base_component = match interface_to_component.get(base_interface) {
+                    Some(c) => c,
+                    None => continue,
+                };
+
+                // Does the base component have expected_children?
+                let base_children = match comp_children.get(base_component) {
+                    Some(c) if !c.is_empty() => c,
+                    _ => continue,
+                };
+
+                // Map base children to wrapper family equivalents.
+                // For each base child (e.g., MenuList), find a component in the
+                // same family whose Props extends that base child's Props.
+                // "Same family" = same name prefix as the current component.
+                //
+                // When a base child has no wrapper equivalent but HAS its own
+                // expected_children, recurse one level — the wrapper might
+                // render the base child internally (e.g., Dropdown renders
+                // MenuContent internally, so we need MenuContent's children
+                // — MenuList, MenuGroup — mapped to DropdownList, DropdownGroup).
+                let prefix = &comp.name; // e.g., "Dropdown"
+                let mut mapped_children: Vec<ExpectedChild> = Vec::new();
+
+                let mut base_queue: Vec<&ExpectedChild> = base_children.iter().collect();
+                let mut seen_bases: HashSet<String> = HashSet::new();
+
+                while let Some(base_child) = base_queue.pop() {
+                    if !seen_bases.insert(base_child.name.clone()) {
+                        continue;
+                    }
+
+                    let base_child_interface = format!("{}Props", base_child.name);
+
+                    // Find a wrapper component whose Props extends this base child's Props
+                    let wrapper = extends_map.iter().find(|(iface, parent)| {
+                        *parent == &base_child_interface && iface.starts_with(prefix)
+                    });
+
+                    if let Some((wrapper_iface, _)) = wrapper {
+                        let wrapper_name = wrapper_iface
+                            .strip_suffix("Props")
+                            .unwrap_or(wrapper_iface);
+                        mapped_children.push(ExpectedChild {
+                            name: wrapper_name.to_string(),
+                            required: base_child.required,
+                        });
+                    } else {
+                        // No wrapper for this base child — check if the base child
+                        // has its own expected_children (the wrapper component might
+                        // render this base child internally).
+                        if let Some(sub_children) = comp_children.get(&base_child.name) {
+                            for sub in sub_children {
+                                base_queue.push(sub);
+                            }
+                        }
+                    }
+                }
+
+                if !mapped_children.is_empty() {
+                    eprintln!(
+                        "[Hierarchy] Inferred expected_children for {} from {} extends chain: {:?}",
+                        comp.name,
+                        base_component,
+                        mapped_children.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                    );
+                    inferred.push((comp.name.clone(), mapped_children));
+                    inferred_count += 1;
+                }
+            }
+        }
+
+        // Apply inferred children
+        for (comp_name, children) in inferred {
+            for pkg in &mut report.packages {
+                for comp in &mut pkg.components {
+                    if comp.name == comp_name {
+                        for ec in &children {
+                            if !comp.expected_children.iter().any(|e| e.name == ec.name) {
+                                comp.expected_children.push(ec.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if inferred_count > 0 {
+            eprintln!(
+                "[Hierarchy] Inferred expected_children for {} components via extends chain fallback",
+                inferred_count,
+            );
         }
     }
 

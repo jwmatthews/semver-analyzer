@@ -454,6 +454,35 @@ pub struct LlmComponentHierarchy {
     pub expected_children: Vec<LlmExpectedChild>,
 }
 
+// ── CSS Suffix Rename Response Parsing ───────────────────────────────────
+
+/// A single suffix rename from the LLM response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmSuffixRename {
+    pub from: String,
+    pub to: String,
+}
+
+/// The top-level LLM suffix rename response.
+#[derive(Debug, Clone, Deserialize)]
+struct LlmSuffixRenameResponse {
+    pub renames: Vec<LlmSuffixRename>,
+}
+
+/// Parse the LLM response for CSS suffix rename inference.
+/// Returns a list of (old_suffix, new_suffix) pairs.
+pub fn parse_suffix_rename_response(response: &str) -> Result<Vec<LlmSuffixRename>> {
+    let json_str = extract_json(response)
+        .with_context(|| "No JSON found in suffix rename inference response")?;
+    let parsed: LlmSuffixRenameResponse = serde_json::from_str(&json_str).with_context(|| {
+        format!(
+            "Failed to parse suffix rename response: {}",
+            truncate(&json_str, 300)
+        )
+    })?;
+    Ok(parsed.renames)
+}
+
 /// Parse the LLM response for hierarchy inference.
 /// Returns a map of component name → expected children.
 pub fn parse_hierarchy_response(
@@ -1027,5 +1056,41 @@ The function validates email addresses."#;
         let result = parse_hierarchy_response(response).unwrap();
         assert_eq!(result.len(), 1);
         assert!(result["Badge"].is_empty());
+    }
+
+    // ── Suffix rename response parsing tests ───────────────────────
+
+    #[test]
+    fn parse_suffix_rename_response_valid() {
+        let response = r#"```json
+{
+  "renames": [
+    { "from": "PaddingTop", "to": "PaddingBlockStart" },
+    { "from": "MarginLeft", "to": "MarginInlineStart" }
+  ]
+}
+```"#;
+        let result = parse_suffix_rename_response(response).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].from, "PaddingTop");
+        assert_eq!(result[0].to, "PaddingBlockStart");
+        assert_eq!(result[1].from, "MarginLeft");
+        assert_eq!(result[1].to, "MarginInlineStart");
+    }
+
+    #[test]
+    fn parse_suffix_rename_response_empty() {
+        let response = r#"```json
+{ "renames": [] }
+```"#;
+        let result = parse_suffix_rename_response(response).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_suffix_rename_response_no_json() {
+        let response = "I couldn't find any renames.";
+        let result = parse_suffix_rename_response(response);
+        assert!(result.is_err());
     }
 }

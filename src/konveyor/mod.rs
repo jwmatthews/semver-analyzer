@@ -396,6 +396,11 @@ pub struct FrontendReferencedFields {
     /// Filter JSX components to only those inside this parent (regex).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Filter by the parent component's import source (regex).
+    /// Requires `parent` to be set. Ensures the parent is from a specific
+    /// package (e.g., `@patternfly/react-core`), not a custom app component.
+    #[serde(rename = "parentFrom", skip_serializing_if = "Option::is_none")]
+    pub parent_from: Option<String>,
     /// Filter JSX prop values to only those matching this regex.
     /// Used for prop value changes (e.g., `variant="tertiary"`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -728,6 +733,7 @@ fn build_combined_constant_rule(
                 parent: None,
                 value: None,
                 from: from_pkg,
+                parent_from: None,
             },
         },
         fix_strategy: strategy,
@@ -1228,16 +1234,44 @@ fn build_migration_message_v2(comp: &semver_analyzer_core::ComponentSummary) -> 
         msg.push('\n');
     }
 
-    // ── Behavioral changes section ──
+    // ── Behavioral changes section (deduplicated) ──
     if !comp.behavioral_changes.is_empty() {
-        msg.push_str("Behavioral changes:\n");
+        // Deduplicate identical behavioral change descriptions.
+        // Test assertion diffs often produce many identical entries
+        // (e.g., "aria-labelledby attribute added" × 20).
+        let mut seen = std::collections::BTreeSet::new();
+        let mut deduped: Vec<(&semver_analyzer_core::BehavioralChange, usize)> = Vec::new();
         for b in &comp.behavioral_changes {
+            let key = format!(
+                "{}:{}",
+                b.category
+                    .as_ref()
+                    .map(|c| behavioral_category_label(c))
+                    .unwrap_or("change"),
+                b.description
+            );
+            if seen.insert(key.clone()) {
+                let count = comp
+                    .behavioral_changes
+                    .iter()
+                    .filter(|b2| b2.description == b.description && b2.category == b.category)
+                    .count();
+                deduped.push((b, count));
+            }
+        }
+
+        msg.push_str("Behavioral changes:\n");
+        for (b, count) in &deduped {
             let cat = b
                 .category
                 .as_ref()
                 .map(|c| behavioral_category_label(c))
                 .unwrap_or("change");
-            msg.push_str(&format!("  - {}: {}\n", cat, b.description));
+            if *count > 1 {
+                msg.push_str(&format!("  - {}: {} (×{})\n", cat, b.description, count));
+            } else {
+                msg.push_str(&format!("  - {}: {}\n", cat, b.description));
+            }
         }
         msg.push('\n');
     }
@@ -1380,7 +1414,14 @@ pub fn generate_rules(
         }
     }
 
-    // Generate consolidated parent-level rules
+    // Generate consolidated parent-level rules.
+    //
+    // When a common suffix can be derived from the migrated child names
+    // (e.g., all end in "Icon"), generate a targeted JSX_COMPONENT rule
+    // matching that suffix pattern with `parent: ^Button$`. This fires
+    // at each incorrect usage (icon as child of Button) rather than at
+    // the import, giving the fix engine exact JSX context. The suffix
+    // pattern also catches custom/app-level components (e.g., ContextIcon).
     for ((parent, prop), migration) in &children_to_prop {
         let child_list = migration.child_components.join(", ");
         let base_id = format!(
@@ -1405,12 +1446,44 @@ pub fn generate_rules(
             children = child_list,
         );
 
+        // Derive a common suffix from the child component names to build
+        // a targeted pattern. Filter to valid PascalCase component names
+        // (skip LLM artifacts like "children (span ...)", "div (wrapper)").
+        let common_suffix = derive_common_suffix(&migration.child_components);
+
+        let (pattern, location, parent_field, parent_from_field) =
+            if let Some(ref suffix) = common_suffix {
+                // Targeted: match components ending in the derived suffix
+                // as children of the parent component, scoped to the parent's
+                // package via parentFrom.
+                (
+                    format!("{}$", regex_escape(suffix)),
+                    "JSX_COMPONENT".to_string(),
+                    Some(format!("^{}$", regex_escape(parent))),
+                    migration.from_pkg.clone(),
+                )
+            } else {
+                // Fallback: no common suffix — match on the parent's import.
+                (
+                    format!("^{}$", regex_escape(parent)),
+                    "IMPORT".to_string(),
+                    None,
+                    None,
+                )
+            };
+
         eprintln!(
-            "Consolidated {} children→{} composition changes on <{}> into parent-level rule: {}",
+            "Consolidated {} children→{} composition changes on <{}>: {} (pattern={}{})",
             migration.child_components.len(),
             prop,
             parent,
             rule_id,
+            pattern,
+            if let Some(ref p) = parent_field {
+                format!(", parent={}", p)
+            } else {
+                String::new()
+            },
         );
 
         rules.push(KonveyorRule {
@@ -1430,12 +1503,15 @@ pub fn generate_rules(
             links: Vec::new(),
             when: KonveyorCondition::FrontendReferenced {
                 referenced: FrontendReferencedFields {
-                    pattern: format!("^{}$", regex_escape(parent)),
-                    location: "IMPORT".to_string(),
+                    pattern,
+                    location,
                     component: None,
-                    parent: None,
+                    parent: parent_field,
+                    parent_from: parent_from_field,
                     value: None,
-                    from: migration.from_pkg.clone(),
+                    // Don't filter on the matched component's import source —
+                    // we want to catch app-level icons too (e.g., ContextIcon).
+                    from: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -1609,6 +1685,7 @@ pub fn generate_rules(
                             parent: None,
                             value: None,
                             from: Some(pkg.name.clone()),
+                            parent_from: None,
                         },
                     },
                     fix_strategy: Some(strategy),
@@ -1851,6 +1928,7 @@ pub fn generate_rules(
                         parent: parent_regex,
                         value: None,
                         from: from_scope.clone(),
+                        parent_from: None,
                     },
                 }
             } else {
@@ -1862,6 +1940,7 @@ pub fn generate_rules(
                         parent: None,
                         value: None,
                         from: from_scope,
+                        parent_from: None,
                     },
                 }
             };
@@ -1895,12 +1974,28 @@ pub fn generate_rules(
     //
     // V2 path: iterate pre-aggregated report.packages[].components.
     // Legacy path: scan dotted symbols to aggregate by parent interface.
-    if !report.hierarchy_deltas.is_empty() {
+    // Build the set of components covered by hierarchy deltas so P0-C
+    // can be skipped per-component rather than globally.
+    //
+    // Only skip P0-C when the hierarchy delta has added_children — that
+    // means the hierarchy rule provides constructive migration guidance
+    // ("use these new child components"). When a delta only has
+    // removed_children, the hierarchy rule just says "X is no longer a
+    // child" without guidance on what to do instead — P0-C is still
+    // needed for prop migration instructions in those cases.
+    let hierarchy_covered_components: HashSet<String> = report
+        .hierarchy_deltas
+        .iter()
+        .filter(|d| !d.added_children.is_empty())
+        .map(|d| d.component.clone())
+        .collect();
+    if !hierarchy_covered_components.is_empty() {
         eprintln!(
-            "Skipping P0-C rule generation ({} hierarchy deltas present)",
-            report.hierarchy_deltas.len(),
+            "Hierarchy covers {} components — P0-C will skip those",
+            hierarchy_covered_components.len(),
         );
-    } else {
+    }
+    {
         let has_package_components = report.packages.iter().any(|pkg| !pkg.components.is_empty());
 
         if has_package_components {
@@ -1919,6 +2014,17 @@ pub fn generate_rules(
                         || comp.property_summary.removed >= 5;
 
                     if !qualifies {
+                        continue;
+                    }
+
+                    // Skip this component if it's covered by a hierarchy delta
+                    // (the hierarchy-composition rule has richer data).
+                    // Components NOT in the hierarchy delta set still get P0-C rules.
+                    if hierarchy_covered_components.contains(&comp.name) {
+                        eprintln!(
+                            "  Skipping P0-C for {} (covered by hierarchy delta)",
+                            comp.name,
+                        );
                         continue;
                     }
 
@@ -1956,6 +2062,7 @@ pub fn generate_rules(
                                 parent: None,
                                 value: None,
                                 from: Some(pkg.name.clone()),
+                                parent_from: None,
                             },
                         },
                         fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -2080,6 +2187,7 @@ pub fn generate_rules(
                                 parent: None,
                                 value: None,
                                 from: info.from_pkg.clone(),
+                                parent_from: None,
                             },
                         },
                         fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -2293,6 +2401,7 @@ pub fn generate_rules(
                     parent: Some(entry.parent.clone()),
                     value: None,
                     from: entry.package.clone(),
+                    parent_from: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -2333,6 +2442,7 @@ pub fn generate_rules(
                     parent: None,
                     value: None,
                     from: entry.package.clone(),
+                    parent_from: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::rename(&entry.old_prop, &entry.new_prop)),
@@ -2368,6 +2478,7 @@ pub fn generate_rules(
                     parent: None,
                     value: Some(entry.value.clone()),
                     from: entry.package.clone(),
+                    parent_from: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("Manual")),
@@ -2399,6 +2510,7 @@ pub fn generate_rules(
                     parent: None,
                     value: None,
                     from: entry.package.clone(),
+                    parent_from: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("Manual")),
@@ -2593,6 +2705,7 @@ pub fn generate_rules(
                                     parent: None,
                                     value: None,
                                     from: Some(pkg.name.clone()),
+                                    parent_from: None,
                                 },
                             },
                             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -2739,6 +2852,7 @@ pub fn generate_rules(
                                     parent: None,
                                     value: None,
                                     from: from_pkg,
+                                    parent_from: None,
                                 },
                             },
                             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -2752,7 +2866,7 @@ pub fn generate_rules(
                 }
             }
         }
-    } // end else (P0-C skipped when hierarchy deltas present)
+    } // end P0-C block
 
     // ── Hierarchy-based composition rules ──
     //
@@ -2818,15 +2932,18 @@ pub fn generate_rules(
             .filter(|ec| !ec.is_empty());
 
         if let Some(expected_children) = all_expected {
-            msg.push_str("Use these child components inside <");
-            msg.push_str(component);
-            msg.push_str(">:\n");
+            let child_names: Vec<&str> =
+                expected_children.iter().map(|c| c.name.as_str()).collect();
+            msg.push_str(&format!(
+                "The ONLY expected children of <{}> are: {}. \
+                 Replace any other children with the appropriate component listed below:\n",
+                component,
+                child_names.join(", "),
+            ));
             for child in expected_children {
-                let req = if child.required {
-                    "required"
-                } else {
-                    "optional"
-                };
+                // Drop the required/optional distinction — in a migration
+                // context every listed child is part of the migration path.
+                // The prop instructions convey what needs to happen.
 
                 // Find props that migrated to this child
                 let child_migrated: Vec<&semver_analyzer_core::MigratedProp> = delta
@@ -2855,7 +2972,7 @@ pub fn generate_rules(
                     })
                     .collect();
 
-                msg.push_str(&format!("  <{}> ({}) —", child.name, req));
+                msg.push_str(&format!("  <{}> —", child.name));
 
                 let mut prop_instructions: Vec<String> = Vec::new();
                 let mut seen_props: BTreeSet<String> = BTreeSet::new();
@@ -2882,6 +2999,52 @@ pub fn generate_rules(
                             prop_instructions.push(format!("{} → {}", mp.prop_name, target_name));
                         } else {
                             prop_instructions.push(format!("pass {} as prop", mp.prop_name));
+                        }
+                    }
+                }
+
+                // Check if the added child has notable new (added) props from
+                // the report's API changes. This covers cases like
+                // PageToggleButton.isHamburgerButton where the child component
+                // is brand new and has no migrated/removed props — only added ones.
+                for fc in &report.changes {
+                    for ac in &fc.breaking_api_changes {
+                        if ac.change == ApiChangeType::SignatureChanged
+                            && ac.description.contains("was added")
+                        {
+                            // Symbol format: "ComponentName.propName"
+                            if let Some(prop_name) =
+                                ac.symbol.strip_prefix(&format!("{}.", child.name))
+                            {
+                                if seen_props.insert(prop_name.to_string()) {
+                                    let type_hint = ac
+                                        .after
+                                        .as_deref()
+                                        .and_then(|t| t.split(':').last())
+                                        .map(|t| format!(" ({})", t.trim()))
+                                        .unwrap_or_default();
+                                    prop_instructions.push(format!(
+                                        "add prop: {}{} — set this if an equivalent child or prop already exists in your code",
+                                        prop_name, type_hint,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Surface key behavioral changes about the child
+                if let Some(child_cs) = report
+                    .packages
+                    .iter()
+                    .flat_map(|pkg| &pkg.components)
+                    .find(|c| c.name == child.name)
+                {
+                    for bc in &child_cs.behavioral_changes {
+                        if bc.description.contains("children are no longer rendered")
+                            || bc.description.contains("replaces")
+                        {
+                            prop_instructions.push(format!("note: {}", bc.description));
                         }
                     }
                 }
@@ -2913,9 +3076,60 @@ pub fn generate_rules(
                     ));
                 } else {
                     msg.push_str(&format!(
-                        "  - <{}> (no longer a direct child)\n",
-                        child_name,
+                        "  - <{}> (removed — its functionality is absorbed into <{}>)\n",
+                        child_name, component,
                     ));
+                }
+
+                // Look up the removed child's ComponentSummary for migration_target info.
+                // When a child like EmptyStateHeader is removed and has a migration_target
+                // pointing to the parent (EmptyState), include the prop mapping so
+                // consumers know the child's props are now on the parent.
+                let child_summary =
+                    report
+                        .packages
+                        .iter()
+                        .flat_map(|pkg| &pkg.components)
+                        .find(|c| {
+                            c.name == *child_name
+                                && c.status == semver_analyzer_core::ComponentStatus::Removed
+                        });
+
+                if let Some(child_cs) = child_summary {
+                    if let Some(ref mt) = child_cs.migration_target {
+                        // Check if the migration target points to the parent component
+                        let target_is_parent = mt
+                            .replacement_symbol
+                            .strip_suffix("Props")
+                            .unwrap_or(&mt.replacement_symbol)
+                            == component;
+
+                        if target_is_parent && !mt.matching_members.is_empty() {
+                            msg.push_str(&format!(
+                                "    Props from <{}> are now directly on <{}>:\n",
+                                child_name, component,
+                            ));
+                            for mm in &mt.matching_members {
+                                if mm.old_name == mm.new_name {
+                                    msg.push_str(
+                                        &format!("      - {} (same name)\n", mm.old_name,),
+                                    );
+                                } else {
+                                    msg.push_str(&format!(
+                                        "      - {} → {}\n",
+                                        mm.old_name, mm.new_name,
+                                    ));
+                                }
+                            }
+                            if !mt.removed_only_members.is_empty() {
+                                msg.push_str(&format!(
+                                    "    Removed (no equivalent on <{}>): {}\n",
+                                    component,
+                                    mt.removed_only_members.join(", "),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             msg.push('\n');
@@ -3045,6 +3259,7 @@ pub fn generate_rules(
                     parent: None,
                     value: None,
                     from: from_pkg,
+                    parent_from: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -3250,26 +3465,39 @@ pub fn generate_dependency_update_rules(
     (rules, strategies)
 }
 
-/// Analyze the report to find token object member keys and member renames.
+/// A compound token with its removed and added member key suffixes.
 ///
-/// For each `type_changed` entry whose before/after contains `["member_key"]`
-/// patterns (token objects), extracts the member key sets and diffs them.
-///
-/// Returns:
-/// - `covered_symbols`: symbols that appear as member keys in a parent token's
-///   type_changed entry. Individual `Removed` rules for these are redundant.
-/// - `member_renames`: old_member → new_member mappings derived from diffing
-///   member key sets using the supplied rename patterns.
-pub fn analyze_token_members(
-    report: &AnalysisReport,
-    rename_patterns: &RenamePatterns,
-) -> (BTreeSet<String>, HashMap<String, String>) {
-    static MEMBER_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+/// Used to cache compound token data between suffix inventory extraction
+/// and suffix mapping application.
+struct CompoundToken {
+    removed: BTreeSet<String>,
+    added: BTreeSet<String>,
+}
+
+/// Regex for extracting member keys from token type strings.
+fn member_key_re() -> &'static regex::Regex {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"\["([a-zA-Z_][a-zA-Z_0-9]*)"\]"#).unwrap()
     });
+    &RE
+}
 
+/// Extract compound tokens from the report.
+///
+/// Returns the covered symbols, compound token diffs, and any member
+/// renames found via explicit rename patterns.
+fn extract_compound_tokens(
+    report: &AnalysisReport,
+    rename_patterns: &RenamePatterns,
+) -> (
+    BTreeSet<String>,
+    Vec<CompoundToken>,
+    HashMap<String, String>,
+) {
+    let re = member_key_re();
     let mut covered_symbols: BTreeSet<String> = BTreeSet::new();
     let mut member_renames: HashMap<String, String> = HashMap::new();
+    let mut compound_tokens: Vec<CompoundToken> = Vec::new();
 
     for file_changes in &report.changes {
         for api_change in &file_changes.breaking_api_changes {
@@ -3286,44 +3514,150 @@ pub fn analyze_token_members(
                 _ => continue,
             };
 
-            // Extract member keys from before and after
-            let old_keys: BTreeSet<String> = MEMBER_KEY_RE
+            let old_keys: BTreeSet<String> = re
                 .captures_iter(before)
                 .map(|c| c[1].to_string())
                 .filter(|k| k != "name" && k != "value" && k != "values" && k != "var")
                 .collect();
 
-            let new_keys: BTreeSet<String> = MEMBER_KEY_RE
+            let new_keys: BTreeSet<String> = re
                 .captures_iter(after)
                 .map(|c| c[1].to_string())
                 .filter(|k| k != "name" && k != "value" && k != "values" && k != "var")
                 .collect();
 
             if old_keys.len() < 3 || new_keys.len() < 3 {
-                continue; // Not a token object — too few members
+                continue;
             }
 
-            // All old member keys are "covered" — individual removal rules are redundant
             for key in &old_keys {
                 covered_symbols.insert(key.clone());
             }
 
-            // Diff member keys to find renames
-            let removed: BTreeSet<&String> = old_keys.difference(&new_keys).collect();
-            let added: BTreeSet<&String> = new_keys.difference(&old_keys).collect();
+            let removed: BTreeSet<String> = old_keys.difference(&new_keys).cloned().collect();
+            let added: BTreeSet<String> = new_keys.difference(&old_keys).cloned().collect();
 
-            // Try to match removed→added using rename patterns
+            // Apply explicit rename patterns
             for old_key in &removed {
                 if let Some(expected_new) = rename_patterns.find_replacement(old_key) {
                     if added.contains(&expected_new) {
-                        member_renames.insert(old_key.to_string(), expected_new);
+                        member_renames.insert(old_key.clone(), expected_new);
+                    }
+                }
+            }
+
+            compound_tokens.push(CompoundToken { removed, added });
+        }
+    }
+
+    (covered_symbols, compound_tokens, member_renames)
+}
+
+/// Extract the unique removed and added suffixes from compound token diffs.
+///
+/// Returns `(removed_suffixes, added_suffixes)` — the sets of trailing
+/// PascalCase suffixes found across all compound token member key diffs.
+/// These can be passed to an LLM to identify CSS logical property renames.
+pub fn extract_suffix_inventory(report: &AnalysisReport) -> (BTreeSet<String>, BTreeSet<String>) {
+    let re = member_key_re();
+    let mut removed_suffixes: BTreeSet<String> = BTreeSet::new();
+    let mut added_suffixes: BTreeSet<String> = BTreeSet::new();
+
+    for file_changes in &report.changes {
+        for api_change in &file_changes.breaking_api_changes {
+            if api_change.change != ApiChangeType::TypeChanged {
+                continue;
+            }
+            let before = match &api_change.before {
+                Some(b) if b.contains("[\"") => b,
+                _ => continue,
+            };
+            let after = match &api_change.after {
+                Some(a) if a.contains("[\"") => a,
+                _ => continue,
+            };
+
+            let old_keys: BTreeSet<String> = re
+                .captures_iter(before)
+                .map(|c| c[1].to_string())
+                .filter(|k| k != "name" && k != "value" && k != "values" && k != "var")
+                .collect();
+            let new_keys: BTreeSet<String> = re
+                .captures_iter(after)
+                .map(|c| c[1].to_string())
+                .filter(|k| k != "name" && k != "value" && k != "values" && k != "var")
+                .collect();
+
+            if old_keys.len() < 3 || new_keys.len() < 3 {
+                continue;
+            }
+
+            for key in old_keys.difference(&new_keys) {
+                if let Some(suffix) = extract_trailing_suffix(key) {
+                    removed_suffixes.insert(suffix.to_string());
+                }
+            }
+            for key in new_keys.difference(&old_keys) {
+                if let Some(suffix) = extract_trailing_suffix(key) {
+                    added_suffixes.insert(suffix.to_string());
+                }
+            }
+        }
+    }
+
+    (removed_suffixes, added_suffixes)
+}
+
+/// Analyze the report to find token object member keys and member renames.
+///
+/// For each `type_changed` entry whose before/after contains `["member_key"]`
+/// patterns (token objects), extracts the member key sets and diffs them.
+///
+/// Returns:
+/// - `covered_symbols`: symbols that appear as member keys in a parent token's
+///   type_changed entry. Individual `Removed` rules for these are redundant.
+/// - `member_renames`: old_member → new_member mappings derived from diffing
+///   member key sets using the supplied rename patterns.
+pub fn analyze_token_members(
+    report: &AnalysisReport,
+    rename_patterns: &RenamePatterns,
+) -> (BTreeSet<String>, HashMap<String, String>) {
+    let (covered_symbols, _compound_tokens, member_renames) =
+        extract_compound_tokens(report, rename_patterns);
+    (covered_symbols, member_renames)
+}
+
+/// Apply suffix rename mappings to compound token diffs and return the
+/// resulting member renames (old_member_key → new_member_key).
+///
+/// This is called during the `analyze` step after the LLM has identified
+/// CSS physical→logical property suffix renames. The results are stored
+/// in `report.member_renames` so the `konveyor` step can generate rules.
+pub fn apply_suffix_renames(
+    report: &AnalysisReport,
+    suffix_renames: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let (_covered, compound_tokens, mut member_renames) =
+        extract_compound_tokens(report, &RenamePatterns::empty());
+
+    for ct in &compound_tokens {
+        for old_key in &ct.removed {
+            if member_renames.contains_key(old_key) {
+                continue;
+            }
+            if let Some(old_suffix) = extract_trailing_suffix(old_key) {
+                if let Some(new_suffix) = suffix_renames.get(old_suffix) {
+                    let prefix = &old_key[..old_key.len() - old_suffix.len()];
+                    let expected_new = format!("{}{}", prefix, new_suffix);
+                    if ct.added.contains(&expected_new) {
+                        member_renames.insert(old_key.clone(), expected_new);
                     }
                 }
             }
         }
     }
 
-    (covered_symbols, member_renames)
+    member_renames
 }
 
 /// Suppress redundant individual token removal rules.
@@ -3580,6 +3914,107 @@ pub fn consolidate_rules(rules: Vec<KonveyorRule>) -> (Vec<KonveyorRule>, HashMa
         }
     }
     (consolidated, id_mapping)
+}
+
+/// Generate conformance rules from component `expected_children` data.
+///
+/// Unlike migration rules (which come from hierarchy DELTAS between versions),
+/// conformance rules come from the FULL new-version hierarchy and flag usage
+/// patterns that don't match the expected composition structure — regardless of
+/// whether the structure changed between versions.
+///
+/// Components that already have a `hierarchy-composition` migration rule are
+/// skipped to avoid duplication.
+pub fn generate_conformance_rules(report: &AnalysisReport) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+    let mut id_counts: HashMap<String, usize> = HashMap::new();
+
+    // Collect components already covered by hierarchy-composition migration rules
+    let hierarchy_covered: HashSet<String> = report
+        .hierarchy_deltas
+        .iter()
+        .map(|d| d.component.clone())
+        .collect();
+
+    for pkg in &report.packages {
+        for comp in &pkg.components {
+            if comp.expected_children.is_empty() {
+                continue;
+            }
+
+            // Skip if already covered by a hierarchy-composition migration rule
+            if hierarchy_covered.contains(&comp.name) {
+                continue;
+            }
+
+            let base_id = format!("conformance-{}-expected-children", sanitize_id(&comp.name),);
+            let rule_id = unique_id(base_id, &mut id_counts);
+
+            let children_list: Vec<String> = comp
+                .expected_children
+                .iter()
+                .map(|ec| {
+                    let req = if ec.required {
+                        "required"
+                    } else {
+                        "recommended"
+                    };
+                    format!("  <{}> ({})", ec.name, req)
+                })
+                .collect();
+
+            let example_children: String = comp
+                .expected_children
+                .iter()
+                .map(|ec| format!("    <{}> ... </{}>", ec.name, ec.name))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let msg = format!(
+                "CONFORMANCE: <{}> expects these child components:\n{}\n\n\
+                 Review your usage to ensure child components match the expected\n\
+                 composition pattern.\n\n\
+                 Expected structure:\n  <{}>\n{}\n  </{}>",
+                comp.name,
+                children_list.join("\n"),
+                comp.name,
+                example_children,
+                comp.name,
+            );
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=conformance".to_string(),
+                    "has-codemod=false".to_string(),
+                ],
+                effort: 3,
+                category: "potential".to_string(),
+                description: format!("<{}> expects specific child components", comp.name,),
+                message: msg,
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: format!("^{}$", regex_escape(&comp.name)),
+                        location: "IMPORT".to_string(),
+                        component: None,
+                        parent: None,
+                        value: None,
+                        from: Some(pkg.name.clone()),
+                        parent_from: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+            });
+        }
+    }
+
+    if !rules.is_empty() {
+        eprintln!("Generated {} conformance rules", rules.len(),);
+    }
+
+    rules
 }
 
 fn consolidation_key(rule: &KonveyorRule) -> String {
@@ -3908,6 +4343,7 @@ fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
                     parent: None,
                     value: None,
                     from: from_pkg,
+                    parent_from: None,
                 },
             }
         } else {
@@ -4558,6 +4994,34 @@ pub fn write_ruleset_dir(
     Ok(())
 }
 
+/// Write conformance rules to a separate file in the output directory.
+///
+/// These rules check component usage patterns against the expected
+/// composition hierarchy, independent of version migration.
+pub fn write_conformance_rules(output_dir: &Path, rules: &[KonveyorRule]) -> Result<()> {
+    // Write conformance ruleset
+    let ruleset = KonveyorRuleset {
+        name: "semver-conformance".to_string(),
+        description: "Component usage conformance checks — verifies child component composition matches expected patterns".to_string(),
+        labels: vec!["source=semver-analyzer".to_string()],
+    };
+
+    let ruleset_path = output_dir.join("conformance-ruleset.yaml");
+    let ruleset_yaml =
+        serde_yaml::to_string(&ruleset).context("Failed to serialize conformance ruleset")?;
+    std::fs::write(&ruleset_path, &ruleset_yaml)
+        .with_context(|| format!("Failed to write {}", ruleset_path.display()))?;
+
+    // Write conformance rules
+    let rules_path = output_dir.join("conformance-rules.yaml");
+    let rules_yaml =
+        serde_yaml::to_string(&rules).context("Failed to serialize conformance rules")?;
+    std::fs::write(&rules_path, &rules_yaml)
+        .with_context(|| format!("Failed to write {}", rules_path.display()))?;
+
+    Ok(())
+}
+
 /// Write fix guidance to a separate sibling directory.
 ///
 /// Given the ruleset `output_dir`, creates a `fix-guidance/` directory
@@ -4852,6 +5316,7 @@ fn api_change_to_rules(
                             parent: None,
                             value: Some(format!("^{}$", regex_escape(value))),
                             from: from.clone(),
+                            parent_from: None,
                         },
                     },
                     fix_strategy: Some(fix_strategy),
@@ -4939,6 +5404,7 @@ fn behavioral_change_to_rule(
                 location: "JSX_COMPONENT".to_string(),
                 component: None,
                 parent: None,
+                parent_from: None,
                 value: None,
                 from,
             },
@@ -4953,6 +5419,30 @@ fn behavioral_change_to_rule(
         }
     };
 
+    // Downgrade noisy behavioral rules so they don't go to the fix engine:
+    //
+    // - "propagated through call chain" rules have no actionable content —
+    //   they just say "review all usages" with no detail.
+    //
+    // - "Test assertions changed" rules describe test file diffs, not
+    //   component API changes. Tagged with `source=test-diff` for filtering.
+    let is_propagated = change.description.contains("propagated through call chain");
+    let is_test_assertion = change.description.contains("Test assertions changed")
+        || change
+            .description
+            .to_lowercase()
+            .contains("test assertions");
+
+    let strategy = if is_propagated || is_test_assertion {
+        "Manual"
+    } else {
+        "LlmAssisted"
+    };
+
+    if is_test_assertion {
+        labels.push("source=test-diff".to_string());
+    }
+
     Some(KonveyorRule {
         rule_id,
         labels,
@@ -4962,7 +5452,7 @@ fn behavioral_change_to_rule(
         message,
         links: Vec::new(),
         when: condition,
-        fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+        fix_strategy: Some(FixStrategyEntry::new(strategy)),
     })
 }
 
@@ -5477,6 +5967,7 @@ fn build_frontend_condition(
                     parent: None,
                     value: None,
                     from: from.clone(),
+                    parent_from: None,
                 },
             }];
             if !is_subpath_scoped {
@@ -5490,6 +5981,7 @@ fn build_frontend_condition(
                             parent: None,
                             value: None,
                             from: from.clone(),
+                            parent_from: None,
                         },
                     },
                 );
@@ -5515,6 +6007,7 @@ fn build_frontend_condition(
                         parent: None,
                         value: None,
                         from: from.clone(),
+                        parent_from: None,
                     },
                 });
             }
@@ -5526,6 +6019,7 @@ fn build_frontend_condition(
                     parent: None,
                     value: None,
                     from: from.clone(),
+                    parent_from: None,
                 },
             });
             // If FooProps → also match Foo at IMPORT
@@ -5541,6 +6035,7 @@ fn build_frontend_condition(
                             parent: None,
                             value: None,
                             from: from.clone(),
+                            parent_from: None,
                         },
                     });
                 }
@@ -5563,6 +6058,7 @@ fn build_frontend_condition(
                         parent: None,
                         value: None,
                         from,
+                        parent_from: None,
                     },
                 }
             } else {
@@ -5574,6 +6070,7 @@ fn build_frontend_condition(
                         parent: None,
                         value: value_filter,
                         from,
+                        parent_from: None,
                     },
                 }
             }
@@ -5590,6 +6087,7 @@ fn build_frontend_condition(
                 },
                 component: None,
                 parent: None,
+                parent_from: None,
                 value: None,
                 from,
             },
@@ -5611,6 +6109,7 @@ fn build_frontend_condition(
                         parent: None,
                         value: None,
                         from: from.clone(),
+                        parent_from: None,
                     },
                 });
             }
@@ -5622,6 +6121,7 @@ fn build_frontend_condition(
                     parent: None,
                     value: None,
                     from,
+                    parent_from: None,
                 },
             });
             if conditions.len() == 1 {
@@ -5652,6 +6152,7 @@ fn build_frontend_condition(
                                 parent: None,
                                 value: None,
                                 from: from.clone(),
+                                parent_from: None,
                             },
                         },
                         KonveyorCondition::FrontendReferenced {
@@ -5662,6 +6163,7 @@ fn build_frontend_condition(
                                 parent: None,
                                 value: None,
                                 from,
+                                parent_from: None,
                             },
                         },
                     ],
@@ -5675,6 +6177,7 @@ fn build_frontend_condition(
                         parent: None,
                         value: None,
                         from,
+                        parent_from: None,
                     },
                 }
             }
@@ -6001,6 +6504,60 @@ fn extract_trailing_suffix(name: &str) -> Option<&str> {
         && !suffix.contains('_')
     {
         Some(suffix)
+    } else {
+        None
+    }
+}
+
+/// Derive the longest common suffix from a list of component names.
+///
+/// Filters to valid PascalCase component names (starts with uppercase,
+/// no spaces or parentheses — skips LLM artifacts like "children (span ...)").
+/// Returns `None` if fewer than 2 valid names remain or no common suffix
+/// of 3+ characters is found.
+///
+/// # Examples
+/// ```ignore
+/// derive_common_suffix(&["TimesIcon", "AngleRightIcon", "CheckIcon"]) => Some("Icon")
+/// derive_common_suffix(&["Foo", "Bar", "Baz"]) => None  // no common suffix >= 3 chars
+/// ```
+fn derive_common_suffix(names: &[String]) -> Option<String> {
+    let valid: Vec<&str> = names
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| {
+            s.chars().next().map_or(false, |c| c.is_uppercase())
+                && !s.contains(' ')
+                && !s.contains('(')
+                && !s.contains('/')
+        })
+        .collect();
+
+    if valid.len() < 2 {
+        return None;
+    }
+
+    // Find longest common suffix by comparing characters from the end
+    let min_len = valid.iter().map(|s| s.len()).min().unwrap_or(0);
+    let first = valid[0];
+    let first_bytes = first.as_bytes();
+
+    let mut suffix_len = 0;
+    for i in 1..=min_len {
+        let idx = first.len() - i;
+        let ch = first_bytes[idx];
+        if valid[1..].iter().all(|s| {
+            let sidx = s.len() - i;
+            s.as_bytes()[sidx] == ch
+        }) {
+            suffix_len = i;
+        } else {
+            break;
+        }
+    }
+
+    if suffix_len >= 3 {
+        Some(first[first.len() - suffix_len..].to_string())
     } else {
         None
     }
@@ -7252,6 +7809,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        parent_from: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -7276,6 +7834,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        parent_from: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -7304,6 +7863,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        parent_from: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -7332,6 +7892,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: None,
+                        parent_from: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -7874,6 +8435,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        parent_from: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -7901,6 +8463,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        parent_from: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -7949,6 +8512,7 @@ mod tests {
                     parent: None,
                     value: None,
                     from: None,
+                    parent_from: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("Manual")),
@@ -8207,6 +8771,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        parent_from: None,
                     },
                 };
                 r.fix_strategy = Some(FixStrategyEntry::new("LlmAssisted"));
@@ -8299,6 +8864,139 @@ mod tests {
             extract_trailing_suffix("c_about_modal_box__brand_PaddingBlockEnd"),
             Some("PaddingBlockEnd")
         );
+    }
+
+    // ── apply_suffix_renames tests ──
+
+    /// Build a token object string with the given member keys.
+    fn make_token_object(keys: &[&str]) -> String {
+        let members: Vec<String> = keys
+            .iter()
+            .map(|k| {
+                format!("[\"{k}\"]: {{ [\"name\"]: \"--pf-test--{k}\"; [\"value\"]: \"1rem\" }}")
+            })
+            .collect();
+        format!("{{ {} }}", members.join("; "))
+    }
+
+    fn make_token_type_changed(symbol: &str, old_keys: &[&str], new_keys: &[&str]) -> ApiChange {
+        ApiChange {
+            symbol: symbol.to_string(),
+            kind: ApiChangeKind::Constant,
+            change: ApiChangeType::TypeChanged,
+            before: Some(make_token_object(old_keys)),
+            after: Some(make_token_object(new_keys)),
+            description: format!("{} type changed", symbol),
+            migration_target: None,
+            removal_disposition: None,
+            renders_element: None,
+        }
+    }
+
+    #[test]
+    fn test_apply_suffix_renames_maps_members() {
+        // Compound token has PaddingTop removed and PaddingBlockStart added.
+        // With the suffix mapping PaddingTop→PaddingBlockStart, the function
+        // should produce a member rename for each matching key.
+        let changes = vec![make_file_changes(
+            "packages/react-tokens/src/c_alert.d.ts",
+            vec![make_token_type_changed(
+                "c_alert",
+                &[
+                    "c_alert__description_PaddingTop",
+                    "c_alert__icon_MarginLeft",
+                    "c_alert_Color",
+                ],
+                &[
+                    "c_alert__description_PaddingBlockStart",
+                    "c_alert__icon_MarginInlineStart",
+                    "c_alert_Color",
+                ],
+            )],
+            vec![],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let suffix_map: HashMap<String, String> = [
+            ("PaddingTop".to_string(), "PaddingBlockStart".to_string()),
+            ("MarginLeft".to_string(), "MarginInlineStart".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let renames = apply_suffix_renames(&report, &suffix_map);
+
+        assert_eq!(
+            renames.get("c_alert__description_PaddingTop"),
+            Some(&"c_alert__description_PaddingBlockStart".to_string()),
+        );
+        assert_eq!(
+            renames.get("c_alert__icon_MarginLeft"),
+            Some(&"c_alert__icon_MarginInlineStart".to_string()),
+        );
+        // Color has no suffix mapping — should not appear
+        assert!(!renames.contains_key("c_alert_Color"));
+    }
+
+    #[test]
+    fn test_apply_suffix_renames_skips_missing_target() {
+        // Suffix mapping exists but the expected new key is NOT in the added set
+        let changes = vec![make_file_changes(
+            "packages/react-tokens/src/c_alert.d.ts",
+            vec![make_token_type_changed(
+                "c_alert",
+                &["c_alert__body_PaddingTop", "c_alert_Size", "c_alert_Width"],
+                &[
+                    "c_alert_Size",
+                    "c_alert_Width",
+                    // PaddingBlockStart NOT added — key was simply removed
+                ],
+            )],
+            vec![],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let suffix_map: HashMap<String, String> =
+            [("PaddingTop".to_string(), "PaddingBlockStart".to_string())]
+                .into_iter()
+                .collect();
+
+        let renames = apply_suffix_renames(&report, &suffix_map);
+        assert!(
+            renames.is_empty(),
+            "No rename should be produced when target key doesn't exist in added set"
+        );
+    }
+
+    #[test]
+    fn test_extract_suffix_inventory() {
+        let changes = vec![make_file_changes(
+            "packages/react-tokens/src/c_alert.d.ts",
+            vec![make_token_type_changed(
+                "c_alert",
+                &[
+                    "c_alert__body_PaddingTop",
+                    "c_alert__body_MarginLeft",
+                    "c_alert_Color",
+                ],
+                &[
+                    "c_alert__body_PaddingBlockStart",
+                    "c_alert__body_MarginInlineStart",
+                    "c_alert_Color",
+                ],
+            )],
+            vec![],
+        )];
+
+        let report = make_report(changes, vec![]);
+        let (removed, added) = extract_suffix_inventory(&report);
+
+        assert!(removed.contains("PaddingTop"));
+        assert!(removed.contains("MarginLeft"));
+        assert!(!removed.contains("Color")); // Color is in both old and new
+
+        assert!(added.contains("PaddingBlockStart"));
+        assert!(added.contains("MarginInlineStart"));
     }
 
     // ── API rule message enrichment with behavioral context ──
@@ -9807,6 +10505,7 @@ mod tests {
                             parent: None,
                             value: Some("^cyan$".to_string()),
                             from: Some("@patternfly/react-core".to_string()),
+                            parent_from: None,
                         },
                     },
                     KonveyorCondition::FrontendReferenced {
@@ -9817,6 +10516,7 @@ mod tests {
                             parent: None,
                             value: Some("^gold$".to_string()),
                             from: Some("@patternfly/react-core".to_string()),
+                            parent_from: None,
                         },
                     },
                 ],
@@ -9845,6 +10545,7 @@ mod tests {
                             parent: None,
                             value: Some("^cyan$".to_string()),
                             from: Some("@patternfly/react-core".to_string()),
+                            parent_from: None,
                         },
                     },
                     KonveyorCondition::FrontendReferenced {
@@ -9855,6 +10556,7 @@ mod tests {
                             parent: None,
                             value: Some("^gold$".to_string()),
                             from: Some("@patternfly/react-core".to_string()),
+                            parent_from: None,
                         },
                     },
                 ],
@@ -9882,6 +10584,7 @@ mod tests {
                     parent: None,
                     value: None,
                     from: Some("@patternfly/react-core".to_string()),
+                    parent_from: None,
                 },
             },
             fix_strategy: None,
@@ -10090,11 +10793,24 @@ mod tests {
             rule.rule_id,
         );
 
-        // Should match on Button IMPORT, not on individual icon components
+        // Should match on components ending in "Icon" as children of Button
         match &rule.when {
             KonveyorCondition::FrontendReferenced { referenced } => {
-                assert_eq!(referenced.pattern, "^Button$");
-                assert_eq!(referenced.location, "IMPORT");
+                assert_eq!(
+                    referenced.pattern, "Icon$",
+                    "Should derive common suffix 'Icon' from child names"
+                );
+                assert_eq!(referenced.location, "JSX_COMPONENT");
+                assert_eq!(
+                    referenced.parent,
+                    Some("^Button$".to_string()),
+                    "Should match children of Button"
+                );
+                // from should be None (we want to catch app-level icons too)
+                assert!(
+                    referenced.from.is_none(),
+                    "from should be None to catch app-level icons"
+                );
             }
             other => panic!("Expected FrontendReferenced, got {:?}", other),
         }
@@ -10758,8 +11474,8 @@ mod tests {
             "Message should mention DropdownList"
         );
         assert!(
-            rule.message.contains("required"),
-            "Message should indicate DropdownList is required"
+            rule.message.contains("<DropdownList>"),
+            "Message should list DropdownList as a child component"
         );
         assert!(
             rule.message.contains("DropdownItem"),
@@ -10880,8 +11596,8 @@ mod tests {
             rule.message,
         );
         assert!(
-            rule.message.contains("ModalBody") && rule.message.contains("required"),
-            "Should show ModalBody as required",
+            rule.message.contains("<ModalBody>"),
+            "Should list ModalBody as a child component",
         );
     }
 
@@ -10908,5 +11624,144 @@ mod tests {
             .collect();
 
         assert_eq!(hierarchy_rules.len(), 0);
+    }
+
+    // ── Conformance rule tests ──────────────────────────────────────
+
+    #[test]
+    fn test_conformance_rules_from_expected_children() {
+        // Components with expected_children but no hierarchy delta should
+        // produce conformance rules.
+        let mut report = make_report(vec![], vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "MastheadToggle".to_string(),
+                interface_name: "MastheadToggleProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary::default(),
+                removed_properties: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![ExpectedChild {
+                    name: "PageToggleButton".to_string(),
+                    required: false,
+                }],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+        // No hierarchy deltas — this is a conformance-only case
+        report.hierarchy_deltas = vec![];
+
+        let rules = generate_conformance_rules(&report);
+
+        assert_eq!(rules.len(), 1, "Expected 1 conformance rule");
+        let rule = &rules[0];
+
+        assert!(
+            rule.rule_id.contains("conformance-mastheadtoggle"),
+            "Rule ID: {}",
+            rule.rule_id,
+        );
+        assert!(rule.labels.iter().any(|l| l == "change-type=conformance"),);
+        assert_eq!(rule.category, "potential");
+        assert!(rule.message.contains("PageToggleButton"));
+        assert!(rule.message.contains("CONFORMANCE"));
+
+        match &rule.when {
+            KonveyorCondition::FrontendReferenced { referenced } => {
+                assert_eq!(referenced.pattern, "^MastheadToggle$");
+                assert_eq!(referenced.location, "IMPORT");
+            }
+            other => panic!("Expected FrontendReferenced, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_conformance_skips_hierarchy_delta_components() {
+        // Components with BOTH expected_children AND hierarchy deltas should
+        // NOT get conformance rules (the hierarchy-composition rule covers them).
+        let mut report = make_report(vec![], vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "Modal".to_string(),
+                interface_name: "ModalProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary::default(),
+                removed_properties: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![
+                    ExpectedChild {
+                        name: "ModalHeader".to_string(),
+                        required: false,
+                    },
+                    ExpectedChild {
+                        name: "ModalBody".to_string(),
+                        required: true,
+                    },
+                ],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+        // Modal HAS a hierarchy delta — conformance should be skipped
+        report.hierarchy_deltas = vec![HierarchyDelta {
+            component: "Modal".to_string(),
+            added_children: vec![ExpectedChild {
+                name: "ModalHeader".to_string(),
+                required: false,
+            }],
+            removed_children: vec![],
+            migrated_props: vec![],
+        }];
+
+        let rules = generate_conformance_rules(&report);
+        assert_eq!(
+            rules.len(),
+            0,
+            "Should skip conformance for components with hierarchy deltas"
+        );
+    }
+
+    #[test]
+    fn test_conformance_empty_expected_children() {
+        // Components with no expected_children should not produce rules.
+        let mut report = make_report(vec![], vec![]);
+        report.packages = vec![PackageChanges {
+            name: "@patternfly/react-core".to_string(),
+            old_version: None,
+            new_version: None,
+            components: vec![ComponentSummary {
+                name: "Badge".to_string(),
+                interface_name: "BadgeProps".to_string(),
+                status: ComponentStatus::Modified,
+                property_summary: PropertySummary::default(),
+                removed_properties: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![],
+                source_files: vec![],
+            }],
+            constants: vec![],
+            added_components: vec![],
+        }];
+
+        let rules = generate_conformance_rules(&report);
+        assert_eq!(rules.len(), 0);
     }
 }

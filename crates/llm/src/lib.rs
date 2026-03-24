@@ -24,7 +24,7 @@ mod spec_compare;
 use anyhow::Result;
 pub use invoke::{
     FileApiChange, FileBehavioralChange, LlmCompositionChange, LlmConstantRenamePattern,
-    LlmExpectedChild, LlmInterfaceRenameMapping, LlmRemovalDisposition,
+    LlmExpectedChild, LlmInterfaceRenameMapping, LlmRemovalDisposition, LlmSuffixRename,
 };
 use semver_analyzer_core::{
     BehaviorAnalyzer, BreakingVerdict, ChangedFunction, EvidenceSource, FunctionSpec, TestDiff,
@@ -131,10 +131,30 @@ impl LlmBehaviorAnalyzer {
         &self,
         family_name: &str,
         files_content: &str,
+        related_components: Option<&str>,
     ) -> Result<std::collections::HashMap<String, Vec<LlmExpectedChild>>> {
-        let prompt = prompts::build_hierarchy_inference_prompt(family_name, files_content);
+        let prompt = prompts::build_hierarchy_inference_prompt(
+            family_name,
+            files_content,
+            related_components,
+        );
         let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
         invoke::parse_hierarchy_response(&response)
+    }
+
+    /// Infer CSS property suffix renames from removed/added suffix inventories.
+    ///
+    /// Given two sets of suffixes extracted from compound token member key
+    /// diffs, asks the LLM to identify CSS physical→logical property renames
+    /// (e.g., PaddingTop → PaddingBlockStart).
+    pub fn infer_suffix_renames(
+        &self,
+        removed_suffixes: &[&str],
+        added_suffixes: &[&str],
+    ) -> Result<Vec<invoke::LlmSuffixRename>> {
+        let prompt = prompts::build_suffix_rename_prompt(removed_suffixes, added_suffixes);
+        let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
+        invoke::parse_suffix_rename_response(&response)
     }
 
     /// Infer interface/component rename mappings from removed/added interface data.
