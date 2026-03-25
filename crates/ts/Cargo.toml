@@ -14,6 +14,7 @@ oxc_allocator = "0.116"
 oxc_span = "0.116"
 
 # Serialization
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Error handling
