@@ -7,8 +7,9 @@
 //! This is deterministic — no LLM involved. It complements the JSX differ
 //! by catching CSS variable changes that are invisible to DOM/attribute diffing.
 
+use crate::jsx_diff::JsxChange;
+use crate::language::TsCategory;
 use regex::Regex;
-use semver_analyzer_core::{BehavioralCategory, JsxChange};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::LazyLock;
@@ -42,7 +43,7 @@ pub fn diff_css_references(
         changes.push(JsxChange {
             symbol: symbol.to_string(),
             file: file.to_path_buf(),
-            category: BehavioralCategory::CssVariable,
+            category: TsCategory::CssVariable,
             description: format!("CSS variable '{}' removed from source", var),
             before: Some(var.clone()),
             after: None,
@@ -53,7 +54,7 @@ pub fn diff_css_references(
         changes.push(JsxChange {
             symbol: symbol.to_string(),
             file: file.to_path_buf(),
-            category: BehavioralCategory::CssVariable,
+            category: TsCategory::CssVariable,
             description: format!("CSS variable '{}' added to source", var),
             before: None,
             after: Some(var.clone()),
@@ -68,7 +69,7 @@ pub fn diff_css_references(
         changes.push(JsxChange {
             symbol: symbol.to_string(),
             file: file.to_path_buf(),
-            category: BehavioralCategory::CssClass,
+            category: TsCategory::CssClass,
             description: format!("CSS class prefix '{}' removed from source", class),
             before: Some(class.clone()),
             after: None,
@@ -79,7 +80,7 @@ pub fn diff_css_references(
         changes.push(JsxChange {
             symbol: symbol.to_string(),
             file: file.to_path_buf(),
-            category: BehavioralCategory::CssClass,
+            category: TsCategory::CssClass,
             description: format!("CSS class prefix '{}' added to source", class),
             before: None,
             after: Some(class.clone()),
@@ -114,7 +115,7 @@ mod tests {
         // May also have CSS class prefix changes since pf-v5-global matches the class regex.
         let var_changes: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::CssVariable)
+            .filter(|c| c.category == TsCategory::CssVariable)
             .collect();
         assert_eq!(var_changes.len(), 2); // old removed + new added
         let removed: Vec<_> = var_changes
@@ -147,7 +148,7 @@ mod tests {
 
         let removed: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::CssClass && c.before.is_some())
+            .filter(|c| c.category == TsCategory::CssClass && c.before.is_some())
             .collect();
         assert!(!removed.is_empty());
         assert!(removed

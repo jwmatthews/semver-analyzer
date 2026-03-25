@@ -290,18 +290,10 @@ mod tests {
             symbol: name.to_string(),
             caused_by: name.to_string(),
             call_path: vec![name.to_string()],
-            evidence: crate::types::EvidenceSource::TestDelta {
-                test_diff: crate::types::TestDiff {
-                    test_file: std::path::PathBuf::from("test.ts"),
-                    removed_assertions: vec![],
-                    added_assertions: vec![],
-                    has_assertion_changes: true,
-                    full_diff: String::new(),
-                },
-            },
+            evidence_description: "TestDelta: test assertions changed".to_string(),
             confidence: 0.95,
             description: format!("{} behavior changed", name),
-            category: None,
+            category_label: None,
         }
     }
 

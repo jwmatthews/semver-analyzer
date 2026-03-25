@@ -15,7 +15,7 @@ use semver_analyzer_core::{
     BehavioralChange, Comparison, FileChanges, FileStatus, ManifestChange, StructuralChange,
     Summary,
 };
-use semver_analyzer_ts::OxcExtractor;
+use semver_analyzer_ts::{OxcExtractor, TsManifestChangeType, TypeScript};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -235,7 +235,7 @@ async fn cmd_analyze(
             fc.composition_pattern_changes.extend(comp_changes);
         } else if !comp_changes.is_empty() {
             // Create a new entry for the component directory
-            report.changes.push(semver_analyzer_core::FileChanges {
+            report.changes.push(FileChanges {
                 file: std::path::PathBuf::from(&source_path),
                 status: semver_analyzer_core::FileStatus::Modified,
                 renamed_from: None,
@@ -388,7 +388,7 @@ async fn cmd_konveyor(
         eprintln!("Loading report from {}", report_path.display());
         let json = std::fs::read_to_string(report_path)
             .with_context(|| format!("Failed to read {}", report_path.display()))?;
-        let report: semver_analyzer_core::AnalysisReport = serde_json::from_str(&json)
+        let report: semver_analyzer_core::AnalysisReport<TypeScript> = serde_json::from_str(&json)
             .with_context(|| format!("Failed to parse {} as AnalysisReport", report_path.display()))?;
         report
     } else {
@@ -602,13 +602,13 @@ fn build_report(
     from_ref: &str,
     to_ref: &str,
     structural_changes: Vec<StructuralChange>,
-    behavioral_changes: Vec<BehavioralChange>,
-    manifest_changes: Vec<ManifestChange>,
+    behavioral_changes: Vec<BehavioralChange<TypeScript>>,
+    manifest_changes: Vec<ManifestChange<TypeScript>>,
     llm_api_changes: Vec<orchestrator::LlmApiChangeEntry>,
     old_surface: &semver_analyzer_core::ApiSurface,
     new_surface: &semver_analyzer_core::ApiSurface,
     inferred_rename_patterns: Option<semver_analyzer_core::InferredRenamePatterns>,
-) -> AnalysisReport {
+) -> AnalysisReport<TypeScript> {
     // Group breaking structural changes by file, converting to v2 ApiChange format.
     // Non-breaking changes (symbol_added, etc.) are excluded from the report.
     let mut file_api_map: std::collections::BTreeMap<std::path::PathBuf, Vec<ApiChange>> =
@@ -757,7 +757,7 @@ fn build_report(
     // extracted from the BU pipeline's qualified names.
     let mut file_behavioral_map: std::collections::BTreeMap<
         std::path::PathBuf,
-        Vec<BehavioralChange>,
+        Vec<BehavioralChange<TypeScript>>,
     > = std::collections::BTreeMap::new();
     for bc in behavioral_changes {
         let file = if let Some(ref src) = bc.source_file {
@@ -774,7 +774,7 @@ fn build_report(
     all_files.extend(file_api_map.keys().cloned());
     all_files.extend(file_behavioral_map.keys().cloned());
 
-    let changes: Vec<FileChanges> = all_files
+    let changes: Vec<FileChanges<TypeScript>> = all_files
         .into_iter()
         .map(|file| {
             let api_changes = file_api_map.remove(&file).unwrap_or_default();
@@ -866,11 +866,11 @@ fn build_report(
 /// 6. analyze_token_members → computed from surfaces directly
 fn build_package_summaries(
     structural_changes: &[StructuralChange],
-    behavioral_changes: &[BehavioralChange],
+    behavioral_changes: &[BehavioralChange<TypeScript>],
     old_surface: &semver_analyzer_core::ApiSurface,
     new_surface: &semver_analyzer_core::ApiSurface,
     llm_api_changes: &[orchestrator::LlmApiChangeEntry],
-) -> Vec<semver_analyzer_core::PackageChanges> {
+) -> Vec<semver_analyzer_core::PackageChanges<TypeScript>> {
     use semver_analyzer_core::{
         AddedComponent, ChangeSubject, ComponentStatus, ComponentSummary,
         ConstantGroup, PackageChanges, PropertySummary, RemovalDisposition, RemovedProperty,
@@ -963,7 +963,7 @@ fn build_package_summaries(
 
     // Find all interface/class symbols that have members (potential components).
     // We look at the OLD surface since we want to know what existed before.
-    let mut package_map: BTreeMap<String, PackageChanges> = BTreeMap::new();
+    let mut package_map: BTreeMap<String, PackageChanges<TypeScript>> = BTreeMap::new();
 
     // Process interfaces/classes with members from the old surface
     for old_sym in &old_surface.symbols {
@@ -1129,7 +1129,7 @@ fn build_package_summaries(
             });
 
         // Cross-reference behavioral changes by component name
-        let component_behavioral: Vec<BehavioralChange> = behavioral_changes
+        let component_behavioral: Vec<BehavioralChange<TypeScript>> = behavioral_changes
             .iter()
             .filter(|bc| {
                 bc.symbol == component_name
@@ -1348,7 +1348,7 @@ fn discover_child_components(
     old_surface: &semver_analyzer_core::ApiSurface,
     new_surface: &semver_analyzer_core::ApiSurface,
     structural_changes: &[StructuralChange],
-    _behavioral_changes: &[BehavioralChange],
+    _behavioral_changes: &[BehavioralChange<TypeScript>],
     removed_prop_names: &[&str],
     removed_properties: &[semver_analyzer_core::RemovedProperty],
 ) -> Vec<semver_analyzer_core::ChildComponent> {
@@ -1862,7 +1862,7 @@ fn qualified_name_to_file(qualified_name: &str) -> std::path::PathBuf {
 ///  3. Store the matches as `MigratedProp` entries on the delta.
 ///  4. Populate `expected_children` on the parent's `ComponentSummary`.
 fn enrich_hierarchy_deltas(
-    report: &mut semver_analyzer_core::AnalysisReport,
+    report: &mut semver_analyzer_core::AnalysisReport<TypeScript>,
     mut deltas: Vec<semver_analyzer_core::HierarchyDelta>,
     new_surface: &semver_analyzer_core::ApiSurface,
     new_hierarchies: &std::collections::HashMap<
@@ -2309,7 +2309,7 @@ mod tests {
         ];
         let manifest = vec![ManifestChange {
             field: "type".into(),
-            change_type: semver_analyzer_core::ManifestChangeType::ModuleSystemChanged,
+            change_type: TsManifestChangeType::ModuleSystemChanged,
             before: Some("commonjs".into()),
             after: Some("module".into()),
             description: "CJS to ESM".into(),

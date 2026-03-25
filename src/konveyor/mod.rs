@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use semver_analyzer_core::{
     AnalysisReport, ApiChange, ApiChangeKind, ApiChangeType, BehavioralChange, FileChanges,
-    ManifestChange, ManifestChangeType,
+    ManifestChange,
 };
+use semver_analyzer_ts::{TsCategory, TsManifestChangeType, TypeScript};
 
 // ── User-supplied rename patterns ───────────────────────────────────────
 
@@ -570,7 +571,7 @@ struct ConstantGroupKey {
 /// Returns a map of `ConstantGroupKey` → list of `(change, from_pkg, strategy)`
 /// for groups exceeding `CONSTANT_COLLAPSE_THRESHOLD`.
 fn detect_collapsible_constant_groups<'a>(
-    report: &'a AnalysisReport,
+    report: &'a AnalysisReport<TypeScript>,
     pkg_cache: &HashMap<String, String>,
     rename_patterns: &RenamePatterns,
     member_renames: &HashMap<String, String>,
@@ -755,7 +756,7 @@ fn build_combined_constant_rule(
 fn build_migration_message_legacy(
     component_name: &str,
     interface_name: &str,
-    report: &AnalysisReport,
+    report: &AnalysisReport<TypeScript>,
     removal_count: usize,
     total_changes: usize,
 ) -> String {
@@ -1031,7 +1032,7 @@ fn build_migration_message_legacy(
 /// This is the v2 replacement for `build_migration_message_legacy()`.
 /// It reads directly from the pre-aggregated fields on `ComponentSummary`
 /// rather than scanning the full report.
-fn build_migration_message_v2(comp: &semver_analyzer_core::ComponentSummary) -> String {
+fn build_migration_message_v2(comp: &semver_analyzer_core::ComponentSummary<TypeScript>) -> String {
     let component_name = &comp.name;
     let removal_count = comp.property_summary.removed;
     let total = comp.property_summary.total;
@@ -1240,7 +1241,8 @@ fn build_migration_message_v2(comp: &semver_analyzer_core::ComponentSummary) -> 
         // Test assertion diffs often produce many identical entries
         // (e.g., "aria-labelledby attribute added" × 20).
         let mut seen = std::collections::BTreeSet::new();
-        let mut deduped: Vec<(&semver_analyzer_core::BehavioralChange, usize)> = Vec::new();
+        let mut deduped: Vec<(&semver_analyzer_core::BehavioralChange<TypeScript>, usize)> =
+            Vec::new();
         for b in &comp.behavioral_changes {
             let key = format!(
                 "{}:{}",
@@ -1309,7 +1311,7 @@ fn build_migration_message_v2(comp: &semver_analyzer_core::ComponentSummary) -> 
 
 /// IMPORT, etc.). When `Builtin`, rules use `builtin.filecontent` regex patterns.
 pub fn generate_rules(
-    report: &AnalysisReport,
+    report: &AnalysisReport<TypeScript>,
     file_pattern: &str,
     pkg_cache: &HashMap<String, String>,
     rename_patterns: &RenamePatterns,
@@ -2897,14 +2899,15 @@ pub fn generate_rules(
             .map(|c| c.removed_properties.iter().collect())
             .unwrap_or_default();
 
-        let behavioral_changes: Vec<&semver_analyzer_core::BehavioralChange> = comp_summary
-            .map(|c| {
-                c.behavioral_changes
-                    .iter()
-                    .filter(|b| b.is_internal_only != Some(true))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let behavioral_changes: Vec<&semver_analyzer_core::BehavioralChange<TypeScript>> =
+            comp_summary
+                .map(|c| {
+                    c.behavioral_changes
+                        .iter()
+                        .filter(|b| b.is_internal_only != Some(true))
+                        .collect()
+                })
+                .unwrap_or_default();
 
         let prop_summary = comp_summary.map(|c| &c.property_summary);
 
@@ -3348,7 +3351,7 @@ pub fn generate_rules(
 /// - `rules` are Konveyor rules using `builtin.json` to detect the dependency
 /// - `strategies` maps rule IDs to `UpdateDependency` fix strategy entries
 pub fn generate_dependency_update_rules(
-    report: &AnalysisReport,
+    report: &AnalysisReport<TypeScript>,
     pkg_info_cache: &HashMap<String, PackageInfo>,
 ) -> (Vec<KonveyorRule>, HashMap<String, FixStrategyEntry>) {
     let mut rules = Vec::new();
@@ -3473,7 +3476,7 @@ fn member_key_re() -> &'static regex::Regex {
 /// Returns the covered symbols, compound token diffs, and any member
 /// renames found via explicit rename patterns.
 fn extract_compound_tokens(
-    report: &AnalysisReport,
+    report: &AnalysisReport<TypeScript>,
     rename_patterns: &RenamePatterns,
 ) -> (
     BTreeSet<String>,
@@ -3544,7 +3547,9 @@ fn extract_compound_tokens(
 /// Returns `(removed_suffixes, added_suffixes)` — the sets of trailing
 /// PascalCase suffixes found across all compound token member key diffs.
 /// These can be passed to an LLM to identify CSS logical property renames.
-pub fn extract_suffix_inventory(report: &AnalysisReport) -> (BTreeSet<String>, BTreeSet<String>) {
+pub fn extract_suffix_inventory(
+    report: &AnalysisReport<TypeScript>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
     let re = member_key_re();
     let mut removed_suffixes: BTreeSet<String> = BTreeSet::new();
     let mut added_suffixes: BTreeSet<String> = BTreeSet::new();
@@ -3605,7 +3610,7 @@ pub fn extract_suffix_inventory(report: &AnalysisReport) -> (BTreeSet<String>, B
 /// - `member_renames`: old_member → new_member mappings derived from diffing
 ///   member key sets using the supplied rename patterns.
 pub fn analyze_token_members(
-    report: &AnalysisReport,
+    report: &AnalysisReport<TypeScript>,
     rename_patterns: &RenamePatterns,
 ) -> (BTreeSet<String>, HashMap<String, String>) {
     let (covered_symbols, _compound_tokens, member_renames) =
@@ -3620,7 +3625,7 @@ pub fn analyze_token_members(
 /// CSS physical→logical property suffix renames. The results are stored
 /// in `report.member_renames` so the `konveyor` step can generate rules.
 pub fn apply_suffix_renames(
-    report: &AnalysisReport,
+    report: &AnalysisReport<TypeScript>,
     suffix_renames: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let (_covered, compound_tokens, mut member_renames) =
@@ -3911,7 +3916,7 @@ pub fn consolidate_rules(rules: Vec<KonveyorRule>) -> (Vec<KonveyorRule>, HashMa
 ///
 /// Components that already have a `hierarchy-composition` migration rule are
 /// skipped to avoid duplication.
-pub fn generate_conformance_rules(report: &AnalysisReport) -> Vec<KonveyorRule> {
+pub fn generate_conformance_rules(report: &AnalysisReport<TypeScript>) -> Vec<KonveyorRule> {
     let mut rules = Vec::new();
     let mut id_counts: HashMap<String, usize> = HashMap::new();
 
@@ -4093,7 +4098,7 @@ pub struct PackageInfo {
     pub version: Option<String>,
 }
 
-pub fn build_package_name_cache(report: &AnalysisReport) -> HashMap<String, String> {
+pub fn build_package_name_cache(report: &AnalysisReport<TypeScript>) -> HashMap<String, String> {
     let full_cache = build_package_info_cache(report);
     full_cache
         .into_iter()
@@ -4106,7 +4111,9 @@ pub fn build_package_name_cache(report: &AnalysisReport) -> HashMap<String, Stri
 /// Reads package.json from the to_ref (new version) using `git show` to get
 /// the target version for dependency update rules. Falls back to reading from
 /// disk if git fails.
-pub fn build_package_info_cache(report: &AnalysisReport) -> HashMap<String, PackageInfo> {
+pub fn build_package_info_cache(
+    report: &AnalysisReport<TypeScript>,
+) -> HashMap<String, PackageInfo> {
     let mut cache: HashMap<String, PackageInfo> = HashMap::new();
     let repo_path = &report.repository;
     let to_ref = &report.comparison.to_ref;
@@ -4500,7 +4507,7 @@ fn extract_file_pattern_from_condition(condition: &KonveyorCondition) -> Option<
 ///
 /// The class prefix is the var prefix without the leading `--`
 /// (e.g., `--pf-v5-` → `pf-v5-`).
-fn detect_css_prefix_changes(report: &AnalysisReport) -> Vec<(String, String)> {
+fn detect_css_prefix_changes(report: &AnalysisReport<TypeScript>) -> Vec<(String, String)> {
     let mut seen = BTreeSet::new();
     let mut results = Vec::new();
 
@@ -4888,7 +4895,7 @@ fn detect_version_prefix(description: &str) -> Option<(String, String)> {
 /// the breaking change: strategy, confidence, concrete instructions, and
 /// before/after examples where available.
 pub fn generate_fix_guidance(
-    report: &AnalysisReport,
+    report: &AnalysisReport<TypeScript>,
     rules: &[KonveyorRule],
     file_pattern: &str,
 ) -> FixGuidanceDoc {
@@ -4962,7 +4969,7 @@ pub fn generate_fix_guidance(
 pub fn write_ruleset_dir(
     output_dir: &Path,
     ruleset_name: &str,
-    report: &AnalysisReport,
+    report: &AnalysisReport<TypeScript>,
     rules: &[KonveyorRule],
 ) -> Result<()> {
     std::fs::create_dir_all(output_dir)
@@ -5063,7 +5070,7 @@ fn fix_guidance_dir_for(output_dir: &Path) -> std::path::PathBuf {
 
 fn api_change_to_rules(
     change: &ApiChange,
-    file_changes: &FileChanges,
+    file_changes: &FileChanges<TypeScript>,
     file_pattern: &str,
     from_pkg: Option<&str>,
     id_counts: &mut HashMap<String, usize>,
@@ -5332,8 +5339,8 @@ fn api_change_to_rules(
 }
 
 fn behavioral_change_to_rule(
-    change: &BehavioralChange,
-    file_changes: &FileChanges,
+    change: &BehavioralChange<TypeScript>,
+    file_changes: &FileChanges<TypeScript>,
     file_pattern: &str,
     from_pkg: Option<&str>,
     id_counts: &mut HashMap<String, usize>,
@@ -5381,11 +5388,11 @@ fn behavioral_change_to_rule(
         // DOM, CSS, a11y, and behavioral changes primarily impact frontend testing
         if matches!(
             cat,
-            semver_analyzer_core::BehavioralCategory::DomStructure
-                | semver_analyzer_core::BehavioralCategory::CssClass
-                | semver_analyzer_core::BehavioralCategory::CssVariable
-                | semver_analyzer_core::BehavioralCategory::Accessibility
-                | semver_analyzer_core::BehavioralCategory::DataAttribute
+            TsCategory::DomStructure
+                | TsCategory::CssClass
+                | TsCategory::CssVariable
+                | TsCategory::Accessibility
+                | TsCategory::DataAttribute
         ) {
             labels.push("impact=frontend-testing".to_string());
         }
@@ -5460,7 +5467,7 @@ fn behavioral_change_to_rule(
 }
 
 fn manifest_change_to_rule(
-    change: &ManifestChange,
+    change: &ManifestChange<TypeScript>,
     file_pattern: &str,
     id_counts: &mut HashMap<String, usize>,
 ) -> KonveyorRule {
@@ -5505,7 +5512,7 @@ fn manifest_change_to_rule(
 
 fn api_change_to_fix(
     change: &ApiChange,
-    file_changes: &FileChanges,
+    file_changes: &FileChanges<TypeScript>,
     rule_id: &str,
     file_pattern: &str,
 ) -> FixGuidanceEntry {
@@ -5661,8 +5668,8 @@ fn api_change_to_fix(
 }
 
 fn behavioral_change_to_fix(
-    change: &BehavioralChange,
-    file_changes: &FileChanges,
+    change: &BehavioralChange<TypeScript>,
+    file_changes: &FileChanges<TypeScript>,
     rule_id: &str,
 ) -> FixGuidanceEntry {
     let file_path = file_changes.file.display().to_string();
@@ -5697,23 +5704,24 @@ fn behavioral_change_to_fix(
     }
 }
 
-fn manifest_change_to_fix(change: &ManifestChange, rule_id: &str) -> FixGuidanceEntry {
-    let (strategy, confidence, source, fix_description, search, replacement) =
-        match change.change_type {
-            ManifestChangeType::ModuleSystemChanged => {
-                let is_cjs_to_esm = change
-                    .after
-                    .as_deref()
-                    .map(|a| a == "module")
-                    .unwrap_or(false);
+fn manifest_change_to_fix(change: &ManifestChange<TypeScript>, rule_id: &str) -> FixGuidanceEntry {
+    let (strategy, confidence, source, fix_description, search, replacement) = match change
+        .change_type
+    {
+        TsManifestChangeType::ModuleSystemChanged => {
+            let is_cjs_to_esm = change
+                .after
+                .as_deref()
+                .map(|a| a == "module")
+                .unwrap_or(false);
 
-                if is_cjs_to_esm {
-                    (
-                        FixStrategy::UpdateImport,
-                        FixConfidence::High,
-                        FixSource::Pattern,
-                        format!(
-                            "The package has changed from CommonJS to ESM.\n\n\
+            if is_cjs_to_esm {
+                (
+                    FixStrategy::UpdateImport,
+                    FixConfidence::High,
+                    FixSource::Pattern,
+                    format!(
+                        "The package has changed from CommonJS to ESM.\n\n\
                              Action required:\n\
                              1. Convert all require() calls to import statements:\n\
                              \n\
@@ -5728,18 +5736,18 @@ fn manifest_change_to_fix(change: &ManifestChange, rule_id: &str) -> FixGuidance
                              3. Update your package.json \"type\" field if needed\n\
                              4. Rename .js files to .mjs if mixing module systems\n\n\
                              {}",
-                            change.description,
-                        ),
-                        r"\brequire\s*\(".to_string(),
-                        Some("import".to_string()),
-                    )
-                } else {
-                    (
-                        FixStrategy::UpdateImport,
-                        FixConfidence::High,
-                        FixSource::Pattern,
-                        format!(
-                            "The package has changed from ESM to CommonJS.\n\n\
+                        change.description,
+                    ),
+                    r"\brequire\s*\(".to_string(),
+                    Some("import".to_string()),
+                )
+            } else {
+                (
+                    FixStrategy::UpdateImport,
+                    FixConfidence::High,
+                    FixSource::Pattern,
+                    format!(
+                        "The package has changed from ESM to CommonJS.\n\n\
                              Action required:\n\
                              1. Convert all import statements to require() calls:\n\
                              \n\
@@ -5749,110 +5757,110 @@ fn manifest_change_to_fix(change: &ManifestChange, rule_id: &str) -> FixGuidance
                              2. Convert export statements to module.exports\n\
                              3. Update your package.json \"type\" field if needed\n\n\
                              {}",
-                            change.description,
-                        ),
-                        r"\bimport\s+".to_string(),
-                        Some("require".to_string()),
-                    )
-                }
+                        change.description,
+                    ),
+                    r"\bimport\s+".to_string(),
+                    Some("require".to_string()),
+                )
             }
+        }
 
-            ManifestChangeType::PeerDependencyAdded => (
-                FixStrategy::UpdateDependency,
-                FixConfidence::Exact,
-                FixSource::Pattern,
-                format!(
-                    "A new peer dependency has been added: '{}'\n\n\
+        TsManifestChangeType::PeerDependencyAdded => (
+            FixStrategy::UpdateDependency,
+            FixConfidence::Exact,
+            FixSource::Pattern,
+            format!(
+                "A new peer dependency has been added: '{}'\n\n\
                      Action required:\n\
                      1. Install the peer dependency: npm install {}\n\
                      2. Verify version compatibility with your existing dependencies\n\n\
                      {}",
-                    change.field, change.field, change.description,
-                ),
-                change.field.clone(),
-                change.after.clone(),
+                change.field, change.field, change.description,
             ),
+            change.field.clone(),
+            change.after.clone(),
+        ),
 
-            ManifestChangeType::PeerDependencyRemoved => (
-                FixStrategy::UpdateDependency,
-                FixConfidence::High,
-                FixSource::Pattern,
-                format!(
-                    "Peer dependency '{}' has been removed.\n\n\
+        TsManifestChangeType::PeerDependencyRemoved => (
+            FixStrategy::UpdateDependency,
+            FixConfidence::High,
+            FixSource::Pattern,
+            format!(
+                "Peer dependency '{}' has been removed.\n\n\
                      Action required:\n\
                      1. Check if you still need '{}' as a direct dependency\n\
                      2. If it was only required by this package, you may be able \
                         to remove it\n\
                      3. Verify that removing it doesn't break other dependencies\n\n\
                      {}",
-                    change.field, change.field, change.description,
-                ),
-                change.field.clone(),
-                None,
+                change.field, change.field, change.description,
             ),
+            change.field.clone(),
+            None,
+        ),
 
-            ManifestChangeType::PeerDependencyRangeChanged => (
-                FixStrategy::UpdateDependency,
-                FixConfidence::High,
-                FixSource::Pattern,
-                format!(
-                    "Peer dependency '{}' version range changed.\n\n\
+        TsManifestChangeType::PeerDependencyRangeChanged => (
+            FixStrategy::UpdateDependency,
+            FixConfidence::High,
+            FixSource::Pattern,
+            format!(
+                "Peer dependency '{}' version range changed.\n\n\
                      Before: {}\n\
                      After:  {}\n\n\
                      Action required:\n\
                      1. Update '{}' to a version that satisfies the new range\n\
                      2. Test for compatibility with the new version\n\n\
                      {}",
-                    change.field,
-                    change.before.as_deref().unwrap_or("(none)"),
-                    change.after.as_deref().unwrap_or("(none)"),
-                    change.field,
-                    change.description,
-                ),
-                change.field.clone(),
-                change.after.clone(),
+                change.field,
+                change.before.as_deref().unwrap_or("(none)"),
+                change.after.as_deref().unwrap_or("(none)"),
+                change.field,
+                change.description,
             ),
+            change.field.clone(),
+            change.after.clone(),
+        ),
 
-            ManifestChangeType::EntryPointChanged | ManifestChangeType::ExportsEntryRemoved => (
-                FixStrategy::UpdateImport,
-                FixConfidence::Medium,
-                FixSource::Pattern,
-                format!(
-                    "Package entry point or export map changed for '{}'.\n\n\
+        TsManifestChangeType::EntryPointChanged | TsManifestChangeType::ExportsEntryRemoved => (
+            FixStrategy::UpdateImport,
+            FixConfidence::Medium,
+            FixSource::Pattern,
+            format!(
+                "Package entry point or export map changed for '{}'.\n\n\
                      Before: {}\n\
                      After:  {}\n\n\
                      Action required:\n\
                      1. Update all import paths that reference the old entry point\n\
                      2. Check the package's export map for the new path\n\n\
                      {}",
-                    change.field,
-                    change.before.as_deref().unwrap_or("(none)"),
-                    change.after.as_deref().unwrap_or("(none)"),
-                    change.description,
-                ),
-                change.field.clone(),
-                change.after.clone(),
+                change.field,
+                change.before.as_deref().unwrap_or("(none)"),
+                change.after.as_deref().unwrap_or("(none)"),
+                change.description,
             ),
+            change.field.clone(),
+            change.after.clone(),
+        ),
 
-            _ => (
-                FixStrategy::ManualReview,
-                FixConfidence::Medium,
-                FixSource::Pattern,
-                format!(
-                    "Package manifest field '{}' changed.\n\n\
+        _ => (
+            FixStrategy::ManualReview,
+            FixConfidence::Medium,
+            FixSource::Pattern,
+            format!(
+                "Package manifest field '{}' changed.\n\n\
                      Before: {}\n\
                      After:  {}\n\n\
                      Review the change and update your configuration accordingly.\n\n\
                      {}",
-                    change.field,
-                    change.before.as_deref().unwrap_or("(none)"),
-                    change.after.as_deref().unwrap_or("(none)"),
-                    change.description,
-                ),
-                change.field.clone(),
-                None,
+                change.field,
+                change.before.as_deref().unwrap_or("(none)"),
+                change.after.as_deref().unwrap_or("(none)"),
+                change.description,
             ),
-        };
+            change.field.clone(),
+            None,
+        ),
+    };
 
     FixGuidanceEntry {
         rule_id: rule_id.to_string(),
@@ -6282,12 +6290,12 @@ fn extract_added_union_values(change: &ApiChange) -> Vec<String> {
 
 /// Build the condition and message for a manifest change.
 fn build_manifest_condition_and_message(
-    change: &ManifestChange,
+    change: &ManifestChange<TypeScript>,
     file_pattern: &str,
     change_type_label: &str,
 ) -> (KonveyorCondition, String) {
     match change.change_type {
-        ManifestChangeType::ModuleSystemChanged => {
+        TsManifestChangeType::ModuleSystemChanged => {
             let is_cjs_to_esm = change
                 .after
                 .as_deref()
@@ -6324,9 +6332,9 @@ fn build_manifest_condition_and_message(
                 message,
             )
         }
-        ManifestChangeType::PeerDependencyAdded
-        | ManifestChangeType::PeerDependencyRemoved
-        | ManifestChangeType::PeerDependencyRangeChanged => {
+        TsManifestChangeType::PeerDependencyAdded
+        | TsManifestChangeType::PeerDependencyRemoved
+        | TsManifestChangeType::PeerDependencyRangeChanged => {
             let message = format!(
                 "Peer dependency change ({}): {}\n\nField: {}\nBefore: {}\nAfter: {}",
                 change_type_label,
@@ -6421,13 +6429,13 @@ fn effort_for_api_change(change: &ApiChangeType) -> u32 {
     }
 }
 
-fn manifest_effort(change_type: &ManifestChangeType) -> u32 {
+fn manifest_effort(change_type: &TsManifestChangeType) -> u32 {
     match change_type {
-        ManifestChangeType::ModuleSystemChanged => 7,
-        ManifestChangeType::EntryPointChanged => 5,
-        ManifestChangeType::ExportsEntryRemoved => 5,
-        ManifestChangeType::ExportsConditionRemoved => 3,
-        ManifestChangeType::BinEntryRemoved => 3,
+        TsManifestChangeType::ModuleSystemChanged => 7,
+        TsManifestChangeType::EntryPointChanged => 5,
+        TsManifestChangeType::ExportsEntryRemoved => 5,
+        TsManifestChangeType::ExportsConditionRemoved => 3,
+        TsManifestChangeType::BinEntryRemoved => 3,
         _ => 3,
     }
 }
@@ -6460,32 +6468,31 @@ fn api_kind_label(kind: &ApiChangeKind) -> &'static str {
     }
 }
 
-fn behavioral_category_label(cat: &semver_analyzer_core::BehavioralCategory) -> &'static str {
-    use semver_analyzer_core::BehavioralCategory;
+fn behavioral_category_label(cat: &TsCategory) -> &'static str {
     match cat {
-        BehavioralCategory::DomStructure => "dom-structure",
-        BehavioralCategory::CssClass => "css-class",
-        BehavioralCategory::CssVariable => "css-variable",
-        BehavioralCategory::Accessibility => "accessibility",
-        BehavioralCategory::DefaultValue => "default-value",
-        BehavioralCategory::LogicChange => "logic-change",
-        BehavioralCategory::DataAttribute => "data-attribute",
-        BehavioralCategory::RenderOutput => "render-output",
+        TsCategory::DomStructure => "dom-structure",
+        TsCategory::CssClass => "css-class",
+        TsCategory::CssVariable => "css-variable",
+        TsCategory::Accessibility => "accessibility",
+        TsCategory::DefaultValue => "default-value",
+        TsCategory::LogicChange => "logic-change",
+        TsCategory::DataAttribute => "data-attribute",
+        TsCategory::RenderOutput => "render-output",
     }
 }
 
-fn manifest_change_type_label(change_type: &ManifestChangeType) -> &'static str {
+fn manifest_change_type_label(change_type: &TsManifestChangeType) -> &'static str {
     match change_type {
-        ManifestChangeType::EntryPointChanged => "entry-point-changed",
-        ManifestChangeType::ExportsEntryRemoved => "exports-entry-removed",
-        ManifestChangeType::ExportsEntryAdded => "exports-entry-added",
-        ManifestChangeType::ExportsConditionRemoved => "exports-condition-removed",
-        ManifestChangeType::ModuleSystemChanged => "module-system-changed",
-        ManifestChangeType::PeerDependencyAdded => "peer-dependency-added",
-        ManifestChangeType::PeerDependencyRemoved => "peer-dependency-removed",
-        ManifestChangeType::PeerDependencyRangeChanged => "peer-dependency-range-changed",
-        ManifestChangeType::EngineConstraintChanged => "engine-constraint-changed",
-        ManifestChangeType::BinEntryRemoved => "bin-entry-removed",
+        TsManifestChangeType::EntryPointChanged => "entry-point-changed",
+        TsManifestChangeType::ExportsEntryRemoved => "exports-entry-removed",
+        TsManifestChangeType::ExportsEntryAdded => "exports-entry-added",
+        TsManifestChangeType::ExportsConditionRemoved => "exports-condition-removed",
+        TsManifestChangeType::ModuleSystemChanged => "module-system-changed",
+        TsManifestChangeType::PeerDependencyAdded => "peer-dependency-added",
+        TsManifestChangeType::PeerDependencyRemoved => "peer-dependency-removed",
+        TsManifestChangeType::PeerDependencyRangeChanged => "peer-dependency-range-changed",
+        TsManifestChangeType::EngineConstraintChanged => "engine-constraint-changed",
+        TsManifestChangeType::BinEntryRemoved => "bin-entry-removed",
     }
 }
 
@@ -6672,9 +6679,9 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_report(
-        changes: Vec<FileChanges>,
-        manifest_changes: Vec<ManifestChange>,
-    ) -> AnalysisReport {
+        changes: Vec<FileChanges<TypeScript>>,
+        manifest_changes: Vec<ManifestChange<TypeScript>>,
+    ) -> AnalysisReport<TypeScript> {
         AnalysisReport {
             repository: PathBuf::from("/tmp/test-repo"),
             comparison: Comparison {
@@ -6870,7 +6877,7 @@ mod tests {
     fn test_generate_rules_manifest_module_system() {
         let manifest = vec![ManifestChange {
             field: "type".to_string(),
-            change_type: ManifestChangeType::ModuleSystemChanged,
+            change_type: TsManifestChangeType::ModuleSystemChanged,
             before: Some("commonjs".to_string()),
             after: Some("module".to_string()),
             description: "CJS to ESM".to_string(),
@@ -6906,7 +6913,7 @@ mod tests {
     fn test_generate_rules_manifest_peer_dep() {
         let manifest = vec![ManifestChange {
             field: "react".to_string(),
-            change_type: ManifestChangeType::PeerDependencyRemoved,
+            change_type: TsManifestChangeType::PeerDependencyRemoved,
             before: Some("^17.0.0".to_string()),
             after: None,
             description: "Peer dependency 'react' was removed".to_string(),
@@ -7237,7 +7244,7 @@ mod tests {
     fn test_fix_guidance_manifest_cjs_to_esm() {
         let manifest = vec![ManifestChange {
             field: "type".to_string(),
-            change_type: ManifestChangeType::ModuleSystemChanged,
+            change_type: TsManifestChangeType::ModuleSystemChanged,
             before: Some("commonjs".to_string()),
             after: Some("module".to_string()),
             description: "CJS to ESM migration".to_string(),
@@ -7362,7 +7369,7 @@ mod tests {
 
         let manifest = vec![ManifestChange {
             field: "type".to_string(),
-            change_type: ManifestChangeType::ModuleSystemChanged,
+            change_type: TsManifestChangeType::ModuleSystemChanged,
             before: Some("commonjs".to_string()),
             after: Some("module".to_string()),
             description: "CJS to ESM".to_string(),
@@ -7582,8 +7589,8 @@ mod tests {
     fn make_file_changes(
         file: &str,
         api: Vec<ApiChange>,
-        behavioral: Vec<BehavioralChange>,
-    ) -> FileChanges {
+        behavioral: Vec<BehavioralChange<TypeScript>>,
+    ) -> FileChanges<TypeScript> {
         FileChanges {
             file: PathBuf::from(file),
             status: FileStatus::Modified,
@@ -7596,9 +7603,9 @@ mod tests {
 
     fn make_behavioral(
         symbol: &str,
-        category: Option<BehavioralCategory>,
+        category: Option<TsCategory>,
         description: &str,
-    ) -> BehavioralChange {
+    ) -> BehavioralChange<TypeScript> {
         BehavioralChange {
             symbol: symbol.to_string(),
             kind: BehavioralChangeKind::Function,
@@ -7613,9 +7620,9 @@ mod tests {
     }
 
     fn make_report_with_added(
-        changes: Vec<FileChanges>,
+        changes: Vec<FileChanges<TypeScript>>,
         added_files: Vec<PathBuf>,
-    ) -> AnalysisReport {
+    ) -> AnalysisReport<TypeScript> {
         let mut report = make_report(changes, vec![]);
         report.added_files = added_files;
         report
@@ -8154,7 +8161,7 @@ mod tests {
                 ],
                 vec![make_behavioral(
                     "MastheadBrand",
-                    Some(BehavioralCategory::LogicChange),
+                    Some(TsCategory::LogicChange),
                     "href no longer creates a clickable link",
                 )],
             ),
@@ -8164,7 +8171,7 @@ mod tests {
                 vec![],
                 vec![make_behavioral(
                     "MastheadBasic",
-                    Some(BehavioralCategory::DomStructure),
+                    Some(TsCategory::DomStructure),
                     "<MastheadLogo> element added to render output (1 instance)",
                 )],
             ),
@@ -8301,7 +8308,7 @@ mod tests {
             ],
             vec![make_behavioral(
                 "EmptyStateHeader",
-                Some(BehavioralCategory::RenderOutput),
+                Some(TsCategory::RenderOutput),
                 "<EmptyStateHeader> element removed from render output",
             )],
         )];
@@ -8382,7 +8389,7 @@ mod tests {
                 )],
                 vec![make_behavioral(
                     "EmptyStateHeader",
-                    Some(BehavioralCategory::RenderOutput),
+                    Some(TsCategory::RenderOutput),
                     "<EmptyStateHeader> element removed from render output",
                 )],
             ),
@@ -9026,12 +9033,12 @@ mod tests {
             vec![
                 make_behavioral(
                     "Modal",
-                    Some(BehavioralCategory::RenderOutput),
+                    Some(TsCategory::RenderOutput),
                     "title prop no longer renders ModalBoxHeader",
                 ),
                 make_behavioral(
                     "Modal",
-                    Some(BehavioralCategory::DomStructure),
+                    Some(TsCategory::DomStructure),
                     "ModalBoxCloseButton no longer rendered inside ModalBoxHeader",
                 ),
             ],
@@ -9245,7 +9252,7 @@ mod tests {
                 vec![],
                 vec![make_behavioral(
                     "Demo",
-                    Some(BehavioralCategory::DomStructure),
+                    Some(TsCategory::DomStructure),
                     "<MastheadLogo> element added to render output",
                 )],
             ),
@@ -9961,7 +9968,7 @@ mod tests {
             }),
             behavioral_changes: vec![make_behavioral(
                 "EmptyStateHeader",
-                Some(BehavioralCategory::RenderOutput),
+                Some(TsCategory::RenderOutput),
                 "<EmptyStateHeader> element removed from render output",
             )],
             child_components: vec![],
@@ -10385,7 +10392,7 @@ mod tests {
         // A behavioral change with is_internal_only=true should not produce a rule
         let mut internal_beh = make_behavioral(
             "ModalBox",
-            Some(BehavioralCategory::DomStructure),
+            Some(TsCategory::DomStructure),
             "Internal wrapper now uses div instead of section",
         );
         internal_beh.is_internal_only = Some(true);
@@ -10425,7 +10432,7 @@ mod tests {
         // when packages data is available (non-empty).
         let internal_beh = make_behavioral(
             "MenuBase",
-            Some(BehavioralCategory::DomStructure),
+            Some(TsCategory::DomStructure),
             "Internal base component changed",
         );
 
@@ -10639,7 +10646,7 @@ mod tests {
         // A behavioral change for a public symbol should still produce a rule
         let beh = make_behavioral(
             "Menu",
-            Some(BehavioralCategory::DomStructure),
+            Some(TsCategory::DomStructure),
             "Menu now renders nav element",
         );
 
@@ -10738,7 +10745,10 @@ mod tests {
     // ── children→prop consolidation tests ───────────────────────────────
 
     /// Helper: create a FileChanges with composition pattern changes.
-    fn make_composition_changes(file: &str, changes: Vec<CompositionPatternChange>) -> FileChanges {
+    fn make_composition_changes(
+        file: &str,
+        changes: Vec<CompositionPatternChange>,
+    ) -> FileChanges<TypeScript> {
         FileChanges {
             file: PathBuf::from(file),
             status: FileStatus::Modified,

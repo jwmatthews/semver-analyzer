@@ -6,6 +6,8 @@
 //! to 5 + ChangeSubject.
 
 use semver_analyzer_core::*;
+use semver_analyzer_ts::jsx_diff::JsxChange;
+use semver_analyzer_ts::language::TypeScript;
 use serde::Serialize;
 
 /// Semantic representation of a structural change, independent of
@@ -161,8 +163,8 @@ pub struct NormalizedManifestChange {
     pub after: Option<String>,
 }
 
-impl From<&ManifestChange> for NormalizedManifestChange {
-    fn from(c: &ManifestChange) -> Self {
+impl From<&ManifestChange<TypeScript>> for NormalizedManifestChange {
+    fn from(c: &ManifestChange<TypeScript>) -> Self {
         NormalizedManifestChange {
             field: c.field.clone(),
             change_type: format!("{:?}", c.change_type),
@@ -174,7 +176,7 @@ impl From<&ManifestChange> for NormalizedManifestChange {
     }
 }
 
-pub fn normalize_manifest(changes: &[ManifestChange]) -> Vec<NormalizedManifestChange> {
+pub fn normalize_manifest(changes: &[ManifestChange<TypeScript>]) -> Vec<NormalizedManifestChange> {
     changes.iter().map(NormalizedManifestChange::from).collect()
 }
 
@@ -190,8 +192,8 @@ pub struct NormalizedBehavioralChange {
     pub after: Option<String>,
 }
 
-impl From<&semver_analyzer_core::JsxChange> for NormalizedBehavioralChange {
-    fn from(c: &semver_analyzer_core::JsxChange) -> Self {
+impl From<&JsxChange> for NormalizedBehavioralChange {
+    fn from(c: &JsxChange) -> Self {
         NormalizedBehavioralChange {
             symbol: c.symbol.clone(),
             category: format!("{:?}", c.category),
@@ -202,9 +204,7 @@ impl From<&semver_analyzer_core::JsxChange> for NormalizedBehavioralChange {
     }
 }
 
-pub fn normalize_jsx(
-    changes: &[semver_analyzer_core::JsxChange],
-) -> Vec<NormalizedBehavioralChange> {
+pub fn normalize_jsx(changes: &[JsxChange]) -> Vec<NormalizedBehavioralChange> {
     changes
         .iter()
         .map(NormalizedBehavioralChange::from)

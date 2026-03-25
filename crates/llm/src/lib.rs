@@ -27,7 +27,7 @@ pub use invoke::{
     LlmExpectedChild, LlmInterfaceRenameMapping, LlmRemovalDisposition, LlmSuffixRename,
 };
 use semver_analyzer_core::{
-    BehaviorAnalyzer, BreakingVerdict, ChangedFunction, EvidenceSource, FunctionSpec, TestDiff,
+    BehaviorAnalyzer, BreakingVerdict, ChangedFunction, FunctionSpec, TestDiff,
 };
 
 /// LLM-based implementation of `BehaviorAnalyzer`.
@@ -220,13 +220,13 @@ impl BehaviorAnalyzer for LlmBehaviorAnalyzer {
         caller_body: &str,
         caller_signature: &str,
         callee_name: &str,
-        evidence: &EvidenceSource,
+        evidence_description: &str,
     ) -> Result<bool> {
         let prompt = prompts::build_propagation_check_prompt(
             caller_body,
             caller_signature,
             callee_name,
-            evidence,
+            evidence_description,
         );
         let response = invoke::run_llm_command(&self.llm_command, &prompt, self.timeout_secs)?;
         invoke::parse_propagation_result(&response)

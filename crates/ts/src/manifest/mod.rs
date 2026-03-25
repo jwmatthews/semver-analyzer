@@ -5,13 +5,14 @@
 //! just JSON comparison with semantic awareness of entry points,
 //! exports maps, module systems, peer dependencies, engines, and bin entries.
 
-use semver_analyzer_core::{ManifestChange, ManifestChangeType};
+use crate::language::{TsManifestChangeType, TypeScript};
+use semver_analyzer_core::ManifestChange;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Compare two `package.json` files and produce manifest changes.
-pub fn diff_manifests(old: &Value, new: &Value) -> Vec<ManifestChange> {
+pub fn diff_manifests(old: &Value, new: &Value) -> Vec<ManifestChange<TypeScript>> {
     let mut changes = Vec::new();
 
     diff_entry_points(old, new, &mut changes);
@@ -28,7 +29,7 @@ pub fn diff_manifests(old: &Value, new: &Value) -> Vec<ManifestChange> {
 pub fn diff_manifest_files(
     old_path: &Path,
     new_path: &Path,
-) -> anyhow::Result<Vec<ManifestChange>> {
+) -> anyhow::Result<Vec<ManifestChange<TypeScript>>> {
     let old_content = std::fs::read_to_string(old_path)?;
     let new_content = std::fs::read_to_string(new_path)?;
     let old: Value = serde_json::from_str(&old_content)?;
@@ -39,7 +40,7 @@ pub fn diff_manifest_files(
 // ─── Entry points ────────────────────────────────────────────────────────
 
 /// Diff `main`, `module`, and `types` entry point fields.
-fn diff_entry_points(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
+fn diff_entry_points(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeScript>>) {
     for field in &["main", "module", "types", "typings"] {
         let old_val = old.get(field).and_then(|v| v.as_str());
         let new_val = new.get(field).and_then(|v| v.as_str());
@@ -48,7 +49,7 @@ fn diff_entry_points(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>
             (Some(o), Some(n)) if o != n => {
                 changes.push(ManifestChange {
                     field: field.to_string(),
-                    change_type: ManifestChangeType::EntryPointChanged,
+                    change_type: TsManifestChangeType::EntryPointChanged,
                     before: Some(o.to_string()),
                     after: Some(n.to_string()),
                     description: format!("`{}` entry point changed from `{}` to `{}`", field, o, n),
@@ -58,7 +59,7 @@ fn diff_entry_points(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>
             (Some(o), None) => {
                 changes.push(ManifestChange {
                     field: field.to_string(),
-                    change_type: ManifestChangeType::EntryPointChanged,
+                    change_type: TsManifestChangeType::EntryPointChanged,
                     before: Some(o.to_string()),
                     after: None,
                     description: format!("`{}` entry point was removed (was `{}`)", field, o),
@@ -74,7 +75,7 @@ fn diff_entry_points(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>
 // ─── Module system ───────────────────────────────────────────────────────
 
 /// Diff `"type"` field (CJS ↔ ESM transition).
-fn diff_module_system(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
+fn diff_module_system(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeScript>>) {
     let old_type = old
         .get("type")
         .and_then(|v| v.as_str())
@@ -92,7 +93,7 @@ fn diff_module_system(old: &Value, new: &Value, changes: &mut Vec<ManifestChange
         };
         changes.push(ManifestChange {
             field: "type".to_string(),
-            change_type: ManifestChangeType::ModuleSystemChanged,
+            change_type: TsManifestChangeType::ModuleSystemChanged,
             before: Some(old_type.to_string()),
             after: Some(new_type.to_string()),
             description: description.to_string(),
@@ -109,7 +110,7 @@ fn diff_module_system(old: &Value, new: &Value, changes: &mut Vec<ManifestChange
 /// - A string: `"exports": "./index.js"`
 /// - An object with subpath keys: `"exports": { ".": "./index.js", "./utils": "./utils.js" }`
 /// - Nested with conditions: `"exports": { ".": { "import": "./index.mjs", "require": "./index.cjs" } }`
-fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
+fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeScript>>) {
     let old_exports = old.get("exports");
     let new_exports = new.get("exports");
 
@@ -120,7 +121,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
             // Removing exports entirely is breaking
             changes.push(ManifestChange {
                 field: "exports".to_string(),
-                change_type: ManifestChangeType::ExportsEntryRemoved,
+                change_type: TsManifestChangeType::ExportsEntryRemoved,
                 before: Some(old_exp.to_string()),
                 after: None,
                 description: "The `exports` field was removed entirely".to_string(),
@@ -142,7 +143,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
                             if old_target != new_target {
                                 changes.push(ManifestChange {
                                     field: format!("exports.{}.{}", path, cond),
-                                    change_type: ManifestChangeType::EntryPointChanged,
+                                    change_type: TsManifestChangeType::EntryPointChanged,
                                     before: Some(old_target.clone()),
                                     after: Some(new_target.clone()),
                                     description: format!(
@@ -156,7 +157,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
                             // Condition removed
                             changes.push(ManifestChange {
                                 field: format!("exports.{}.{}", path, cond),
-                                change_type: ManifestChangeType::ExportsConditionRemoved,
+                                change_type: TsManifestChangeType::ExportsConditionRemoved,
                                 before: Some(old_target.clone()),
                                 after: None,
                                 description: format!(
@@ -171,7 +172,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
                     // Entire path removed
                     changes.push(ManifestChange {
                         field: format!("exports.{}", path),
-                        change_type: ManifestChangeType::ExportsEntryRemoved,
+                        change_type: TsManifestChangeType::ExportsEntryRemoved,
                         before: Some(format!("{:?}", old_conditions)),
                         after: None,
                         description: format!("Export path `{}` was removed", path),
@@ -185,7 +186,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
                 if !old_flat.contains_key(path.as_str()) {
                     changes.push(ManifestChange {
                         field: format!("exports.{}", path),
-                        change_type: ManifestChangeType::ExportsEntryAdded,
+                        change_type: TsManifestChangeType::ExportsEntryAdded,
                         before: None,
                         after: Some(path.clone()),
                         description: format!("Export path `{}` was added", path),
@@ -259,7 +260,7 @@ fn flatten_exports(value: &Value, prefix: &str) -> BTreeMap<String, BTreeMap<Str
 // ─── Peer dependencies ───────────────────────────────────────────────────
 
 /// Diff `peerDependencies`.
-fn diff_peer_dependencies(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
+fn diff_peer_dependencies(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeScript>>) {
     let old_peers = extract_string_map(old, "peerDependencies");
     let new_peers = extract_string_map(new, "peerDependencies");
 
@@ -268,7 +269,7 @@ fn diff_peer_dependencies(old: &Value, new: &Value, changes: &mut Vec<ManifestCh
         if !old_peers.contains_key(name.as_str()) {
             changes.push(ManifestChange {
                 field: format!("peerDependencies.{}", name),
-                change_type: ManifestChangeType::PeerDependencyAdded,
+                change_type: TsManifestChangeType::PeerDependencyAdded,
                 before: None,
                 after: Some(version.clone()),
                 description: format!(
@@ -285,7 +286,7 @@ fn diff_peer_dependencies(old: &Value, new: &Value, changes: &mut Vec<ManifestCh
         if !new_peers.contains_key(name.as_str()) {
             changes.push(ManifestChange {
                 field: format!("peerDependencies.{}", name),
-                change_type: ManifestChangeType::PeerDependencyRemoved,
+                change_type: TsManifestChangeType::PeerDependencyRemoved,
                 before: Some(version.clone()),
                 after: None,
                 description: format!("Peer dependency `{}` was removed", name),
@@ -305,7 +306,7 @@ fn diff_peer_dependencies(old: &Value, new: &Value, changes: &mut Vec<ManifestCh
                 // For now, report all range changes and let the description indicate both values.
                 changes.push(ManifestChange {
                     field: format!("peerDependencies.{}", name),
-                    change_type: ManifestChangeType::PeerDependencyRangeChanged,
+                    change_type: TsManifestChangeType::PeerDependencyRangeChanged,
                     before: Some(old_range.clone()),
                     after: Some(new_range.clone()),
                     description: format!(
@@ -323,7 +324,7 @@ fn diff_peer_dependencies(old: &Value, new: &Value, changes: &mut Vec<ManifestCh
 // ─── Engines ─────────────────────────────────────────────────────────────
 
 /// Diff `engines` field (e.g., `node`, `npm`).
-fn diff_engines(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
+fn diff_engines(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeScript>>) {
     let old_engines = extract_string_map(old, "engines");
     let new_engines = extract_string_map(new, "engines");
 
@@ -332,7 +333,7 @@ fn diff_engines(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
         if !old_engines.contains_key(engine.as_str()) {
             changes.push(ManifestChange {
                 field: format!("engines.{}", engine),
-                change_type: ManifestChangeType::EngineConstraintChanged,
+                change_type: TsManifestChangeType::EngineConstraintChanged,
                 before: None,
                 after: Some(constraint.clone()),
                 description: format!(
@@ -350,7 +351,7 @@ fn diff_engines(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
             if old_constraint != new_constraint {
                 changes.push(ManifestChange {
                     field: format!("engines.{}", engine),
-                    change_type: ManifestChangeType::EngineConstraintChanged,
+                    change_type: TsManifestChangeType::EngineConstraintChanged,
                     before: Some(old_constraint.clone()),
                     after: Some(new_constraint.clone()),
                     description: format!(
@@ -369,7 +370,7 @@ fn diff_engines(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
 // ─── Bin entries ─────────────────────────────────────────────────────────
 
 /// Diff `bin` field (CLI entry points).
-fn diff_bin(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
+fn diff_bin(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeScript>>) {
     let old_bins = extract_bin_map(old);
     let new_bins = extract_bin_map(new);
 
@@ -378,7 +379,7 @@ fn diff_bin(old: &Value, new: &Value, changes: &mut Vec<ManifestChange>) {
         if !new_bins.contains_key(name.as_str()) {
             changes.push(ManifestChange {
                 field: format!("bin.{}", name),
-                change_type: ManifestChangeType::BinEntryRemoved,
+                change_type: TsManifestChangeType::BinEntryRemoved,
                 before: Some(path.clone()),
                 after: None,
                 description: format!("CLI command `{}` was removed", name),
@@ -434,9 +435,9 @@ mod tests {
     use serde_json::json;
 
     fn find_manifest_change<'a>(
-        changes: &'a [ManifestChange],
-        ct: ManifestChangeType,
-    ) -> &'a ManifestChange {
+        changes: &'a [ManifestChange<TypeScript>],
+        ct: TsManifestChangeType,
+    ) -> &'a ManifestChange<TypeScript> {
         changes
             .iter()
             .find(|c| c.change_type == ct)
@@ -449,7 +450,10 @@ mod tests {
             })
     }
 
-    fn has_manifest_change(changes: &[ManifestChange], ct: ManifestChangeType) -> bool {
+    fn has_manifest_change(
+        changes: &[ManifestChange<TypeScript>],
+        ct: TsManifestChangeType,
+    ) -> bool {
         changes.iter().any(|c| c.change_type == ct)
     }
 
@@ -461,7 +465,7 @@ mod tests {
         let new = json!({ "main": "./lib/index.js" });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::EntryPointChanged);
+        let c = find_manifest_change(&changes, TsManifestChangeType::EntryPointChanged);
         assert!(c.is_breaking);
         assert_eq!(c.field, "main");
     }
@@ -472,7 +476,7 @@ mod tests {
         let new = json!({});
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::EntryPointChanged);
+        let c = find_manifest_change(&changes, TsManifestChangeType::EntryPointChanged);
         assert!(c.is_breaking);
         assert_eq!(c.field, "types");
     }
@@ -500,7 +504,7 @@ mod tests {
         let new = json!({ "type": "module" });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::ModuleSystemChanged);
+        let c = find_manifest_change(&changes, TsManifestChangeType::ModuleSystemChanged);
         assert!(c.is_breaking);
         assert!(c.description.contains("CJS to ESM"));
     }
@@ -511,7 +515,7 @@ mod tests {
         let new = json!({});
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::ModuleSystemChanged);
+        let c = find_manifest_change(&changes, TsManifestChangeType::ModuleSystemChanged);
         assert!(c.is_breaking);
         assert!(c.description.contains("ESM to CJS"));
     }
@@ -523,7 +527,7 @@ mod tests {
         let changes = diff_manifests(&old, &new);
         assert!(!has_manifest_change(
             &changes,
-            ManifestChangeType::ModuleSystemChanged
+            TsManifestChangeType::ModuleSystemChanged
         ));
     }
 
@@ -544,7 +548,7 @@ mod tests {
         });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::ExportsEntryRemoved);
+        let c = find_manifest_change(&changes, TsManifestChangeType::ExportsEntryRemoved);
         assert!(c.is_breaking);
         assert!(c.field.contains("./utils"));
     }
@@ -559,7 +563,7 @@ mod tests {
         });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::ExportsEntryAdded);
+        let c = find_manifest_change(&changes, TsManifestChangeType::ExportsEntryAdded);
         assert!(!c.is_breaking);
     }
 
@@ -582,7 +586,7 @@ mod tests {
         });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::ExportsConditionRemoved);
+        let c = find_manifest_change(&changes, TsManifestChangeType::ExportsConditionRemoved);
         assert!(c.is_breaking);
         assert!(c.field.contains("require"));
     }
@@ -595,7 +599,7 @@ mod tests {
 
         assert!(has_manifest_change(
             &changes,
-            ManifestChangeType::ExportsEntryRemoved
+            TsManifestChangeType::ExportsEntryRemoved
         ));
     }
 
@@ -605,7 +609,7 @@ mod tests {
         let new = json!({ "exports": "./dist/index.js" });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::EntryPointChanged);
+        let c = find_manifest_change(&changes, TsManifestChangeType::EntryPointChanged);
         assert!(c.is_breaking);
     }
 
@@ -617,7 +621,7 @@ mod tests {
         let new = json!({ "peerDependencies": { "react": "^18.0.0" } });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::PeerDependencyAdded);
+        let c = find_manifest_change(&changes, TsManifestChangeType::PeerDependencyAdded);
         assert!(c.is_breaking);
         assert!(c.description.contains("react"));
     }
@@ -628,7 +632,7 @@ mod tests {
         let new = json!({});
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::PeerDependencyRemoved);
+        let c = find_manifest_change(&changes, TsManifestChangeType::PeerDependencyRemoved);
         assert!(!c.is_breaking);
     }
 
@@ -638,7 +642,7 @@ mod tests {
         let new = json!({ "peerDependencies": { "react": "^18.0.0" } });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::PeerDependencyRangeChanged);
+        let c = find_manifest_change(&changes, TsManifestChangeType::PeerDependencyRangeChanged);
         assert!(c.is_breaking);
     }
 
@@ -650,7 +654,7 @@ mod tests {
         let new = json!({ "engines": { "node": ">=18" } });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::EngineConstraintChanged);
+        let c = find_manifest_change(&changes, TsManifestChangeType::EngineConstraintChanged);
         assert!(c.is_breaking);
     }
 
@@ -660,7 +664,7 @@ mod tests {
         let new = json!({ "engines": { "node": ">=18" } });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::EngineConstraintChanged);
+        let c = find_manifest_change(&changes, TsManifestChangeType::EngineConstraintChanged);
         assert!(c.is_breaking);
         assert_eq!(c.before.as_deref(), Some(">=16"));
         assert_eq!(c.after.as_deref(), Some(">=18"));
@@ -680,7 +684,7 @@ mod tests {
         });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::BinEntryRemoved);
+        let c = find_manifest_change(&changes, TsManifestChangeType::BinEntryRemoved);
         assert!(c.is_breaking);
         assert!(c.field.contains("myapp-dev"));
     }
@@ -691,7 +695,7 @@ mod tests {
         let new = json!({ "name": "myapp" });
         let changes = diff_manifests(&old, &new);
 
-        let c = find_manifest_change(&changes, ManifestChangeType::BinEntryRemoved);
+        let c = find_manifest_change(&changes, TsManifestChangeType::BinEntryRemoved);
         assert!(c.is_breaking);
     }
 

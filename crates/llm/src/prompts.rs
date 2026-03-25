@@ -4,7 +4,7 @@
 //! the `FunctionSpec` or `BreakingVerdict` schemas. Template-guided
 //! generation reduces hallucination (Preguss finding: ~30% → ~11-19%).
 
-use semver_analyzer_core::{ChangedFunction, EvidenceSource, FunctionSpec, TestDiff};
+use semver_analyzer_core::{ChangedFunction, FunctionSpec, TestDiff};
 
 /// JSON schema template for `FunctionSpec`.
 ///
@@ -197,9 +197,9 @@ pub fn build_propagation_check_prompt(
     caller_body: &str,
     caller_signature: &str,
     callee_name: &str,
-    evidence: &EvidenceSource,
+    evidence_description: &str,
 ) -> String {
-    let evidence_desc = format_evidence(evidence);
+    let evidence_desc = evidence_description;
 
     format!(
         r#"A behavioral change was detected in the function `{callee_name}`.
@@ -489,33 +489,6 @@ fn format_test_context(test_diff: &TestDiff) -> String {
     parts.join("\n")
 }
 
-/// Format evidence for the propagation check prompt.
-fn format_evidence(evidence: &EvidenceSource) -> String {
-    match evidence {
-        EvidenceSource::TestDelta { test_diff } => {
-            let mut desc = String::from("Test assertions changed:\n");
-            for line in &test_diff.removed_assertions {
-                desc.push_str(&format!("  - {}\n", line));
-            }
-            for line in &test_diff.added_assertions {
-                desc.push_str(&format!("  + {}\n", line));
-            }
-            desc
-        }
-        EvidenceSource::LlmWithTestContext { spec_old, spec_new }
-        | EvidenceSource::LlmOnly { spec_old, spec_new } => {
-            format!(
-                "Old spec: {}\nNew spec: {}",
-                serde_json::to_string(spec_old).unwrap_or_default(),
-                serde_json::to_string(spec_new).unwrap_or_default()
-            )
-        }
-        EvidenceSource::JsxDiff { change_description } => {
-            format!("JSX render output change: {}", change_description)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,21 +593,14 @@ mod tests {
 
     #[test]
     fn propagation_prompt_includes_callee_info() {
-        let evidence = EvidenceSource::TestDelta {
-            test_diff: TestDiff {
-                test_file: PathBuf::from("test.ts"),
-                removed_assertions: vec!["expect(x).toBe(5)".into()],
-                added_assertions: vec!["expect(x).toBe(10)".into()],
-                has_assertion_changes: true,
-                full_diff: String::new(),
-            },
-        };
+        let evidence_desc =
+            "Test assertions changed:\n  - expect(x).toBe(5)\n  + expect(x).toBe(10)\n";
 
         let prompt = build_propagation_check_prompt(
             "{ return helper() + 1; }",
             "function main(): number",
             "helper",
-            &evidence,
+            evidence_desc,
         );
         assert!(prompt.contains("helper"));
         assert!(prompt.contains("return helper() + 1"));

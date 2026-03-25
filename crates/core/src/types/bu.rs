@@ -177,6 +177,10 @@ pub struct SideEffect {
 /// Produced by the BU pipeline. Records the affected public symbol,
 /// the root cause (potentially a private function), the call path,
 /// and the evidence that supports the finding.
+///
+/// Language-agnostic: uses string fields for evidence and category
+/// instead of language-specific enum types (those live in the
+/// language crate, e.g. `TsEvidence` / `TsCategory` in `crates/ts`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BehavioralBreak {
     /// The affected PUBLIC symbol's qualified name.
@@ -193,8 +197,9 @@ pub struct BehavioralBreak {
     /// First element is the public symbol, last is the root cause.
     pub call_path: Vec<String>,
 
-    /// How the behavioral change was detected.
-    pub evidence: EvidenceSource,
+    /// Serialized evidence description (was EvidenceSource).
+    /// How the behavioral change was detected, as a human-readable string.
+    pub evidence_description: String,
 
     /// Confidence score (0.0 to 1.0).
     pub confidence: f64,
@@ -202,70 +207,10 @@ pub struct BehavioralBreak {
     /// Human-readable description of the behavioral change.
     pub description: String,
 
-    /// Sub-category of the behavioral change (DOM, CSS, a11y, etc.).
-    /// Populated from LLM response or JSX diff analysis.
+    /// Category label as string (was Option<BehavioralCategory>).
+    /// Language-specific category rendered as a string for display.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<super::BehavioralCategory>,
-}
-
-/// How the behavioral change was detected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum EvidenceSource {
-    /// Test assertions changed — developer explicitly declared new behavior.
-    /// Highest confidence (0.95), no LLM needed.
-    TestDelta { test_diff: TestDiff },
-
-    /// Test exists but didn't change. LLM analyzed with test as context.
-    /// Medium confidence (0.70).
-    LlmWithTestContext {
-        spec_old: FunctionSpec,
-        spec_new: FunctionSpec,
-    },
-
-    /// No test found. LLM analyzed body diff alone.
-    /// Lower confidence (0.55).
-    LlmOnly {
-        spec_old: FunctionSpec,
-        spec_new: FunctionSpec,
-    },
-
-    /// Deterministic JSX AST diff — no LLM needed.
-    /// High confidence (0.90) since it's based on structural comparison.
-    JsxDiff {
-        /// What kind of JSX change was detected.
-        change_description: String,
-    },
-}
-
-// ── JSX Diff Types ─────────────────────────────────────────────────────
-
-/// A change detected by comparing JSX render output between two versions.
-///
-/// Produced by the JSX differ (deterministic, no LLM). Each change
-/// maps to a `BehavioralCategory` and can be converted to a
-/// `BehavioralBreak` with high confidence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JsxChange {
-    /// The component function/class that produces this JSX.
-    pub symbol: String,
-
-    /// Source file containing the component.
-    pub file: std::path::PathBuf,
-
-    /// What kind of JSX change this is.
-    pub category: super::BehavioralCategory,
-
-    /// Human-readable description of the change.
-    pub description: String,
-
-    /// The old value (element name, class name, ARIA attribute value, etc.).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub before: Option<String>,
-
-    /// The new value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<String>,
+    pub category_label: Option<String>,
 }
 
 // ── Call Graph Types ────────────────────────────────────────────────────
@@ -410,42 +355,6 @@ mod tests {
     }
 
     #[test]
-    fn evidence_source_variants_serialize() {
-        let test_delta = EvidenceSource::TestDelta {
-            test_diff: TestDiff {
-                test_file: PathBuf::from("src/api/users.test.ts"),
-                removed_assertions: vec!["expect(result.email).toBe('A@B.COM')".into()],
-                added_assertions: vec!["expect(result.email).toBe('a@b.com')".into()],
-                has_assertion_changes: true,
-                full_diff: "@@ -10,3 +10,3 @@\n-expect(result.email).toBe('A@B.COM')\n+expect(result.email).toBe('a@b.com')".into(),
-            },
-        };
-
-        let json = serde_json::to_string(&test_delta).unwrap();
-        assert!(json.contains("\"type\":\"TestDelta\""));
-
-        let llm_only = EvidenceSource::LlmOnly {
-            spec_old: FunctionSpec {
-                preconditions: vec![],
-                postconditions: vec![],
-                error_behavior: vec![],
-                side_effects: vec![],
-                notes: vec![],
-            },
-            spec_new: FunctionSpec {
-                preconditions: vec![],
-                postconditions: vec![],
-                error_behavior: vec![],
-                side_effects: vec![],
-                notes: vec![],
-            },
-        };
-
-        let json = serde_json::to_string(&llm_only).unwrap();
-        assert!(json.contains("\"type\":\"LlmOnly\""));
-    }
-
-    #[test]
     fn behavioral_break_with_call_path() {
         let brk = BehavioralBreak {
             symbol: "createUser".into(),
@@ -455,31 +364,10 @@ mod tests {
                 "_processInput".into(),
                 "_normalizeEmail".into(),
             ],
-            evidence: EvidenceSource::LlmOnly {
-                spec_old: FunctionSpec {
-                    preconditions: vec![],
-                    postconditions: vec![Postcondition {
-                        condition: "always".into(),
-                        returns: "lowercased email".into(),
-                    }],
-                    error_behavior: vec![],
-                    side_effects: vec![],
-                    notes: vec![],
-                },
-                spec_new: FunctionSpec {
-                    preconditions: vec![],
-                    postconditions: vec![Postcondition {
-                        condition: "always".into(),
-                        returns: "lowercased email with + alias stripped".into(),
-                    }],
-                    error_behavior: vec![],
-                    side_effects: vec![],
-                    notes: vec![],
-                },
-            },
+            evidence_description: "LlmOnly: postcondition changed".into(),
             confidence: 0.55,
             description: "Email normalization now strips + aliases".into(),
-            category: None,
+            category_label: None,
         };
 
         assert_eq!(brk.call_path.len(), 3);

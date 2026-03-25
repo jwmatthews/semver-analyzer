@@ -8,13 +8,26 @@
 //! contains JSX, we parse both versions, extract the JSX return tree, and
 //! diff element names, attributes, and structure.
 
+use crate::language::TsCategory;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use semver_analyzer_core::{BehavioralCategory, JsxChange};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+
+/// A change detected by comparing JSX render output between two versions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JsxChange {
+    pub symbol: String,
+    pub file: std::path::PathBuf,
+    pub category: TsCategory,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
 
 /// Compare JSX render output between old and new function bodies.
 ///
@@ -335,7 +348,7 @@ fn diff_element_tags(
             changes.push(JsxChange {
                 symbol: symbol.to_string(),
                 file: file.to_path_buf(),
-                category: BehavioralCategory::DomStructure,
+                category: TsCategory::DomStructure,
                 description: format!(
                     "<{}> element removed from render output ({} instance{})",
                     tag,
@@ -354,7 +367,7 @@ fn diff_element_tags(
             changes.push(JsxChange {
                 symbol: symbol.to_string(),
                 file: file.to_path_buf(),
-                category: BehavioralCategory::DomStructure,
+                category: TsCategory::DomStructure,
                 description: format!(
                     "<{}> element added to render output ({} instance{})",
                     tag,
@@ -394,7 +407,7 @@ fn diff_element_tags(
                     changes.push(JsxChange {
                         symbol: symbol.to_string(),
                         file: file.to_path_buf(),
-                        category: BehavioralCategory::DomStructure,
+                        category: TsCategory::DomStructure,
                         description: desc,
                         before: Some(format!("{} × <{}>", old_count, tag)),
                         after: Some(format!("{} × <{}>", new_count, tag)),
@@ -421,7 +434,7 @@ fn diff_aria_attrs(
             changes.push(JsxChange {
                 symbol: symbol.to_string(),
                 file: file.to_path_buf(),
-                category: BehavioralCategory::Accessibility,
+                category: TsCategory::Accessibility,
                 description: format!("{} attribute removed from <{}>", attr, element),
                 before: Some(format!("{}=\"{}\"", attr, value)),
                 after: None,
@@ -438,7 +451,7 @@ fn diff_aria_attrs(
             changes.push(JsxChange {
                 symbol: symbol.to_string(),
                 file: file.to_path_buf(),
-                category: BehavioralCategory::Accessibility,
+                category: TsCategory::Accessibility,
                 description: format!("{} attribute added to <{}>", attr, element),
                 before: None,
                 after: Some(format!("{}=\"{}\"", attr, value)),
@@ -453,7 +466,7 @@ fn diff_aria_attrs(
                 changes.push(JsxChange {
                     symbol: symbol.to_string(),
                     file: file.to_path_buf(),
-                    category: BehavioralCategory::Accessibility,
+                    category: TsCategory::Accessibility,
                     description: format!("{} value changed on <{}>", attr, element),
                     before: Some(format!("{}=\"{}\"", attr, old_val)),
                     after: Some(format!("{}=\"{}\"", attr, new_val)),
@@ -476,7 +489,7 @@ fn diff_role_attrs(
             changes.push(JsxChange {
                 symbol: symbol.to_string(),
                 file: file.to_path_buf(),
-                category: BehavioralCategory::Accessibility,
+                category: TsCategory::Accessibility,
                 description: format!("role=\"{}\" removed from <{}>", role, element),
                 before: Some(format!("role=\"{}\"", role)),
                 after: None,
@@ -491,7 +504,7 @@ fn diff_role_attrs(
                 changes.push(JsxChange {
                     symbol: symbol.to_string(),
                     file: file.to_path_buf(),
-                    category: BehavioralCategory::Accessibility,
+                    category: TsCategory::Accessibility,
                     description: format!(
                         "role changed on <{}> from \"{}\" to \"{}\"",
                         element, old_role, new_role
@@ -516,7 +529,7 @@ fn diff_css_classes(
         changes.push(JsxChange {
             symbol: symbol.to_string(),
             file: file.to_path_buf(),
-            category: BehavioralCategory::CssClass,
+            category: TsCategory::CssClass,
             description: format!("CSS class '{}' removed from render output", class),
             before: Some(class.clone()),
             after: None,
@@ -528,7 +541,7 @@ fn diff_css_classes(
         changes.push(JsxChange {
             symbol: symbol.to_string(),
             file: file.to_path_buf(),
-            category: BehavioralCategory::CssClass,
+            category: TsCategory::CssClass,
             description: format!("CSS class '{}' added to render output", class),
             before: None,
             after: Some(class.clone()),
@@ -552,7 +565,7 @@ fn diff_data_attrs(
             changes.push(JsxChange {
                 symbol: symbol.to_string(),
                 file: file.to_path_buf(),
-                category: BehavioralCategory::DataAttribute,
+                category: TsCategory::DataAttribute,
                 description: format!("{} removed from <{}>", attr, element),
                 before: Some(format!("{}=\"{}\"", attr, value)),
                 after: None,
@@ -567,7 +580,7 @@ fn diff_data_attrs(
                 changes.push(JsxChange {
                     symbol: symbol.to_string(),
                     file: file.to_path_buf(),
-                    category: BehavioralCategory::DataAttribute,
+                    category: TsCategory::DataAttribute,
                     description: format!("{} value changed on <{}>", attr, element),
                     before: Some(format!("{}=\"{}\"", attr, old_val)),
                     after: Some(format!("{}=\"{}\"", attr, new_val)),
@@ -731,7 +744,7 @@ mod tests {
 
         let dom_changes: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::DomStructure)
+            .filter(|c| c.category == TsCategory::DomStructure)
             .collect();
         assert!(!dom_changes.is_empty());
         assert!(dom_changes
@@ -747,7 +760,7 @@ mod tests {
 
         let dom = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::DomStructure)
+            .filter(|c| c.category == TsCategory::DomStructure)
             .collect::<Vec<_>>();
         assert!(!dom.is_empty());
         assert!(dom
@@ -763,7 +776,7 @@ mod tests {
 
         let a11y = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::Accessibility)
+            .filter(|c| c.category == TsCategory::Accessibility)
             .collect::<Vec<_>>();
         assert!(!a11y.is_empty());
         assert!(a11y.iter().any(
@@ -779,7 +792,7 @@ mod tests {
 
         let a11y: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::Accessibility)
+            .filter(|c| c.category == TsCategory::Accessibility)
             .collect();
         assert!(!a11y.is_empty());
         assert!(a11y
@@ -795,7 +808,7 @@ mod tests {
 
         let a11y: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::Accessibility)
+            .filter(|c| c.category == TsCategory::Accessibility)
             .collect();
         assert_eq!(a11y.len(), 1);
         assert!(a11y[0].description.contains("separator"));
@@ -810,7 +823,7 @@ mod tests {
 
         let css: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::CssClass)
+            .filter(|c| c.category == TsCategory::CssClass)
             .collect();
         assert!(!css.is_empty());
         // pf-v5-c-button removed, pf-v6-c-button added
@@ -832,7 +845,7 @@ mod tests {
 
         let data: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::DataAttribute)
+            .filter(|c| c.category == TsCategory::DataAttribute)
             .collect();
         assert_eq!(data.len(), 1);
         assert!(data[0].description.contains("data-ouia-component-type"));
@@ -846,7 +859,7 @@ mod tests {
 
         let dom: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::DomStructure)
+            .filter(|c| c.category == TsCategory::DomStructure)
             .collect();
         assert!(!dom.is_empty());
         assert!(dom
@@ -863,7 +876,7 @@ mod tests {
 
         let dom: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::DomStructure)
+            .filter(|c| c.category == TsCategory::DomStructure)
             .collect();
         // div removed, section added
         assert!(dom
@@ -891,9 +904,9 @@ mod tests {
 
         let categories: BTreeSet<_> = changes.iter().map(|c| &c.category).collect();
         // Should detect DOM structure (div→hr), CSS class, and accessibility changes
-        assert!(categories.contains(&BehavioralCategory::DomStructure));
-        assert!(categories.contains(&BehavioralCategory::CssClass));
-        assert!(categories.contains(&BehavioralCategory::Accessibility));
+        assert!(categories.contains(&TsCategory::DomStructure));
+        assert!(categories.contains(&TsCategory::CssClass));
+        assert!(categories.contains(&TsCategory::Accessibility));
     }
 
     #[test]
@@ -906,7 +919,7 @@ mod tests {
 
         let css_changes: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::CssClass)
+            .filter(|c| c.category == TsCategory::CssClass)
             .collect();
         // Should be empty — no actual string literal CSS classes changed
         assert!(
@@ -929,7 +942,7 @@ mod tests {
 
         let css_changes: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::CssClass)
+            .filter(|c| c.category == TsCategory::CssClass)
             .collect();
         assert!(
             !css_changes.is_empty(),
@@ -955,7 +968,7 @@ mod tests {
 
         let css_changes: Vec<_> = changes
             .iter()
-            .filter(|c| c.category == BehavioralCategory::CssClass)
+            .filter(|c| c.category == TsCategory::CssClass)
             .collect();
         assert!(
             !css_changes.is_empty(),

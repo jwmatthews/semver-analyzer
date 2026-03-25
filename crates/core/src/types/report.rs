@@ -9,13 +9,15 @@
 //! arrays for API and behavioral breaking changes.
 
 use super::change_subject::ChangeSubject;
+use crate::traits::Language;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Top-level analysis report (v2 harness format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnalysisReport {
+#[serde(bound = "")]
+pub struct AnalysisReport<L: Language> {
     /// Path to the analyzed repository.
     pub repository: PathBuf,
 
@@ -27,11 +29,11 @@ pub struct AnalysisReport {
 
     /// Per-file changes, sorted alphabetically by file path.
     /// Only files with at least one breaking change are included.
-    pub changes: Vec<FileChanges>,
+    pub changes: Vec<FileChanges<L>>,
 
     /// Package manifest changes (package.json).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub manifest_changes: Vec<ManifestChange>,
+    pub manifest_changes: Vec<ManifestChange<L>>,
 
     /// Files added between from_ref and to_ref (new exports, new components).
     /// Used to detect new sibling components that may be needed alongside
@@ -50,7 +52,7 @@ pub struct AnalysisReport {
     /// and the structural/behavioral change lists. Not serialized into
     /// the report when empty (backward compat with older reports).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub packages: Vec<PackageChanges>,
+    pub packages: Vec<PackageChanges<L>>,
 
     /// Member-level rename mappings discovered during analysis.
     ///
@@ -99,7 +101,8 @@ pub struct Summary {
 
 /// All breaking changes within a single file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileChanges {
+#[serde(bound = "")]
+pub struct FileChanges<L: Language> {
     /// Path to the file relative to repository root.
     pub file: PathBuf,
 
@@ -114,7 +117,7 @@ pub struct FileChanges {
     pub breaking_api_changes: Vec<ApiChange>,
 
     /// Breaking behavioral changes (DOM structure, CSS, defaults, rendering).
-    pub breaking_behavioral_changes: Vec<BehavioralChange>,
+    pub breaking_behavioral_changes: Vec<BehavioralChange<L>>,
 
     /// Composition pattern changes detected from test/example diffs.
     /// These describe how JSX nesting structure changed between versions
@@ -209,7 +212,8 @@ pub enum ApiChangeType {
 
 /// A behavioral change detected by BU analysis (possibly LLM-assisted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BehavioralChange {
+#[serde(bound = "")]
+pub struct BehavioralChange<L: Language> {
     /// The function/method/class where the behavioral change occurs.
     pub symbol: String,
 
@@ -219,7 +223,7 @@ pub struct BehavioralChange {
     /// Sub-category of the behavioral change (DOM, CSS, a11y, etc.).
     /// When present, enables more precise Konveyor rule generation.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<BehavioralCategory>,
+    pub category: Option<L::Category>,
 
     /// What was happening before and what happens now.
     pub description: String,
@@ -261,35 +265,6 @@ pub enum BehavioralChangeKind {
     Module,
 }
 
-/// Sub-category of a behavioral breaking change.
-///
-/// Enables downstream tools (Konveyor rule generation, fix guidance)
-/// to produce targeted rules and labels like `change-type=dom-structure`
-/// or `impact=frontend-testing`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BehavioralCategory {
-    /// Changed element types, added/removed wrapper elements, altered
-    /// component nesting structure.
-    DomStructure,
-    /// CSS class name renames, removals, or changed class application logic.
-    CssClass,
-    /// CSS custom property (variable) renames or removals.
-    CssVariable,
-    /// ARIA attribute changes, role changes, keyboard navigation, focus
-    /// management, tab order changes.
-    Accessibility,
-    /// Changed default prop values, altered conditional logic, changed
-    /// return values for same inputs.
-    DefaultValue,
-    /// Changed event handling, state management, side effects.
-    LogicChange,
-    /// Changed data-ouia-*, data-testid, or other data attributes.
-    DataAttribute,
-    /// General render output change not covered by other categories.
-    RenderOutput,
-}
-
 /// A composition pattern change detected from test/example file diffs.
 ///
 /// When a library's tests or examples restructure JSX nesting (e.g.,
@@ -315,10 +290,11 @@ pub struct CompositionPatternChange {
 // that rule generators consume directly. They are populated during
 // `build_report()` using the full API surfaces.
 
-/// All changes within a single npm package.
+/// All changes within a single package.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PackageChanges {
-    /// NPM package name (e.g., "@patternfly/react-core").
+#[serde(bound = "")]
+pub struct PackageChanges<L: Language> {
+    /// Package name (e.g., "@patternfly/react-core").
     pub name: String,
 
     /// Package version at the old ref.
@@ -331,7 +307,7 @@ pub struct PackageChanges {
 
     /// Per-component summaries with pre-aggregated change data.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub components: Vec<ComponentSummary>,
+    pub components: Vec<ComponentSummary<L>>,
 
     /// Pre-grouped bulk constant/token changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -348,7 +324,8 @@ pub struct PackageChanges {
 /// Contains everything the rule generator needs for a component without
 /// rescanning the full report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComponentSummary {
+#[serde(bound = "")]
+pub struct ComponentSummary<L: Language> {
     /// Component name (e.g., "Modal").
     pub name: String,
 
@@ -376,7 +353,7 @@ pub struct ComponentSummary {
 
     /// Behavioral changes pre-grouped for this component.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub behavioral_changes: Vec<BehavioralChange>,
+    pub behavioral_changes: Vec<BehavioralChange<L>>,
 
     /// Discovered child/sibling components (e.g., ModalHeader added
     /// alongside Modal being modified).
@@ -743,14 +720,15 @@ pub struct Dependent {
     pub symbol: String,
 }
 
-/// A breaking change in package.json.
+/// A breaking change in a package manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestChange {
+#[serde(bound = "")]
+pub struct ManifestChange<L: Language> {
     /// What field changed.
     pub field: String,
 
     /// Change type.
-    pub change_type: ManifestChangeType,
+    pub change_type: L::ManifestChangeType,
 
     /// Value before the change.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -765,22 +743,6 @@ pub struct ManifestChange {
 
     /// Whether this change is breaking.
     pub is_breaking: bool,
-}
-
-/// Categories of package.json changes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManifestChangeType {
-    EntryPointChanged,
-    ExportsEntryRemoved,
-    ExportsEntryAdded,
-    ExportsConditionRemoved,
-    ModuleSystemChanged,
-    PeerDependencyAdded,
-    PeerDependencyRemoved,
-    PeerDependencyRangeChanged,
-    EngineConstraintChanged,
-    BinEntryRemoved,
 }
 
 /// Metadata about the analysis run.

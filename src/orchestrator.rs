@@ -21,10 +21,10 @@
 use anyhow::{Context, Result};
 use semver_analyzer_core::{
     BehavioralBreak, BehavioralChange, BehavioralChangeKind, CallGraphBuilder,
-    DiffParser, EvidenceSource, SharedFindings, TestAnalyzer, Visibility,
+    DiffParser, SharedFindings, TestAnalyzer, Visibility,
 };
 use semver_analyzer_llm::LlmBehaviorAnalyzer;
-use semver_analyzer_ts::{OxcExtractor, TsCallGraphBuilder, TsDiffParser, TsTestAnalyzer};
+use semver_analyzer_ts::{OxcExtractor, TsCallGraphBuilder, TsCategory, TsDiffParser, TsTestAnalyzer, TypeScript};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -202,8 +202,8 @@ pub async fn run_concurrent_analysis(
 /// Results from the full analysis pipeline.
 pub struct AnalysisResult {
     pub structural_changes: Vec<semver_analyzer_core::StructuralChange>,
-    pub behavioral_changes: Vec<BehavioralChange>,
-    pub manifest_changes: Vec<semver_analyzer_core::ManifestChange>,
+    pub behavioral_changes: Vec<BehavioralChange<TypeScript>>,
+    pub manifest_changes: Vec<semver_analyzer_core::ManifestChange<TypeScript>>,
     /// API type-level changes detected by LLM (interface extends, optionality, etc.)
     pub llm_api_changes: Vec<LlmApiChangeEntry>,
     pub td_stats: TdStats,
@@ -290,7 +290,7 @@ struct LlmPhaseStats {
 
 struct TdResult {
     structural_changes: Vec<semver_analyzer_core::StructuralChange>,
-    manifest_changes: Vec<semver_analyzer_core::ManifestChange>,
+    manifest_changes: Vec<semver_analyzer_core::ManifestChange<TypeScript>>,
     stats: TdStats,
 }
 
@@ -428,14 +428,20 @@ fn run_bu_phase1(
                 td.removed_assertions.len(),
                 td.added_assertions.len()
             );
+            let evidence_description = format!(
+                "Test assertion changes detected: {} removed, {} added in {}",
+                td.removed_assertions.len(),
+                td.added_assertions.len(),
+                td.full_diff.lines().count(),
+            );
             let brk = BehavioralBreak {
                 symbol: func.qualified_name.clone(),
                 caused_by: func.qualified_name.clone(),
                 call_path: vec![func.name.clone()],
-                evidence: EvidenceSource::TestDelta { test_diff: td },
+                evidence_description,
                 confidence: 0.95,
                 description,
-                category: None, // Test-delta: category inferred later or by JSX differ
+                category_label: None, // Test-delta: category inferred later or by JSX differ
             };
             stats.test_behavioral_breaks += 1;
 
@@ -496,12 +502,10 @@ fn run_bu_phase1(
                 symbol: func.qualified_name.clone(),
                 caused_by: func.qualified_name.clone(),
                 call_path: vec![func.name.clone()],
-                evidence: EvidenceSource::JsxDiff {
-                    change_description: jsx_change.description.clone(),
-                },
+                evidence_description: jsx_change.description.clone(),
                 confidence: 0.90,
                 description: jsx_change.description,
-                category: Some(jsx_change.category),
+                category_label: Some(ts_category_label(&jsx_change.category).to_string()),
             };
             shared.insert_behavioral_break(brk);
             jsx_change_count += 1;
@@ -535,12 +539,10 @@ fn run_bu_phase1(
                 symbol: func.qualified_name.clone(),
                 caused_by: func.qualified_name.clone(),
                 call_path: vec![func.name.clone()],
-                evidence: EvidenceSource::JsxDiff {
-                    change_description: css_change.description.clone(),
-                },
+                evidence_description: css_change.description.clone(),
                 confidence: 0.90,
                 description: css_change.description,
-                category: Some(css_change.category),
+                category_label: Some(ts_category_label(&css_change.category).to_string()),
             };
             shared.insert_behavioral_break(brk);
             css_change_count += 1;
@@ -1257,35 +1259,22 @@ async fn run_bu_phase2_llm(
 
                     for change in beh_changes {
                         breaks.fetch_add(1, Ordering::Relaxed);
-                        let category = change.category.as_deref().and_then(parse_behavioral_category);
-                        // Encode is_internal_only into the notes for downstream extraction
-                        let mut notes = vec![change.description.clone()];
+                        let category_label = change.category.as_deref().and_then(|s| {
+                            parse_behavioral_category(s).map(|_| s.to_string())
+                        });
+                        // Encode is_internal_only into evidence_description for downstream extraction
+                        let mut evidence_description = format!("LLM behavioral analysis: {}", change.description);
                         if change.is_internal_only == Some(true) {
-                            notes.push("__is_internal_only__".to_string());
+                            evidence_description.push_str(" [__is_internal_only__]");
                         }
                         let brk = BehavioralBreak {
                             symbol: format!("{}::{}", file_path, change.symbol),
                             caused_by: format!("{}::{}", file_path, change.symbol),
                             call_path: vec![change.symbol.clone()],
-                            evidence: EvidenceSource::LlmOnly {
-                                spec_old: semver_analyzer_core::FunctionSpec {
-                                    preconditions: vec![],
-                                    postconditions: vec![],
-                                    error_behavior: vec![],
-                                    side_effects: vec![],
-                                    notes: vec![],
-                                },
-                                spec_new: semver_analyzer_core::FunctionSpec {
-                                    preconditions: vec![],
-                                    postconditions: vec![],
-                                    error_behavior: vec![],
-                                    side_effects: vec![],
-                                    notes,
-                                },
-                            },
+                            evidence_description,
                             confidence: 0.70,
                             description: change.description,
-                            category,
+                            category_label,
                         };
                         shared_ref.insert_behavioral_break(brk);
                     }
@@ -1397,13 +1386,13 @@ fn walk_up_call_graph(
                     symbol: caller.qualified_name.clone(),
                     caused_by: original_break.caused_by.clone(),
                     call_path,
-                    evidence: original_break.evidence.clone(),
+                    evidence_description: original_break.evidence_description.clone(),
                     confidence: original_break.confidence * 0.9, // Slight confidence decay for transitive
                     description: format!(
                         "Behavioral change in {} propagated through call chain",
                         original_break.caused_by
                     ),
-                    category: original_break.category.clone(), // Propagate parent's category
+                    category_label: original_break.category_label.clone(), // Propagate parent's category
                 });
                 propagated += 1;
             } else {
@@ -1425,7 +1414,7 @@ fn walk_up_call_graph(
 // ── Report Merging ──────────────────────────────────────────────────────
 
 /// Convert behavioral breaks from SharedFindings into v2 BehavioralChange entries.
-fn merge_behavioral_breaks(shared: &SharedFindings) -> Vec<BehavioralChange> {
+fn merge_behavioral_breaks(shared: &SharedFindings) -> Vec<BehavioralChange<TypeScript>> {
     shared
         .behavioral_breaks()
         .iter()
@@ -1441,43 +1430,43 @@ fn merge_behavioral_breaks(shared: &SharedFindings) -> Vec<BehavioralChange> {
                 None
             };
 
-            // Determine kind from evidence or call path
-            let kind = match &brk.evidence {
-                EvidenceSource::LlmOnly { .. } | EvidenceSource::LlmWithTestContext { .. } => {
-                    BehavioralChangeKind::Class // LLM file-level analysis = component-level
-                }
-                EvidenceSource::TestDelta { .. } => BehavioralChangeKind::Function,
-                EvidenceSource::JsxDiff { .. } => BehavioralChangeKind::Class, // JSX diff = component-level
+            // Determine kind from evidence_description
+            let evidence_desc = &brk.evidence_description;
+            let kind = if evidence_desc.starts_with("LLM behavioral analysis") {
+                BehavioralChangeKind::Class // LLM file-level analysis = component-level
+            } else if evidence_desc.starts_with("Test assertion changes") {
+                BehavioralChangeKind::Function
+            } else {
+                // JSX diff, CSS scan, or other deterministic evidence = component-level
+                BehavioralChangeKind::Class
             };
 
             // Preserve evidence type from the BU pipeline
-            let evidence_type = Some(match &brk.evidence {
-                EvidenceSource::TestDelta { .. } => "TestDelta".to_string(),
-                EvidenceSource::JsxDiff { .. } => "JsxDiff".to_string(),
-                EvidenceSource::LlmOnly { .. } => "LlmOnly".to_string(),
-                EvidenceSource::LlmWithTestContext { .. } => "LlmWithTestContext".to_string(),
+            let evidence_type = Some(if evidence_desc.starts_with("Test assertion changes") {
+                "TestDelta".to_string()
+            } else if evidence_desc.starts_with("LLM behavioral analysis") {
+                "LlmOnly".to_string()
+            } else {
+                "JsxDiff".to_string()
             });
 
             // Extract component names referenced in the description
             let referenced_components = extract_component_refs(&brk.description);
 
-            // Extract is_internal_only from notes (encoded by the LLM ingestion)
-            let is_internal_only = match &brk.evidence {
-                EvidenceSource::LlmOnly { spec_new, .. }
-                | EvidenceSource::LlmWithTestContext { spec_new, .. } => {
-                    if spec_new.notes.iter().any(|n| n == "__is_internal_only__") {
-                        Some(true)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
+            // Extract is_internal_only from evidence_description (encoded by the LLM ingestion)
+            let is_internal_only = if evidence_desc.contains("__is_internal_only__") {
+                Some(true)
+            } else {
+                None
             };
+
+            // Parse category_label string into TsCategory
+            let category: Option<TsCategory> = brk.category_label.as_deref().and_then(parse_behavioral_category);
 
             BehavioralChange {
                 symbol: extract_display_name(&brk.symbol),
                 kind,
-                category: brk.category.clone(),
+                category,
                 description: brk.description.clone(),
                 source_file,
                 confidence: Some(brk.confidence),
@@ -1567,7 +1556,7 @@ fn diff_package_json(
     repo: &Path,
     from_ref: &str,
     to_ref: &str,
-) -> Vec<semver_analyzer_core::ManifestChange> {
+) -> Vec<semver_analyzer_core::ManifestChange<TypeScript>> {
     let old_json = read_git_file(repo, from_ref, "package.json");
     let new_json = read_git_file(repo, to_ref, "package.json");
 
@@ -1600,18 +1589,31 @@ fn diff_package_json(
 }
 
 /// Parse a behavioral category string from an LLM response into the enum.
-fn parse_behavioral_category(s: &str) -> Option<semver_analyzer_core::BehavioralCategory> {
-    use semver_analyzer_core::BehavioralCategory;
+fn parse_behavioral_category(s: &str) -> Option<TsCategory> {
     match s.trim().to_lowercase().replace('-', "_").as_str() {
-        "dom_structure" | "dom" | "render" => Some(BehavioralCategory::DomStructure),
-        "css_class" | "css" => Some(BehavioralCategory::CssClass),
-        "css_variable" | "css_var" => Some(BehavioralCategory::CssVariable),
-        "accessibility" | "a11y" => Some(BehavioralCategory::Accessibility),
-        "default_value" | "default" => Some(BehavioralCategory::DefaultValue),
-        "logic_change" | "logic" | "side_effect" => Some(BehavioralCategory::LogicChange),
-        "data_attribute" | "data" | "ouia" => Some(BehavioralCategory::DataAttribute),
-        "render_output" | "visual" => Some(BehavioralCategory::RenderOutput),
+        "dom_structure" | "dom" | "render" => Some(TsCategory::DomStructure),
+        "css_class" | "css" => Some(TsCategory::CssClass),
+        "css_variable" | "css_var" => Some(TsCategory::CssVariable),
+        "accessibility" | "a11y" => Some(TsCategory::Accessibility),
+        "default_value" | "default" => Some(TsCategory::DefaultValue),
+        "logic_change" | "logic" | "side_effect" => Some(TsCategory::LogicChange),
+        "data_attribute" | "data" | "ouia" => Some(TsCategory::DataAttribute),
+        "render_output" | "visual" => Some(TsCategory::RenderOutput),
         _ => None,
+    }
+}
+
+/// Convert a TsCategory to a snake_case string label.
+fn ts_category_label(cat: &TsCategory) -> &'static str {
+    match cat {
+        TsCategory::DomStructure => "dom_structure",
+        TsCategory::CssClass => "css_class",
+        TsCategory::CssVariable => "css_variable",
+        TsCategory::Accessibility => "accessibility",
+        TsCategory::DefaultValue => "default_value",
+        TsCategory::LogicChange => "logic_change",
+        TsCategory::DataAttribute => "data_attribute",
+        TsCategory::RenderOutput => "render_output",
     }
 }
 

@@ -18,13 +18,13 @@ use std::collections::BTreeSet;
 // ── TypeScript language type ────────────────────────────────────────────
 
 /// The TypeScript language implementation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypeScript;
 
 // ── Associated types ────────────────────────────────────────────────────
 
 /// Behavioral change categories for TypeScript/React analysis.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TsCategory {
     /// Changed element types, wrapper elements, component nesting.

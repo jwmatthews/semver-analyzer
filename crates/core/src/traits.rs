@@ -14,7 +14,7 @@
 //! | `BehaviorAnalyzer` | BU | No (language-agnostic, LLM-based) |
 
 use crate::types::{
-    ApiSurface, BreakingVerdict, Caller, ChangedFunction, EvidenceSource, FunctionSpec, Reference,
+    ApiSurface, BreakingVerdict, Caller, ChangedFunction, FunctionSpec, Reference,
     StructuralChange, Symbol, TestDiff, TestFile, Visibility,
 };
 use anyhow::Result;
@@ -177,7 +177,7 @@ pub trait BehaviorAnalyzer {
         caller_body: &str,
         caller_signature: &str,
         callee_name: &str,
-        evidence: &EvidenceSource,
+        evidence_description: &str,
     ) -> Result<bool>;
 }
 
