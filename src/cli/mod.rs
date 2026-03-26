@@ -1,7 +1,8 @@
 //! CLI argument parsing and command dispatch.
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use semver_analyzer_core::cli::DiffArgs;
+use semver_analyzer_ts::cli::{TsAnalyzeArgs, TsExtractArgs, TsKonveyorArgs};
 
 /// Semantic Breaking Change Analyzer
 ///
@@ -16,157 +17,51 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Full pipeline: extract -> diff -> impact -> behavioral analysis.
+    Analyze {
+        #[command(subcommand)]
+        language: AnalyzeLanguage,
+    },
+
     /// Extract API surface from source code at a specific ref.
     Extract {
-        /// Path to the git repository.
-        #[arg(long)]
-        repo: PathBuf,
-
-        /// Git ref (tag, branch, or commit SHA) to extract from.
-        #[arg(long, name = "ref")]
-        git_ref: String,
-
-        /// Output file path (writes JSON). Defaults to stdout.
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-
-        /// Custom build command to run instead of `tsc --declaration`.
-        /// Use for projects that require custom generation steps before tsc.
-        /// Example: --build-command "yarn build"
-        #[arg(long)]
-        build_command: Option<String>,
+        #[command(subcommand)]
+        language: ExtractLanguage,
     },
 
     /// Compare two API surfaces and identify structural changes.
-    Diff {
-        /// Path to the "from" API surface JSON file.
-        #[arg(long)]
-        from: PathBuf,
-
-        /// Path to the "to" API surface JSON file.
-        #[arg(long)]
-        to: PathBuf,
-
-        /// Output file path (writes JSON). Defaults to stdout.
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
-
-    /// Full pipeline: extract -> diff -> impact -> behavioral analysis.
-    Analyze {
-        /// Path to the git repository.
-        #[arg(long)]
-        repo: PathBuf,
-
-        /// Git ref to compare from (the "old" version).
-        #[arg(long)]
-        from: String,
-
-        /// Git ref to compare to (the "new" version).
-        #[arg(long)]
-        to: String,
-
-        /// Output file path (writes JSON). Defaults to stdout.
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-
-        /// Skip LLM-based behavioral analysis (static analysis only).
-        #[arg(long)]
-        no_llm: bool,
-
-        /// Command to invoke for LLM analysis.
-        /// The prompt is passed as the final argument.
-        /// Examples:
-        ///   --llm-command "goose run --no-session -q -t"
-        ///   --llm-command "opencode run"
-        #[arg(long)]
-        llm_command: Option<String>,
-
-        /// Maximum LLM cost in USD before circuit breaker triggers.
-        #[arg(long, default_value = "5.0")]
-        max_llm_cost: f64,
-
-        /// Custom build command to run instead of `tsc --declaration`.
-        /// Use for projects that require custom generation steps before tsc.
-        /// Example: --build-command "yarn build"
-        #[arg(long)]
-        build_command: Option<String>,
-
-        /// Send ALL files with changed exported functions to the LLM,
-        /// not just files that have associated test changes. By default,
-        /// only files whose tests also changed are sent to the LLM
-        /// (much faster and cheaper).
-        #[arg(long)]
-        llm_all_files: bool,
-    },
+    ///
+    /// This command is language-agnostic — it compares two JSON surface
+    /// files using minimal semantics (no language-specific rules).
+    Diff(DiffArgs),
 
     /// Generate Konveyor analyzer rules from breaking change analysis.
-    ///
-    /// Can either run the full analysis pipeline internally or accept
-    /// a pre-existing AnalysisReport JSON file.
     Konveyor {
-        /// Path to a pre-existing AnalysisReport JSON file.
-        /// Mutually exclusive with --repo/--from/--to.
-        #[arg(long, conflicts_with_all = ["repo", "from", "to"])]
-        from_report: Option<PathBuf>,
-
-        /// Path to the git repository (runs full analysis pipeline).
-        #[arg(long, required_unless_present = "from_report")]
-        repo: Option<PathBuf>,
-
-        /// Git ref to compare from (the "old" version).
-        #[arg(long, required_unless_present = "from_report")]
-        from: Option<String>,
-
-        /// Git ref to compare to (the "new" version).
-        #[arg(long, required_unless_present = "from_report")]
-        to: Option<String>,
-
-        /// Output directory for the generated ruleset.
-        #[arg(long)]
-        output_dir: PathBuf,
-
-        /// File glob pattern for filecontent rules.
-        /// Determines which files Konveyor will scan for violations.
-        #[arg(long, default_value = "*.{ts,tsx,js,jsx,mjs,cjs}")]
-        file_pattern: String,
-
-        /// Name for the generated ruleset.
-        #[arg(long, default_value = "semver-breaking-changes")]
-        ruleset_name: String,
-
-        /// Skip LLM-based behavioral analysis (static analysis only).
-        /// Only used when running analysis internally (--repo mode).
-        #[arg(long)]
-        no_llm: bool,
-
-        /// Command to invoke for LLM analysis.
-        #[arg(long)]
-        llm_command: Option<String>,
-
-        /// Maximum LLM cost in USD before circuit breaker triggers.
-        #[arg(long, default_value = "5.0")]
-        max_llm_cost: f64,
-
-        /// Custom build command to run instead of `tsc --declaration`.
-        #[arg(long)]
-        build_command: Option<String>,
-
-        /// Send ALL files with changed exported functions to the LLM.
-        #[arg(long)]
-        llm_all_files: bool,
-
-        /// Disable rule consolidation (keep one rule per declaration change).
-        #[arg(long)]
-        no_consolidate: bool,
-
-        /// Path to a YAML file with regex-based rename patterns.
-        /// Used to map removed symbols to their replacements via regex
-        /// substitution (e.g., PaddingTop → PaddingBlockStart).
-        #[arg(long)]
-        rename_patterns: Option<PathBuf>,
+        #[command(subcommand)]
+        language: KonveyorLanguage,
     },
 
     /// Start as an MCP server (stdio transport).
     Serve,
+}
+
+/// Language-specific subcommands for the `analyze` action.
+#[derive(Subcommand, Debug)]
+pub enum AnalyzeLanguage {
+    /// Analyze a TypeScript/JavaScript project.
+    Typescript(TsAnalyzeArgs),
+}
+
+/// Language-specific subcommands for the `extract` action.
+#[derive(Subcommand, Debug)]
+pub enum ExtractLanguage {
+    /// Extract API surface from a TypeScript/JavaScript project.
+    Typescript(TsExtractArgs),
+}
+
+/// Language-specific subcommands for the `konveyor` action.
+#[derive(Subcommand, Debug)]
+pub enum KonveyorLanguage {
+    /// Generate Konveyor rules for a TypeScript/JavaScript project.
+    Typescript(TsKonveyorArgs),
 }

@@ -6,6 +6,7 @@
 //! - Traits for language-pluggable analysis (`Language`, `LanguageSemantics`, etc.)
 //! - The structural diff engine (`diff_surfaces_with_semantics`)
 
+pub mod cli;
 pub mod diff;
 pub mod shared;
 pub mod traits;

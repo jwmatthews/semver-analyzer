@@ -8,6 +8,7 @@
 
 pub mod call_graph;
 pub mod canon;
+pub mod cli;
 pub mod css_scan;
 pub mod diff_parser;
 pub mod extract;

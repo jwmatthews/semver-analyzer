@@ -933,6 +933,7 @@ name = "semver-analyzer-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "dashmap",
  "serde",
  "serde_json",
@@ -969,6 +970,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "clap",
  "insta",
  "oxc_allocator",
  "oxc_ast",
