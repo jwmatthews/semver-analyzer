@@ -15,7 +15,7 @@ use crate::{TsCategory, TsManifestChangeType, TypeScript};
 use semver_analyzer_core::{
     AnalysisReport, ApiChange, ApiChangeKind, ApiChangeType, BehavioralChange,
     ChildComponentStatus, ComponentStatus, ComponentSummary, FileChanges, ManifestChange,
-    MigratedProp, RemovalDisposition, RemovedProperty,
+    MigratedMember, RemovalDisposition, RemovedMember,
 };
 
 // Re-export shared types from konveyor-core so downstream users can access them.
@@ -438,8 +438,8 @@ fn build_migration_message_legacy(
 
 fn build_migration_message_v2(comp: &ComponentSummary<TypeScript>) -> String {
     let component_name = &comp.name;
-    let removal_count = comp.property_summary.removed;
-    let total = comp.property_summary.total;
+    let removal_count = comp.member_summary.removed;
+    let total = comp.member_summary.total;
 
     let mut msg = String::new();
 
@@ -499,9 +499,9 @@ fn build_migration_message_v2(comp: &ComponentSummary<TypeScript>) -> String {
             component_name, removal_count, total, component_name,
         ));
 
-        if !comp.removed_properties.is_empty() {
+        if !comp.removed_members.is_empty() {
             msg.push_str("Removed props (move to child components):\n");
-            for prop in &comp.removed_properties {
+            for prop in &comp.removed_members {
                 msg.push_str(&format!("  - {}\n", prop.name));
             }
             msg.push('\n');
@@ -512,7 +512,7 @@ fn build_migration_message_v2(comp: &ComponentSummary<TypeScript>) -> String {
             if !comp.child_components.is_empty() {
                 // Build a map of prop → disposition for quick lookup
                 let prop_dispositions: HashMap<&str, &RemovalDisposition> = comp
-                    .removed_properties
+                    .removed_members
                     .iter()
                     .filter_map(|rp| {
                         rp.removal_disposition
@@ -525,21 +525,21 @@ fn build_migration_message_v2(comp: &ComponentSummary<TypeScript>) -> String {
                 msg.push_str(component_name);
                 msg.push_str(">:\n");
                 for child in &comp.child_components {
-                    if !child.absorbed_props.is_empty() {
+                    if !child.absorbed_members.is_empty() {
                         // Separate props by mechanism: named prop vs children
                         let mut as_props = Vec::new();
                         let mut as_children = Vec::new();
-                        for prop_name in &child.absorbed_props {
+                        for prop_name in &child.absorbed_members {
                             match prop_dispositions.get(prop_name.as_str()) {
-                                Some(RemovalDisposition::MovedToChild { mechanism, .. })
-                                    if mechanism == "children" =>
-                                {
+                                Some(RemovalDisposition::MovedToRelatedType {
+                                    mechanism, ..
+                                }) if mechanism == "children" => {
                                     as_children.push(prop_name.as_str());
                                 }
                                 _ => {
                                     // Default: if the child has this as a named prop, it's a prop;
                                     // otherwise it's likely children
-                                    if child.known_props.contains(prop_name) {
+                                    if child.known_members.contains(prop_name) {
                                         as_props.push(prop_name.as_str());
                                     } else {
                                         as_children.push(prop_name.as_str());
@@ -567,10 +567,10 @@ fn build_migration_message_v2(comp: &ComponentSummary<TypeScript>) -> String {
                 let absorbed: HashSet<&str> = comp
                     .child_components
                     .iter()
-                    .flat_map(|c| c.absorbed_props.iter().map(|s| s.as_str()))
+                    .flat_map(|c| c.absorbed_members.iter().map(|s| s.as_str()))
                     .collect();
                 let unmapped: Vec<&str> = comp
-                    .removed_properties
+                    .removed_members
                     .iter()
                     .map(|rp| rp.name.as_str())
                     .filter(|n| !absorbed.contains(n))
@@ -724,9 +724,9 @@ pub fn generate_rules(
     let composition_required_components: HashSet<String> = report
         .changes
         .iter()
-        .flat_map(|fc| &fc.composition_pattern_changes)
-        .filter(|c| c.new_parent.is_some())
-        .map(|c| c.component.clone())
+        .flat_map(|fc| &fc.container_changes)
+        .filter(|c| c.new_container.is_some())
+        .map(|c| c.symbol.clone())
         .collect();
 
     // ── Pre-scan: consolidate children→prop composition patterns ─────────
@@ -758,12 +758,12 @@ pub fn generate_rules(
         let file_str = file_changes.file.to_string_lossy();
         let from_pkg = resolve_npm_package(&file_str, pkg_cache);
 
-        for comp_change in &file_changes.composition_pattern_changes {
-            let (old_parent, new_parent) = match (&comp_change.old_parent, &comp_change.new_parent)
-            {
-                (Some(old), Some(new)) => (old.as_str(), new.as_str()),
-                _ => continue,
-            };
+        for comp_change in &file_changes.container_changes {
+            let (old_parent, new_parent) =
+                match (&comp_change.old_container, &comp_change.new_container) {
+                    (Some(old), Some(new)) => (old.as_str(), new.as_str()),
+                    _ => continue,
+                };
 
             // Extract parent component names from the AST data.
             // old_parent/new_parent may have context qualifiers added by
@@ -800,13 +800,13 @@ pub fn generate_rules(
                     from_pkg: from_pkg.clone(),
                 });
             // Deduplicate child component names
-            let child = &comp_change.component;
+            let child = &comp_change.symbol;
             if !entry.child_components.iter().any(|c| c == child) {
                 entry.child_components.push(child.clone());
             }
 
             // Mark this composition change for skipping in the per-child loop
-            let dedup_key = format!("{}|{}|{}", comp_change.component, old_parent, new_parent,);
+            let dedup_key = format!("{}|{}|{}", comp_change.symbol, old_parent, new_parent,);
             consolidated_composition_keys.insert(dedup_key);
         }
     }
@@ -929,19 +929,18 @@ pub fn generate_rules(
     let mut covered_props: HashSet<(String, String)> = HashSet::new();
 
     for pkg in &report.packages {
-        for comp in &pkg.components {
+        for comp in &pkg.type_summaries {
             let qualifies = comp.status == ComponentStatus::Removed
-                || (comp.property_summary.removed >= 3
-                    && comp.property_summary.removal_ratio > 0.5)
-                || comp.property_summary.removed >= 5;
+                || (comp.member_summary.removed >= 3 && comp.member_summary.removal_ratio > 0.5)
+                || comp.member_summary.removed >= 5;
             if !qualifies {
                 continue;
             }
             covered_components.insert(comp.name.clone());
-            covered_components.insert(comp.interface_name.clone());
+            covered_components.insert(comp.definition_name.clone());
             // Mark all removed props as covered
-            for rp in &comp.removed_properties {
-                covered_props.insert((comp.interface_name.clone(), rp.name.clone()));
+            for rp in &comp.removed_members {
+                covered_props.insert((comp.definition_name.clone(), rp.name.clone()));
                 covered_props.insert((comp.name.clone(), rp.name.clone()));
             }
         }
@@ -966,10 +965,10 @@ pub fn generate_rules(
         .packages
         .iter()
         .flat_map(|pkg| {
-            pkg.components.iter().flat_map(|comp| {
+            pkg.type_summaries.iter().flat_map(|comp| {
                 // Include both the component name and interface name
                 std::iter::once(comp.name.as_str())
-                    .chain(std::iter::once(comp.interface_name.as_str()))
+                    .chain(std::iter::once(comp.definition_name.as_str()))
             })
         })
         .collect();
@@ -1169,7 +1168,6 @@ pub fn generate_rules(
             let new_rules = api_change_to_rules(
                 api_change,
                 file_changes,
-                file_pattern,
                 from_pkg.as_deref(),
                 &mut id_counts,
                 rename_patterns,
@@ -1228,15 +1226,15 @@ pub fn generate_rules(
         // changes (nesting restructures like MastheadToggle moving from
         // Masthead to MastheadMain) get individual rules with fixed `parent`
         // regex patterns (bare component name, not LLM descriptive text).
-        for comp_change in &file_changes.composition_pattern_changes {
-            let component = &comp_change.component;
+        for comp_change in &file_changes.container_changes {
+            let component = &comp_change.symbol;
 
             // Skip duplicates
             let dedup_key = format!(
                 "{}|{}|{}",
                 component,
-                comp_change.old_parent.as_deref().unwrap_or(""),
-                comp_change.new_parent.as_deref().unwrap_or("")
+                comp_change.old_container.as_deref().unwrap_or(""),
+                comp_change.new_container.as_deref().unwrap_or("")
             );
             if seen_composition_keys.contains(&dedup_key) {
                 continue;
@@ -1260,11 +1258,11 @@ pub fn generate_rules(
             // Extract bare component names from old_parent/new_parent for
             // the rule message (strip LLM context qualifiers).
             let old_parent_name = comp_change
-                .old_parent
+                .old_container
                 .as_deref()
                 .map(|p| p.split(" (").next().unwrap_or(p).trim());
             let new_parent_name = comp_change
-                .new_parent
+                .new_container
                 .as_deref()
                 .map(|p| p.split(" (").next().unwrap_or(p).trim());
 
@@ -1310,12 +1308,12 @@ pub fn generate_rules(
 
             // Use bare component name for the parent regex so it matches
             // actual JSX parent names (not LLM descriptive text).
-            let parent_regex = comp_change.old_parent.as_deref().map(|p| {
+            let parent_regex = comp_change.old_container.as_deref().map(|p| {
                 let bare = p.split(" (").next().unwrap_or(p).trim();
                 format!("^{}$", regex_escape(bare))
             });
 
-            let condition = if comp_change.new_parent.is_some() {
+            let condition = if comp_change.new_container.is_some() {
                 KonveyorCondition::FrontendReferenced {
                     referenced: FrontendReferencedFields {
                         pattern: format!("^{}$", component),
@@ -1392,12 +1390,15 @@ pub fn generate_rules(
         );
     }
     {
-        let has_package_components = report.packages.iter().any(|pkg| !pkg.components.is_empty());
+        let has_package_components = report
+            .packages
+            .iter()
+            .any(|pkg| !pkg.type_summaries.is_empty());
 
         if has_package_components {
             // V2 path: read from pre-aggregated ComponentSummary data
             for pkg in &report.packages {
-                for comp in &pkg.components {
+                for comp in &pkg.type_summaries {
                     // A component qualifies for a P0-C rule if:
                     // - it was fully removed, OR
                     // - it has many props removed (>50% ratio), OR
@@ -1405,9 +1406,9 @@ pub fn generate_rules(
                     //   significant restructuring even if total prop count is large
                     //   (e.g., Modal: 11 of 28 props removed = composition change)
                     let qualifies = comp.status == ComponentStatus::Removed
-                        || (comp.property_summary.removed >= 3
-                            && comp.property_summary.removal_ratio > 0.5)
-                        || comp.property_summary.removed >= 5;
+                        || (comp.member_summary.removed >= 3
+                            && comp.member_summary.removal_ratio > 0.5)
+                        || comp.member_summary.removed >= 5;
 
                     if !qualifies {
                         continue;
@@ -1444,9 +1445,7 @@ pub fn generate_rules(
                         category: "mandatory".to_string(),
                         description: format!(
                             "{} has significant breaking changes — {} of {} props removed",
-                            component_name,
-                            comp.property_summary.removed,
-                            comp.property_summary.total
+                            component_name, comp.member_summary.removed, comp.member_summary.total
                         ),
                         message,
                         links: Vec::new(),
@@ -1962,7 +1961,7 @@ pub fn generate_rules(
     // Legacy path: scan added_files + behavioral descriptions.
     {
         let has_child_components = report.packages.iter().any(|pkg| {
-            pkg.components
+            pkg.type_summaries
                 .iter()
                 .any(|comp| !comp.child_components.is_empty())
         });
@@ -1970,7 +1969,7 @@ pub fn generate_rules(
         if has_child_components {
             // V2 path: read from pre-aggregated child_components
             for pkg in &report.packages {
-                for comp in &pkg.components {
+                for comp in &pkg.type_summaries {
                     for child in &comp.child_components {
                         if child.status != ChildComponentStatus::Added {
                             continue;
@@ -1985,11 +1984,11 @@ pub fn generate_rules(
                         );
 
                         // Build prop migration instructions from AST data
-                        if !child.absorbed_props.is_empty() {
+                        if !child.absorbed_members.is_empty() {
                             // Categorize absorbed props by mechanism using
                             // the parent's removal_disposition data
                             let prop_dispositions: HashMap<&str, &RemovalDisposition> = comp
-                                .removed_properties
+                                .removed_members
                                 .iter()
                                 .filter_map(|rp| {
                                     rp.removal_disposition
@@ -2001,15 +2000,16 @@ pub fn generate_rules(
                             let mut as_props = Vec::new();
                             let mut as_children = Vec::new();
 
-                            for prop_name in &child.absorbed_props {
+                            for prop_name in &child.absorbed_members {
                                 match prop_dispositions.get(prop_name.as_str()) {
-                                    Some(RemovalDisposition::MovedToChild {
-                                        mechanism, ..
+                                    Some(RemovalDisposition::MovedToRelatedType {
+                                        mechanism,
+                                        ..
                                     }) if mechanism == "children" => {
                                         as_children.push(prop_name.as_str());
                                     }
                                     _ => {
-                                        if child.known_props.contains(prop_name) {
+                                        if child.known_members.contains(prop_name) {
                                             as_props.push(prop_name.as_str());
                                         } else {
                                             as_children.push(prop_name.as_str());
@@ -2061,7 +2061,7 @@ pub fn generate_rules(
                         // Truly optional new-siblings (no absorbed props, not
                         // composition-required) are skipped — they add noise and
                         // the fix engine may apply them unnecessarily.
-                        let is_mandatory = !child.absorbed_props.is_empty()
+                        let is_mandatory = !child.absorbed_members.is_empty()
                             || composition_required_components.contains(new_component);
                         if !is_mandatory {
                             eprintln!(
@@ -2280,11 +2280,11 @@ pub fn generate_rules(
         let comp_summary = report
             .packages
             .iter()
-            .flat_map(|pkg| &pkg.components)
+            .flat_map(|pkg| &pkg.type_summaries)
             .find(|c| c.name == *component);
 
-        let removed_props: Vec<&RemovedProperty> = comp_summary
-            .map(|c| c.removed_properties.iter().collect())
+        let removed_props: Vec<&RemovedMember> = comp_summary
+            .map(|c| c.removed_members.iter().collect())
             .unwrap_or_default();
 
         let behavioral_changes: Vec<&BehavioralChange<TypeScript>> = comp_summary
@@ -2296,7 +2296,7 @@ pub fn generate_rules(
             })
             .unwrap_or_default();
 
-        let prop_summary = comp_summary.map(|c| &c.property_summary);
+        let prop_summary = comp_summary.map(|c| &c.member_summary);
 
         let base_id = format!(
             "semver-hierarchy-{}-composition-changed",
@@ -2336,8 +2336,8 @@ pub fn generate_rules(
                 // The prop instructions convey what needs to happen.
 
                 // Find props that migrated to this child
-                let child_migrated: Vec<&MigratedProp> = delta
-                    .migrated_props
+                let child_migrated: Vec<&MigratedMember> = delta
+                    .migrated_members
                     .iter()
                     .filter(|mp| mp.target_child == child.name)
                     .collect();
@@ -2346,12 +2346,12 @@ pub fn generate_rules(
                 let disposition_props: Vec<(&str, &str)> = removed_props
                     .iter()
                     .filter_map(|rp| {
-                        if let Some(RemovalDisposition::MovedToChild {
-                            target_component,
+                        if let Some(RemovalDisposition::MovedToRelatedType {
+                            target_type,
                             mechanism,
                         }) = &rp.removal_disposition
                         {
-                            if target_component == &child.name {
+                            if target_type == &child.name {
                                 Some((rp.name.as_str(), mechanism.as_str()))
                             } else {
                                 None
@@ -2384,11 +2384,11 @@ pub fn generate_rules(
 
                 // Props from hierarchy migrated_props (name match)
                 for mp in &child_migrated {
-                    if seen_props.insert(mp.prop_name.clone()) {
-                        if let Some(ref target_name) = mp.target_prop_name {
-                            prop_instructions.push(format!("{} → {}", mp.prop_name, target_name));
+                    if seen_props.insert(mp.member_name.clone()) {
+                        if let Some(ref target_name) = mp.target_member_name {
+                            prop_instructions.push(format!("{} → {}", mp.member_name, target_name));
                         } else {
-                            prop_instructions.push(format!("pass {} as prop", mp.prop_name));
+                            prop_instructions.push(format!("pass {} as prop", mp.member_name));
                         }
                     }
                 }
@@ -2427,7 +2427,7 @@ pub fn generate_rules(
                 if let Some(child_cs) = report
                     .packages
                     .iter()
-                    .flat_map(|pkg| &pkg.components)
+                    .flat_map(|pkg| &pkg.type_summaries)
                     .find(|c| c.name == child.name)
                 {
                     for bc in &child_cs.behavioral_changes {
@@ -2478,7 +2478,7 @@ pub fn generate_rules(
                 let child_summary = report
                     .packages
                     .iter()
-                    .flat_map(|pkg| &pkg.components)
+                    .flat_map(|pkg| &pkg.type_summaries)
                     .find(|c| c.name == *child_name && c.status == ComponentStatus::Removed);
 
                 if let Some(child_cs) = child_summary {
@@ -2523,11 +2523,12 @@ pub fn generate_rules(
 
         // List remaining removed props not covered by child migration
         let migrated_prop_names: BTreeSet<String> = delta
-            .migrated_props
+            .migrated_members
             .iter()
-            .map(|mp| mp.prop_name.clone())
+            .map(|mp| mp.member_name.clone())
             .chain(removed_props.iter().filter_map(|rp| {
-                if let Some(RemovalDisposition::MovedToChild { .. }) = &rp.removal_disposition {
+                if let Some(RemovalDisposition::MovedToRelatedType { .. }) = &rp.removal_disposition
+                {
                     Some(rp.name.clone())
                 } else {
                     None
@@ -2535,7 +2536,7 @@ pub fn generate_rules(
             }))
             .collect();
 
-        let uncovered_removed: Vec<&&RemovedProperty> = removed_props
+        let uncovered_removed: Vec<&&RemovedMember> = removed_props
             .iter()
             .filter(|rp| !migrated_prop_names.contains(&rp.name))
             .collect();
@@ -2544,8 +2545,8 @@ pub fn generate_rules(
             msg.push_str("Other removed props:\n");
             for rp in &uncovered_removed {
                 let disposition_hint = match &rp.removal_disposition {
-                    Some(RemovalDisposition::ReplacedByProp { new_prop }) => {
-                        format!(" → use '{}' instead", new_prop)
+                    Some(RemovalDisposition::ReplacedByMember { new_member }) => {
+                        format!(" → use '{}' instead", new_member)
                     }
                     Some(RemovalDisposition::MadeAutomatic) => " (now automatic)".to_string(),
                     Some(RemovalDisposition::TrulyRemoved) => {
@@ -2575,14 +2576,14 @@ pub fn generate_rules(
             for child in expected_children {
                 // Show absorbed props on the child element
                 let child_props: Vec<String> = delta
-                    .migrated_props
+                    .migrated_members
                     .iter()
                     .filter(|mp| mp.target_child == child.name)
                     .map(|mp| {
-                        if let Some(ref tn) = mp.target_prop_name {
+                        if let Some(ref tn) = mp.target_member_name {
                             format!("{}={{...}}", tn)
                         } else {
-                            format!("{}={{...}}", mp.prop_name)
+                            format!("{}={{...}}", mp.member_name)
                         }
                     })
                     .collect();
@@ -2605,15 +2606,15 @@ pub fn generate_rules(
         let from_pkg = report
             .packages
             .iter()
-            .find(|pkg| pkg.components.iter().any(|c| c.name == *component))
+            .find(|pkg| pkg.type_summaries.iter().any(|c| c.name == *component))
             .map(|pkg| pkg.name.clone());
 
         // Track components covered by hierarchy rules for prop/behavioral dedup
         covered_components.insert(component.clone());
         if let Some(cs) = comp_summary {
-            covered_components.insert(cs.interface_name.clone());
-            for rp in &cs.removed_properties {
-                covered_props.insert((cs.interface_name.clone(), rp.name.clone()));
+            covered_components.insert(cs.definition_name.clone());
+            for rp in &cs.removed_members {
+                covered_props.insert((cs.definition_name.clone(), rp.name.clone()));
                 covered_props.insert((cs.name.clone(), rp.name.clone()));
             }
         }
@@ -3000,7 +3001,7 @@ pub fn generate_conformance_rules(report: &AnalysisReport<TypeScript>) -> Vec<Ko
         .collect();
 
     for pkg in &report.packages {
-        for comp in &pkg.components {
+        for comp in &pkg.type_summaries {
             if comp.expected_children.is_empty() {
                 continue;
             }
@@ -3288,7 +3289,6 @@ pub fn write_ruleset_dir(
 fn api_change_to_rules(
     change: &ApiChange,
     file_changes: &FileChanges<TypeScript>,
-    file_pattern: &str,
     from_pkg: Option<&str>,
     id_counts: &mut HashMap<String, usize>,
     rename_patterns: &RenamePatterns,
@@ -3399,7 +3399,7 @@ fn api_change_to_rules(
         ApiChangeType::Renamed | ApiChangeType::SignatureChanged | ApiChangeType::TypeChanged
     ) || matches!(
         change.removal_disposition,
-        Some(RemovalDisposition::ReplacedByProp { .. })
+        Some(RemovalDisposition::ReplacedByMember { .. })
     );
     labels.push(format!("has-codemod={}", has_codemod));
 
@@ -4364,7 +4364,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -4406,10 +4406,10 @@ mod tests {
                 source_file: Some("src/api/users.ts".to_string()),
                 confidence: None,
                 evidence_type: None,
-                referenced_components: vec![],
+                referenced_symbols: vec![],
                 is_internal_only: None,
             }],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -4530,7 +4530,7 @@ mod tests {
                 },
             ],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -4606,7 +4606,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -4646,7 +4646,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -4689,7 +4689,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -4730,7 +4730,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -4772,10 +4772,10 @@ mod tests {
                 source_file: Some("src/auth.ts".to_string()),
                 confidence: None,
                 evidence_type: None,
-                referenced_components: vec![],
+                referenced_symbols: vec![],
                 is_internal_only: None,
             }],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -4867,10 +4867,10 @@ mod tests {
                 source_file: Some("src/lib.ts".to_string()),
                 confidence: None,
                 evidence_type: None,
-                referenced_components: vec![],
+                referenced_symbols: vec![],
                 is_internal_only: None,
             }],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -4922,7 +4922,7 @@ mod tests {
                 },
             ],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let manifest = vec![ManifestChange {
@@ -4979,7 +4979,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5020,7 +5020,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5066,7 +5066,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5103,7 +5103,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -5155,7 +5155,7 @@ mod tests {
             renamed_from: None,
             breaking_api_changes: api,
             breaking_behavioral_changes: behavioral,
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }
     }
 
@@ -5172,7 +5172,7 @@ mod tests {
             source_file: None,
             confidence: None,
             evidence_type: None,
-            referenced_components: vec![],
+            referenced_symbols: vec![],
             is_internal_only: None,
         }
     }
@@ -5836,8 +5836,10 @@ mod tests {
                         removed_symbol: "EmptyStateHeaderProps".to_string(),
                         removed_qualified_name: "EmptyStateHeader.EmptyStateHeaderProps"
                             .to_string(),
+                        removed_package: None,
                         replacement_symbol: "EmptyStateProps".to_string(),
                         replacement_qualified_name: "EmptyState.EmptyStateProps".to_string(),
+                        replacement_package: None,
                         matching_members: vec![
                             MemberMapping {
                                 old_name: "titleText".to_string(),
@@ -6994,7 +6996,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -7052,11 +7054,11 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: Some("5.0.0".to_string()),
             new_version: Some("6.0.0".to_string()),
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Modal".to_string(),
-                interface_name: "ModalProps".to_string(),
+                definition_name: "ModalProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary {
+                member_summary: MemberSummary {
                     total: 14,
                     removed: 10,
                     renamed: 0,
@@ -7064,8 +7066,8 @@ mod tests {
                     added: 0,
                     removal_ratio: 10.0 / 14.0,
                 },
-                removed_properties: (0..10)
-                    .map(|i| RemovedProperty {
+                removed_members: (0..10)
+                    .map(|i| RemovedMember {
                         name: format!("prop{}", i),
                         old_type: None,
                         removal_disposition: None,
@@ -7085,7 +7087,7 @@ mod tests {
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         let rules = generate_rules(
@@ -7154,11 +7156,11 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Button".to_string(),
-                interface_name: "ButtonProps".to_string(),
+                definition_name: "ButtonProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary {
+                member_summary: MemberSummary {
                     total: 10,
                     removed: 1,
                     renamed: 0,
@@ -7166,7 +7168,7 @@ mod tests {
                     added: 0,
                     removal_ratio: 0.1,
                 },
-                removed_properties: vec![RemovedProperty {
+                removed_members: vec![RemovedMember {
                     name: "isActive".to_string(),
                     old_type: None,
                     removal_disposition: None,
@@ -7179,7 +7181,7 @@ mod tests {
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         let rules = generate_rules(
@@ -7231,11 +7233,11 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "MastheadBrand".to_string(),
-                interface_name: "MastheadBrandProps".to_string(),
+                definition_name: "MastheadBrandProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary {
+                member_summary: MemberSummary {
                     total: 5,
                     removed: 1,
                     renamed: 0,
@@ -7243,7 +7245,7 @@ mod tests {
                     added: 0,
                     removal_ratio: 0.2,
                 },
-                removed_properties: vec![RemovedProperty {
+                removed_members: vec![RemovedMember {
                     name: "component".to_string(),
                     old_type: None,
                     removal_disposition: None,
@@ -7254,14 +7256,14 @@ mod tests {
                 child_components: vec![ChildComponent {
                     name: "MastheadLogo".to_string(),
                     status: ChildComponentStatus::Added,
-                    known_props: vec!["href".to_string()],
-                    absorbed_props: vec![],
+                    known_members: vec!["href".to_string()],
+                    absorbed_members: vec![],
                 }],
                 expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         let rules = generate_rules(
@@ -7304,11 +7306,11 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Modal".to_string(),
-                interface_name: "ModalProps".to_string(),
+                definition_name: "ModalProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary {
+                member_summary: MemberSummary {
                     total: 20,
                     removed: 1,
                     renamed: 0,
@@ -7316,7 +7318,7 @@ mod tests {
                     added: 0,
                     removal_ratio: 0.05,
                 },
-                removed_properties: vec![RemovedProperty {
+                removed_members: vec![RemovedMember {
                     name: "title".to_string(),
                     old_type: None,
                     removal_disposition: None,
@@ -7327,14 +7329,14 @@ mod tests {
                 child_components: vec![ChildComponent {
                     name: "ModalHeader".to_string(),
                     status: ChildComponentStatus::Added,
-                    known_props: vec!["title".to_string()],
-                    absorbed_props: vec!["title".to_string()],
+                    known_members: vec!["title".to_string()],
+                    absorbed_members: vec!["title".to_string()],
                 }],
                 expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         let rules = generate_rules(
@@ -7379,26 +7381,26 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Modal".to_string(),
-                interface_name: "ModalProps".to_string(),
+                definition_name: "ModalProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary::default(),
-                removed_properties: vec![],
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
                 child_components: vec![ChildComponent {
                     name: "ModalHeader".to_string(),
                     status: ChildComponentStatus::Modified, // Not Added
-                    known_props: vec![],
-                    absorbed_props: vec![],
+                    known_members: vec![],
+                    absorbed_members: vec![],
                 }],
                 expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         let rules = generate_rules(
@@ -7439,11 +7441,11 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "EmptyStateHeader".to_string(),
-                interface_name: "EmptyStateHeaderProps".to_string(),
+                definition_name: "EmptyStateHeaderProps".to_string(),
                 status: ComponentStatus::Removed,
-                property_summary: PropertySummary {
+                member_summary: MemberSummary {
                     total: 5,
                     removed: 5,
                     renamed: 0,
@@ -7451,7 +7453,7 @@ mod tests {
                     added: 0,
                     removal_ratio: 1.0,
                 },
-                removed_properties: vec![],
+                removed_members: vec![],
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
@@ -7460,7 +7462,7 @@ mod tests {
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         let rules = generate_rules(
@@ -7494,9 +7496,9 @@ mod tests {
     fn test_build_migration_message_v2_with_migration_target() {
         let comp = ComponentSummary {
             name: "EmptyStateHeader".to_string(),
-            interface_name: "EmptyStateHeaderProps".to_string(),
+            definition_name: "EmptyStateHeaderProps".to_string(),
             status: ComponentStatus::Removed,
-            property_summary: PropertySummary {
+            member_summary: MemberSummary {
                 total: 5,
                 removed: 5,
                 renamed: 0,
@@ -7504,13 +7506,15 @@ mod tests {
                 added: 0,
                 removal_ratio: 1.0,
             },
-            removed_properties: vec![],
+            removed_members: vec![],
             type_changes: vec![],
             migration_target: Some(MigrationTarget {
                 removed_symbol: "EmptyStateHeaderProps".to_string(),
                 removed_qualified_name: "EmptyStateHeader.EmptyStateHeaderProps".to_string(),
+                removed_package: None,
                 replacement_symbol: "EmptyStateProps".to_string(),
                 replacement_qualified_name: "EmptyState.EmptyStateProps".to_string(),
+                replacement_package: None,
                 matching_members: vec![
                     MemberMapping {
                         old_name: "titleText".to_string(),
@@ -7564,9 +7568,9 @@ mod tests {
     fn test_build_migration_message_v2_restructured_with_children() {
         let comp = ComponentSummary {
             name: "Modal".to_string(),
-            interface_name: "ModalProps".to_string(),
+            definition_name: "ModalProps".to_string(),
             status: ComponentStatus::Modified,
-            property_summary: PropertySummary {
+            member_summary: MemberSummary {
                 total: 14,
                 removed: 10,
                 renamed: 0,
@@ -7574,13 +7578,13 @@ mod tests {
                 added: 0,
                 removal_ratio: 10.0 / 14.0,
             },
-            removed_properties: vec![
-                RemovedProperty {
+            removed_members: vec![
+                RemovedMember {
                     name: "title".to_string(),
                     old_type: Some("string".to_string()),
                     removal_disposition: None,
                 },
-                RemovedProperty {
+                RemovedMember {
                     name: "actions".to_string(),
                     old_type: None,
                     removal_disposition: None,
@@ -7597,14 +7601,14 @@ mod tests {
                 ChildComponent {
                     name: "ModalHeader".to_string(),
                     status: ChildComponentStatus::Added,
-                    known_props: vec!["title".to_string(), "description".to_string()],
-                    absorbed_props: vec!["title".to_string(), "description".to_string()],
+                    known_members: vec!["title".to_string(), "description".to_string()],
+                    absorbed_members: vec!["title".to_string(), "description".to_string()],
                 },
                 ChildComponent {
                     name: "ModalFooter".to_string(),
                     status: ChildComponentStatus::Added,
-                    known_props: vec![],
-                    absorbed_props: vec![],
+                    known_members: vec![],
+                    absorbed_members: vec![],
                 },
             ],
             expected_children: vec![],
@@ -7658,9 +7662,9 @@ mod tests {
 
         let comp = ComponentSummary {
             name: "Modal".to_string(),
-            interface_name: "ModalProps".to_string(),
+            definition_name: "ModalProps".to_string(),
             status: ComponentStatus::Modified,
-            property_summary: PropertySummary {
+            member_summary: MemberSummary {
                 total: 20,
                 removed: 8,
                 renamed: 0,
@@ -7668,37 +7672,37 @@ mod tests {
                 added: 0,
                 removal_ratio: 8.0 / 20.0,
             },
-            removed_properties: vec![
-                RemovedProperty {
+            removed_members: vec![
+                RemovedMember {
                     name: "title".to_string(),
                     old_type: Some("string".to_string()),
-                    removal_disposition: Some(RemovalDisposition::MovedToChild {
-                        target_component: "ModalHeader".to_string(),
+                    removal_disposition: Some(RemovalDisposition::MovedToRelatedType {
+                        target_type: "ModalHeader".to_string(),
                         mechanism: "prop".to_string(),
                     }),
                 },
-                RemovedProperty {
+                RemovedMember {
                     name: "actions".to_string(),
                     old_type: None,
-                    removal_disposition: Some(RemovalDisposition::MovedToChild {
-                        target_component: "ModalFooter".to_string(),
+                    removal_disposition: Some(RemovalDisposition::MovedToRelatedType {
+                        target_type: "ModalFooter".to_string(),
                         mechanism: "children".to_string(),
                     }),
                 },
-                RemovedProperty {
+                RemovedMember {
                     name: "footer".to_string(),
                     old_type: None,
-                    removal_disposition: Some(RemovalDisposition::MovedToChild {
-                        target_component: "ModalFooter".to_string(),
+                    removal_disposition: Some(RemovalDisposition::MovedToRelatedType {
+                        target_type: "ModalFooter".to_string(),
                         mechanism: "children".to_string(),
                     }),
                 },
-                RemovedProperty {
+                RemovedMember {
                     name: "showClose".to_string(),
                     old_type: None,
                     removal_disposition: Some(RemovalDisposition::TrulyRemoved),
                 },
-                RemovedProperty {
+                RemovedMember {
                     name: "hasNoBodyWrapper".to_string(),
                     old_type: None,
                     removal_disposition: Some(RemovalDisposition::MadeAutomatic),
@@ -7711,14 +7715,14 @@ mod tests {
                 ChildComponent {
                     name: "ModalHeader".to_string(),
                     status: ChildComponentStatus::Added,
-                    known_props: vec!["title".to_string(), "description".to_string()],
-                    absorbed_props: vec!["title".to_string()],
+                    known_members: vec!["title".to_string(), "description".to_string()],
+                    absorbed_members: vec!["title".to_string()],
                 },
                 ChildComponent {
                     name: "ModalFooter".to_string(),
                     status: ChildComponentStatus::Added,
-                    known_props: vec!["children".to_string(), "className".to_string()],
-                    absorbed_props: vec!["actions".to_string(), "footer".to_string()],
+                    known_members: vec!["children".to_string(), "className".to_string()],
+                    absorbed_members: vec!["actions".to_string(), "footer".to_string()],
                 },
             ],
             expected_children: vec![],
@@ -7790,7 +7794,7 @@ mod tests {
                 })
                 .collect(),
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let mut report = make_report(changes, vec![]);
@@ -7798,11 +7802,11 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Modal".to_string(),
-                interface_name: "ModalProps".to_string(),
+                definition_name: "ModalProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary {
+                member_summary: MemberSummary {
                     total: 20,
                     removed: 6,
                     renamed: 0,
@@ -7810,39 +7814,39 @@ mod tests {
                     added: 0,
                     removal_ratio: 6.0 / 20.0,
                 },
-                removed_properties: vec![
-                    RemovedProperty {
+                removed_members: vec![
+                    RemovedMember {
                         name: "title".into(),
                         old_type: None,
-                        removal_disposition: Some(RemovalDisposition::MovedToChild {
-                            target_component: "ModalHeader".into(),
+                        removal_disposition: Some(RemovalDisposition::MovedToRelatedType {
+                            target_type: "ModalHeader".into(),
                             mechanism: "prop".into(),
                         }),
                     },
-                    RemovedProperty {
+                    RemovedMember {
                         name: "actions".into(),
                         old_type: None,
-                        removal_disposition: Some(RemovalDisposition::MovedToChild {
-                            target_component: "ModalFooter".into(),
+                        removal_disposition: Some(RemovalDisposition::MovedToRelatedType {
+                            target_type: "ModalFooter".into(),
                             mechanism: "children".into(),
                         }),
                     },
-                    RemovedProperty {
+                    RemovedMember {
                         name: "footer".into(),
                         old_type: None,
                         removal_disposition: None,
                     },
-                    RemovedProperty {
+                    RemovedMember {
                         name: "description".into(),
                         old_type: None,
                         removal_disposition: None,
                     },
-                    RemovedProperty {
+                    RemovedMember {
                         name: "header".into(),
                         old_type: None,
                         removal_disposition: None,
                     },
-                    RemovedProperty {
+                    RemovedMember {
                         name: "help".into(),
                         old_type: None,
                         removal_disposition: None,
@@ -7855,21 +7859,21 @@ mod tests {
                     ChildComponent {
                         name: "ModalHeader".into(),
                         status: ChildComponentStatus::Added,
-                        known_props: vec!["title".into()],
-                        absorbed_props: vec!["title".into()],
+                        known_members: vec!["title".into()],
+                        absorbed_members: vec!["title".into()],
                     },
                     ChildComponent {
                         name: "ModalFooter".into(),
                         status: ChildComponentStatus::Added,
-                        known_props: vec!["children".into()],
-                        absorbed_props: vec!["actions".into()],
+                        known_members: vec!["children".into()],
+                        absorbed_members: vec!["actions".into()],
                     },
                 ],
                 expected_children: vec![],
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         let rules = generate_rules(
@@ -8006,11 +8010,11 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Menu".to_string(),
-                interface_name: "MenuProps".to_string(),
+                definition_name: "MenuProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary {
+                member_summary: MemberSummary {
                     total: 5,
                     removed: 0,
                     renamed: 0,
@@ -8018,7 +8022,7 @@ mod tests {
                     added: 0,
                     removal_ratio: 0.0,
                 },
-                removed_properties: vec![],
+                removed_members: vec![],
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
@@ -8027,7 +8031,7 @@ mod tests {
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         let rules = generate_rules(
@@ -8219,11 +8223,11 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Menu".to_string(),
-                interface_name: "MenuProps".to_string(),
+                definition_name: "MenuProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary {
+                member_summary: MemberSummary {
                     total: 5,
                     removed: 0,
                     renamed: 0,
@@ -8231,7 +8235,7 @@ mod tests {
                     added: 0,
                     removal_ratio: 0.0,
                 },
-                removed_properties: vec![],
+                removed_members: vec![],
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
@@ -8240,7 +8244,7 @@ mod tests {
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         let rules = generate_rules(
@@ -8305,7 +8309,7 @@ mod tests {
     /// Helper: create a FileChanges with composition pattern changes.
     fn make_composition_changes(
         file: &str,
-        changes: Vec<CompositionPatternChange>,
+        changes: Vec<ContainerChange>,
     ) -> FileChanges<TypeScript> {
         FileChanges {
             file: PathBuf::from(file),
@@ -8313,7 +8317,7 @@ mod tests {
             renamed_from: None,
             breaking_api_changes: vec![],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: changes,
+            container_changes: changes,
         }
     }
 
@@ -8324,16 +8328,16 @@ mod tests {
         let changes = vec![make_composition_changes(
             "packages/react-core/src/components/Button/CloseButton.tsx",
             vec![
-                CompositionPatternChange {
-                    component: "TimesIcon".to_string(),
-                    old_parent: Some("Button (as children)".to_string()),
-                    new_parent: Some("Button (as icon prop)".to_string()),
+                ContainerChange {
+                    symbol: "TimesIcon".to_string(),
+                    old_container: Some("Button (as children)".to_string()),
+                    new_container: Some("Button (as icon prop)".to_string()),
                     description: "TimesIcon moved to icon prop".to_string(),
                 },
-                CompositionPatternChange {
-                    component: "CopyIcon".to_string(),
-                    old_parent: Some("Button (as children)".to_string()),
-                    new_parent: Some("Button (as icon prop)".to_string()),
+                ContainerChange {
+                    symbol: "CopyIcon".to_string(),
+                    old_container: Some("Button (as children)".to_string()),
+                    new_container: Some("Button (as icon prop)".to_string()),
                     description: "CopyIcon moved to icon prop".to_string(),
                 },
             ],
@@ -8414,10 +8418,10 @@ mod tests {
         // (no threshold — always consolidate children→prop patterns).
         let changes = vec![make_composition_changes(
             "packages/react-core/src/components/MenuToggle/MenuToggle.tsx",
-            vec![CompositionPatternChange {
-                component: "EllipsisVIcon".to_string(),
-                old_parent: Some("MenuToggle (as children)".to_string()),
-                new_parent: Some("MenuToggle (as icon prop)".to_string()),
+            vec![ContainerChange {
+                symbol: "EllipsisVIcon".to_string(),
+                old_container: Some("MenuToggle (as children)".to_string()),
+                new_container: Some("MenuToggle (as icon prop)".to_string()),
                 description: "EllipsisVIcon moved to icon prop".to_string(),
             }],
         )];
@@ -8454,10 +8458,10 @@ mod tests {
         // NOT be consolidated — it should remain an individual composition rule.
         let changes = vec![make_composition_changes(
             "packages/react-core/src/components/Masthead/Masthead.tsx",
-            vec![CompositionPatternChange {
-                component: "MastheadToggle".to_string(),
-                old_parent: Some("Masthead".to_string()),
-                new_parent: Some("MastheadMain".to_string()),
+            vec![ContainerChange {
+                symbol: "MastheadToggle".to_string(),
+                old_container: Some("Masthead".to_string()),
+                new_container: Some("MastheadMain".to_string()),
                 description: "MastheadToggle moved from Masthead to MastheadMain".to_string(),
             }],
         )];
@@ -8499,10 +8503,10 @@ mod tests {
         // LLM-generated descriptive text like "Masthead (with display=inline)".
         let changes = vec![make_composition_changes(
             "packages/react-core/src/components/Masthead/Masthead.tsx",
-            vec![CompositionPatternChange {
-                component: "MastheadToggle".to_string(),
-                old_parent: Some("Masthead (with display=inline)".to_string()),
-                new_parent: Some("MastheadMain (inner wrapper)".to_string()),
+            vec![ContainerChange {
+                symbol: "MastheadToggle".to_string(),
+                old_container: Some("Masthead (with display=inline)".to_string()),
+                new_container: Some("MastheadMain (inner wrapper)".to_string()),
                 description: "MastheadToggle restructured".to_string(),
             }],
         )];
@@ -8545,17 +8549,17 @@ mod tests {
             "packages/react-core/src/components/Mixed/Mixed.tsx",
             vec![
                 // children→prop: should be consolidated
-                CompositionPatternChange {
-                    component: "SearchIcon".to_string(),
-                    old_parent: Some("Button (as children)".to_string()),
-                    new_parent: Some("Button (as icon prop)".to_string()),
+                ContainerChange {
+                    symbol: "SearchIcon".to_string(),
+                    old_container: Some("Button (as children)".to_string()),
+                    new_container: Some("Button (as icon prop)".to_string()),
                     description: "SearchIcon moved to icon prop".to_string(),
                 },
                 // nesting restructure: should remain individual
-                CompositionPatternChange {
-                    component: "MastheadToggle".to_string(),
-                    old_parent: Some("Masthead".to_string()),
-                    new_parent: Some("MastheadMain".to_string()),
+                ContainerChange {
+                    symbol: "MastheadToggle".to_string(),
+                    old_container: Some("Masthead".to_string()),
+                    new_container: Some("MastheadMain".to_string()),
                     description: "MastheadToggle moved under MastheadMain".to_string(),
                 },
             ],
@@ -8605,19 +8609,19 @@ mod tests {
         let changes = vec![
             make_composition_changes(
                 "packages/react-core/src/components/Modal/CloseButton.tsx",
-                vec![CompositionPatternChange {
-                    component: "TimesIcon".to_string(),
-                    old_parent: Some("Button (as children)".to_string()),
-                    new_parent: Some("Button (as icon prop)".to_string()),
+                vec![ContainerChange {
+                    symbol: "TimesIcon".to_string(),
+                    old_container: Some("Button (as children)".to_string()),
+                    new_container: Some("Button (as icon prop)".to_string()),
                     description: "TimesIcon in CloseButton".to_string(),
                 }],
             ),
             make_composition_changes(
                 "packages/react-core/src/components/Popover/PopoverClose.tsx",
-                vec![CompositionPatternChange {
-                    component: "TimesIcon".to_string(),
-                    old_parent: Some("Button (as children)".to_string()),
-                    new_parent: Some("Button (as icon prop)".to_string()),
+                vec![ContainerChange {
+                    symbol: "TimesIcon".to_string(),
+                    old_container: Some("Button (as children)".to_string()),
+                    new_container: Some("Button (as icon prop)".to_string()),
                     description: "TimesIcon in PopoverClose".to_string(),
                 }],
             ),
@@ -8670,7 +8674,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -8733,7 +8737,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -8792,7 +8796,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -8868,7 +8872,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -8931,7 +8935,7 @@ mod tests {
                 renders_element: None,
             }],
             breaking_behavioral_changes: vec![],
-            composition_pattern_changes: vec![],
+            container_changes: vec![],
         }];
 
         let report = make_report(changes, vec![]);
@@ -8980,12 +8984,12 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Dropdown".to_string(),
-                interface_name: "DropdownProps".to_string(),
+                definition_name: "DropdownProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary::default(),
-                removed_properties: vec![],
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
@@ -9003,7 +9007,7 @@ mod tests {
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         // Add a hierarchy delta: Dropdown gained DropdownList as required child,
@@ -9015,7 +9019,7 @@ mod tests {
                 required: true,
             }],
             removed_children: vec!["DropdownItem".to_string()],
-            migrated_props: vec![],
+            migrated_members: vec![],
         }];
 
         let rules = generate_rules(
@@ -9082,12 +9086,12 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Modal".to_string(),
-                interface_name: "ModalProps".to_string(),
+                definition_name: "ModalProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary::default(),
-                removed_properties: vec![],
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
@@ -9109,7 +9113,7 @@ mod tests {
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         report.hierarchy_deltas = vec![HierarchyDelta {
@@ -9129,16 +9133,16 @@ mod tests {
                 },
             ],
             removed_children: vec![],
-            migrated_props: vec![
-                MigratedProp {
-                    prop_name: "title".to_string(),
+            migrated_members: vec![
+                MigratedMember {
+                    member_name: "title".to_string(),
                     target_child: "ModalHeader".to_string(),
-                    target_prop_name: None,
+                    target_member_name: None,
                 },
-                MigratedProp {
-                    prop_name: "actions".to_string(),
+                MigratedMember {
+                    member_name: "actions".to_string(),
                     target_child: "ModalFooter".to_string(),
-                    target_prop_name: None,
+                    target_member_name: None,
                 },
             ],
         }];
@@ -9215,12 +9219,12 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "MastheadToggle".to_string(),
-                interface_name: "MastheadToggleProps".to_string(),
+                definition_name: "MastheadToggleProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary::default(),
-                removed_properties: vec![],
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
@@ -9232,7 +9236,7 @@ mod tests {
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
         // No hierarchy deltas — this is a conformance-only case
         report.hierarchy_deltas = vec![];
@@ -9270,12 +9274,12 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Modal".to_string(),
-                interface_name: "ModalProps".to_string(),
+                definition_name: "ModalProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary::default(),
-                removed_properties: vec![],
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
@@ -9293,7 +9297,7 @@ mod tests {
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
         // Modal HAS a hierarchy delta — conformance should be skipped
         report.hierarchy_deltas = vec![HierarchyDelta {
@@ -9303,7 +9307,7 @@ mod tests {
                 required: false,
             }],
             removed_children: vec![],
-            migrated_props: vec![],
+            migrated_members: vec![],
         }];
 
         let rules = generate_conformance_rules(&report);
@@ -9322,12 +9326,12 @@ mod tests {
             name: "@patternfly/react-core".to_string(),
             old_version: None,
             new_version: None,
-            components: vec![ComponentSummary {
+            type_summaries: vec![ComponentSummary {
                 name: "Badge".to_string(),
-                interface_name: "BadgeProps".to_string(),
+                definition_name: "BadgeProps".to_string(),
                 status: ComponentStatus::Modified,
-                property_summary: PropertySummary::default(),
-                removed_properties: vec![],
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
@@ -9336,14 +9340,14 @@ mod tests {
                 source_files: vec![],
             }],
             constants: vec![],
-            added_components: vec![],
+            added_exports: vec![],
         }];
 
         let rules = generate_conformance_rules(&report);
         assert_eq!(rules.len(), 0);
     }
 
-    // ── api_change_to_strategy: ReplacedByProp → Rename ──────────────────
+    // ── api_change_to_strategy: ReplacedByMember → Rename ─────────────────
 
     fn empty_rename_patterns() -> RenamePatterns {
         RenamePatterns::empty()
@@ -9361,8 +9365,8 @@ mod tests {
             after: None,
             description: "chips removed".to_string(),
             migration_target: None,
-            removal_disposition: Some(RemovalDisposition::ReplacedByProp {
-                new_prop: "labels".to_string(),
+            removal_disposition: Some(RemovalDisposition::ReplacedByMember {
+                new_member: "labels".to_string(),
             }),
             renders_element: None,
         };
@@ -9374,7 +9378,7 @@ mod tests {
         let strat = strat.expect("should produce a strategy");
         assert_eq!(
             strat.strategy, "Rename",
-            "ReplacedByProp should produce Rename, not RemoveProp"
+            "ReplacedByMember should produce Rename, not RemoveProp"
         );
         assert_eq!(strat.from.as_deref(), Some("chips"));
         assert_eq!(strat.to.as_deref(), Some("labels"));
@@ -9392,8 +9396,8 @@ mod tests {
             after: None,
             description: "deleteChip removed".to_string(),
             migration_target: None,
-            removal_disposition: Some(RemovalDisposition::ReplacedByProp {
-                new_prop: "deleteLabel".to_string(),
+            removal_disposition: Some(RemovalDisposition::ReplacedByMember {
+                new_member: "deleteLabel".to_string(),
             }),
             renders_element: None,
         };
@@ -9474,8 +9478,8 @@ mod tests {
             after: None,
             description: "title moved to ModalHeader".to_string(),
             migration_target: None,
-            removal_disposition: Some(RemovalDisposition::MovedToChild {
-                target_component: "ModalHeader".to_string(),
+            removal_disposition: Some(RemovalDisposition::MovedToRelatedType {
+                target_type: "ModalHeader".to_string(),
                 mechanism: "prop".to_string(),
             }),
             renders_element: None,
@@ -9488,7 +9492,7 @@ mod tests {
         let strat = strat.expect("should produce a strategy");
         assert_eq!(
             strat.strategy, "RemoveProp",
-            "MovedToChild should stay RemoveProp (handled by hierarchy rule)"
+            "MovedToRelatedType should stay RemoveProp (handled by hierarchy rule)"
         );
     }
 }

@@ -85,7 +85,7 @@ pub(super) fn param_summary(p: &Parameter) -> String {
     if let Some(dv) = &p.default_value {
         write!(s, " = {}", dv).unwrap();
     }
-    if p.is_rest {
+    if p.is_variadic {
         s = format!("...{}", s);
     }
     s

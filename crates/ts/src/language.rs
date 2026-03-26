@@ -108,7 +108,7 @@ pub enum TsEvidence {
 /// TypeScript-specific report data (React component analysis).
 ///
 /// These types will eventually absorb ComponentSummary, HierarchyDelta,
-/// CompositionPatternChange, and other React-specific types currently
+/// ContainerChange, and other React-specific types currently
 /// in the core crate. For now this is a placeholder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TsReportData {
@@ -191,6 +191,17 @@ impl LanguageSemantics for TypeScript {
 
     fn body_analyzer(&self) -> Option<&dyn BodyAnalysisSemantics> {
         Some(self)
+    }
+
+    fn is_async_wrapper(&self, type_str: &str) -> bool {
+        type_str.starts_with("Promise<")
+    }
+
+    fn format_import_change(&self, symbol: &str, old_path: &str, new_path: &str) -> String {
+        format!(
+            "replace `import {{ {} }} from '{}'` with `import {{ {} }} from '{}'`",
+            symbol, old_path, symbol, new_path,
+        )
     }
 }
 
@@ -433,6 +444,19 @@ impl HierarchySemantics for TypeScript {
             }
         }
         None
+    }
+
+    fn is_hierarchy_candidate(&self, sym: &Symbol) -> bool {
+        // React components are PascalCase functions, classes, variables, or constants
+        matches!(
+            sym.kind,
+            SymbolKind::Variable | SymbolKind::Class | SymbolKind::Function | SymbolKind::Constant
+        ) && sym
+            .name
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false)
     }
 
     fn cross_family_relationships(
@@ -878,7 +902,7 @@ mod tests {
                 optional: true,
                 has_default: false,
                 default_value: None,
-                is_rest: false,
+                is_variadic: false,
             }],
             return_type: None,
             type_parameters: vec![],

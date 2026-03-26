@@ -1985,7 +1985,7 @@ fn extract_params(
             optional: false,
             has_default: false,
             default_value: None,
-            is_rest: true,
+            is_variadic: true,
         });
     }
 
@@ -2014,7 +2014,7 @@ fn extract_single_param(
         optional: param.optional || has_default,
         has_default,
         default_value,
-        is_rest: false,
+        is_variadic: false,
     }
 }
 
@@ -2466,8 +2466,8 @@ mod tests {
             extract("export declare function log(msg: string, ...args: unknown[]): void;");
         let sig = symbols[0].signature.as_ref().unwrap();
         assert_eq!(sig.parameters.len(), 2);
-        assert!(!sig.parameters[0].is_rest);
-        assert!(sig.parameters[1].is_rest);
+        assert!(!sig.parameters[0].is_variadic);
+        assert!(sig.parameters[1].is_variadic);
         assert_eq!(sig.parameters[1].name, "args");
         assert_eq!(
             sig.parameters[1].type_annotation.as_deref(),

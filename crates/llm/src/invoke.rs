@@ -678,8 +678,8 @@ The function validates email addresses."#;
       "change": "removed",
       "description": "actions prop removed, pass as children of ModalFooter",
       "removal_disposition": {
-        "type": "moved_to_child",
-        "target_component": "ModalFooter",
+        "type": "moved_to_related_type",
+        "target_type": "ModalFooter",
         "mechanism": "children"
       }
     }
@@ -694,14 +694,14 @@ The function validates email addresses."#;
             .as_ref()
             .expect("Should have disposition");
         match disp {
-            RemovalDisposition::MovedToChild {
-                target_component,
+            RemovalDisposition::MovedToRelatedType {
+                target_type,
                 mechanism,
             } => {
-                assert_eq!(target_component, "ModalFooter");
+                assert_eq!(target_type, "ModalFooter");
                 assert_eq!(mechanism, "children");
             }
-            _ => panic!("Expected MovedToChild, got {:?}", disp),
+            _ => panic!("Expected MovedToRelatedType, got {:?}", disp),
         }
     }
 
@@ -716,8 +716,8 @@ The function validates email addresses."#;
       "change": "removed",
       "description": "title prop moved to ModalHeader",
       "removal_disposition": {
-        "type": "moved_to_child",
-        "target_component": "ModalHeader",
+        "type": "moved_to_related_type",
+        "target_type": "ModalHeader",
         "mechanism": "prop"
       }
     }
@@ -727,19 +727,19 @@ The function validates email addresses."#;
         let (_beh, api) = parse_file_behavioral_response(response).unwrap();
         let disp = api[0].removal_disposition.as_ref().unwrap();
         match disp {
-            RemovalDisposition::MovedToChild {
-                target_component,
+            RemovalDisposition::MovedToRelatedType {
+                target_type,
                 mechanism,
             } => {
-                assert_eq!(target_component, "ModalHeader");
+                assert_eq!(target_type, "ModalHeader");
                 assert_eq!(mechanism, "prop");
             }
-            _ => panic!("Expected MovedToChild, got {:?}", disp),
+            _ => panic!("Expected MovedToRelatedType, got {:?}", disp),
         }
     }
 
     #[test]
-    fn parse_removal_disposition_replaced_by_prop() {
+    fn parse_removal_disposition_replaced_by_member() {
         let response = r#"```json
 {
   "breaking_behavioral_changes": [],
@@ -749,8 +749,8 @@ The function validates email addresses."#;
       "change": "removed",
       "description": "isFlat replaced by isPlain",
       "removal_disposition": {
-        "type": "replaced_by_prop",
-        "new_prop": "isPlain"
+        "type": "replaced_by_member",
+        "new_member": "isPlain"
       }
     }
   ]
@@ -759,10 +759,10 @@ The function validates email addresses."#;
         let (_beh, api) = parse_file_behavioral_response(response).unwrap();
         let disp = api[0].removal_disposition.as_ref().unwrap();
         match disp {
-            RemovalDisposition::ReplacedByProp { new_prop } => {
-                assert_eq!(new_prop, "isPlain");
+            RemovalDisposition::ReplacedByMember { new_member } => {
+                assert_eq!(new_member, "isPlain");
             }
-            _ => panic!("Expected ReplacedByProp, got {:?}", disp),
+            _ => panic!("Expected ReplacedByMember, got {:?}", disp),
         }
     }
 

@@ -42,8 +42,6 @@ impl MemberFingerprint {
 pub(super) struct RenameMatch<'a> {
     pub old: &'a Symbol,
     pub new: &'a Symbol,
-    #[allow(dead_code)]
-    pub similarity: f64,
 }
 
 /// Detect renames among removed and added symbol lists.
@@ -125,7 +123,6 @@ pub(super) fn detect_renames<'a>(
         matches.push(RenameMatch {
             old: removed[ri],
             new: added[ai],
-            similarity: sim,
         });
     }
 

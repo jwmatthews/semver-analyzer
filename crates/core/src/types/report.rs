@@ -8,6 +8,7 @@
 //! breaking changes included in the output. Each file entry has separate
 //! arrays for API and behavioral breaking changes.
 
+use super::bu::EvidenceType;
 use super::change_subject::ChangeSubject;
 use crate::traits::Language;
 use serde::{Deserialize, Serialize};
@@ -31,20 +32,20 @@ pub struct AnalysisReport<L: Language> {
     /// Only files with at least one breaking change are included.
     pub changes: Vec<FileChanges<L>>,
 
-    /// Package manifest changes (package.json).
+    /// Package manifest changes (e.g., package.json, go.mod, pom.xml).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub manifest_changes: Vec<ManifestChange<L>>,
 
-    /// Files added between from_ref and to_ref (new exports, new components).
-    /// Used to detect new sibling components that may be needed alongside
-    /// modified components.
+    /// Files added between from_ref and to_ref (new exports, new types).
+    /// Used to detect new sibling types that may be needed alongside
+    /// modified types.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added_files: Vec<PathBuf>,
 
     /// Per-package hierarchical view of changes.
     ///
-    /// Contains pre-aggregated component summaries, constant groups, and
-    /// added components. This is the primary data source for rule generation
+    /// Contains pre-aggregated type summaries, constant groups, and
+    /// added exports. This is the primary data source for rule generation
     /// — all downstream processing reads from this field instead of
     /// reconstructing structure from the flat `changes` list.
     ///
@@ -119,11 +120,11 @@ pub struct FileChanges<L: Language> {
     /// Breaking behavioral changes (DOM structure, CSS, defaults, rendering).
     pub breaking_behavioral_changes: Vec<BehavioralChange<L>>,
 
-    /// Composition pattern changes detected from test/example diffs.
-    /// These describe how JSX nesting structure changed between versions
+    /// Container/nesting changes detected from test/example diffs.
+    /// These describe how symbol containment structure changed between versions
     /// (e.g., MastheadToggle moved inside MastheadMain).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub composition_pattern_changes: Vec<CompositionPatternChange>,
+    pub container_changes: Vec<ContainerChange>,
 }
 
 /// Git file status.
@@ -199,6 +200,26 @@ pub enum ApiChangeKind {
     ModuleExport,
 }
 
+impl From<super::surface::SymbolKind> for ApiChangeKind {
+    fn from(kind: super::surface::SymbolKind) -> Self {
+        use super::surface::SymbolKind;
+        match kind {
+            SymbolKind::Function => ApiChangeKind::Function,
+            SymbolKind::Method => ApiChangeKind::Method,
+            SymbolKind::Class => ApiChangeKind::Class,
+            SymbolKind::Struct => ApiChangeKind::Struct,
+            SymbolKind::Interface => ApiChangeKind::Interface,
+            SymbolKind::TypeAlias => ApiChangeKind::TypeAlias,
+            SymbolKind::Constant | SymbolKind::Variable => ApiChangeKind::Constant,
+            SymbolKind::Property => ApiChangeKind::Property,
+            SymbolKind::Enum | SymbolKind::EnumMember => ApiChangeKind::Constant,
+            SymbolKind::Constructor => ApiChangeKind::Method,
+            SymbolKind::GetAccessor | SymbolKind::SetAccessor => ApiChangeKind::Property,
+            SymbolKind::Namespace => ApiChangeKind::ModuleExport,
+        }
+    }
+}
+
 /// Type of breaking API change.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -241,12 +262,12 @@ pub struct BehavioralChange<L: Language> {
     /// How the behavioral change was detected.
     /// One of: "TestDelta", "JsxDiff", "LlmOnly", "LlmWithTestContext".
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_type: Option<String>,
+    pub evidence_type: Option<EvidenceType>,
 
-    /// Component names referenced in this behavioral change description.
+    /// Symbol names referenced in this behavioral change description.
     /// Pre-extracted so downstream code doesn't need regex parsing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub referenced_components: Vec<String>,
+    pub referenced_symbols: Vec<String>,
 
     /// Whether this change only affects internal rendering and does NOT
     /// require consumer code changes. Set by LLM analysis.
@@ -265,22 +286,20 @@ pub enum BehavioralChangeKind {
     Module,
 }
 
-/// A composition pattern change detected from test/example file diffs.
-///
-/// When a library's tests or examples restructure JSX nesting (e.g.,
-/// MastheadToggle moves from being a child of Masthead to a child of
-/// MastheadMain), this captures the old and new parent-child relationships.
-/// Detected by LLM analysis of test/example diffs.
+/// A change in the containment/nesting structure of a symbol between versions.
+/// For React: JSX nesting changed (e.g., MastheadToggle moved from MastheadBrand to MastheadMain)
+/// For Python: class moved from one module/package to another
+/// For Go: function moved between packages
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompositionPatternChange {
-    /// The component whose parent changed (e.g., "MastheadToggle").
-    pub component: String,
-    /// The old parent component (e.g., "Masthead"). None if newly added.
+pub struct ContainerChange {
+    /// The symbol that changed containers.
+    pub symbol: String,
+    /// The old container/parent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub old_parent: Option<String>,
-    /// The new parent component (e.g., "MastheadMain"). None if removed.
+    pub old_container: Option<String>,
+    /// The new container/parent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_parent: Option<String>,
+    pub new_container: Option<String>,
     /// Description of the change from the LLM.
     pub description: String,
 }
@@ -305,42 +324,42 @@ pub struct PackageChanges<L: Language> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_version: Option<String>,
 
-    /// Per-component summaries with pre-aggregated change data.
+    /// Per-type summaries with pre-aggregated change data.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub components: Vec<ComponentSummary<L>>,
+    pub type_summaries: Vec<ComponentSummary<L>>,
 
     /// Pre-grouped bulk constant/token changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constants: Vec<ConstantGroup>,
 
-    /// Structurally-detected added components (new exports).
+    /// Structurally-detected added exports (new symbols).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub added_components: Vec<AddedComponent>,
+    pub added_exports: Vec<AddedExport>,
 }
 
-/// Pre-aggregated summary of all changes to a single component.
+/// Pre-aggregated summary of all changes to a single type.
 ///
 /// Built from the API surface symbol tree and the flat structural changes.
-/// Contains everything the rule generator needs for a component without
+/// Contains everything the rule generator needs for a type without
 /// rescanning the full report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct ComponentSummary<L: Language> {
-    /// Component name (e.g., "Modal").
+    /// Type name (e.g., "Modal").
     pub name: String,
 
-    /// Props interface name (e.g., "ModalProps").
-    pub interface_name: String,
+    /// Definition name (e.g., "ModalProps").
+    pub definition_name: String,
 
-    /// Overall status of this component.
+    /// Overall status of this type.
     pub status: ComponentStatus,
 
-    /// Aggregated property change counts.
-    pub property_summary: PropertySummary,
+    /// Aggregated member change counts.
+    pub member_summary: MemberSummary,
 
-    /// Details of each removed property.
+    /// Details of each removed member.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub removed_properties: Vec<RemovedProperty>,
+    pub removed_members: Vec<RemovedMember>,
 
     /// Details of each type change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -384,55 +403,55 @@ pub enum ComponentStatus {
     Added,
 }
 
-/// Aggregated property-level change counts for a component.
+/// Aggregated member-level change counts for a type.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PropertySummary {
-    /// Total number of properties in the old version.
+pub struct MemberSummary {
+    /// Total number of members in the old version.
     pub total: usize,
-    /// Number of properties removed.
+    /// Number of members removed.
     pub removed: usize,
-    /// Number of properties renamed.
+    /// Number of members renamed.
     pub renamed: usize,
-    /// Number of properties whose type changed.
+    /// Number of members whose type changed.
     pub type_changed: usize,
-    /// Number of properties added in the new version.
+    /// Number of members added in the new version.
     pub added: usize,
-    /// Ratio of removed properties to total (0.0 to 1.0).
-    /// A high ratio (> 0.5) indicates the component was "mostly removed"
-    /// and may warrant a component-level migration rule.
+    /// Ratio of removed members to total (0.0 to 1.0).
+    /// A high ratio (> 0.5) indicates the type was "mostly removed"
+    /// and may warrant a type-level migration rule.
     pub removal_ratio: f64,
 }
 
-/// A property that was removed from a component.
+/// A member that was removed from a type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemovedProperty {
-    /// Property name.
+pub struct RemovedMember {
+    /// Member name.
     pub name: String,
     /// The type annotation before removal (if known).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_type: Option<String>,
-    /// Why the prop was removed and where its functionality went.
+    /// Why the member was removed and where its functionality went.
     /// Populated from LLM behavioral analysis when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removal_disposition: Option<RemovalDisposition>,
 }
 
-/// Why a prop was removed and where its functionality went.
+/// Why a member was removed and where its functionality went.
 /// Determined by LLM analysis of the source diff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemovalDisposition {
-    /// Prop moved to a child component (e.g., Modal.title → ModalHeader.title).
-    MovedToChild {
-        /// The child component name (e.g., "ModalHeader").
-        target_component: String,
+    /// Member moved to a related type (e.g., Modal.title → ModalHeader.title).
+    MovedToRelatedType {
+        /// The target type name (e.g., "ModalHeader").
+        target_type: String,
         /// How to pass the value: "prop" (named prop) or "children".
         mechanism: String,
     },
-    /// Replaced by a different prop on the same component.
-    ReplacedByProp {
-        /// The new prop name.
-        new_prop: String,
+    /// Replaced by a different member on the same type.
+    ReplacedByMember {
+        /// The new member name.
+        new_member: String,
     },
     /// Functionality is now automatic / inferred.
     MadeAutomatic,
@@ -460,15 +479,15 @@ pub struct ChildComponent {
     pub name: String,
     /// Whether this component was added or modified.
     pub status: ChildComponentStatus,
-    /// Known props on this child component (from the new surface AST).
+    /// Known members on this child component (from the new surface AST).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub known_props: Vec<String>,
-    /// Props that were removed from the parent and match props on this
+    pub known_members: Vec<String>,
+    /// Members that were removed from the parent and match members on this
     /// child (by name). Populated from AST member comparison.
     /// E.g., parent `Modal` had `title` removed, child `ModalHeader`
-    /// has `title` → `absorbed_props: ["title"]`.
+    /// has `title` → `absorbed_members: ["title"]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub absorbed_props: Vec<String>,
+    pub absorbed_members: Vec<String>,
 }
 
 /// Status of a child/sibling component.
@@ -507,22 +526,22 @@ pub struct HierarchyDelta {
     /// Children removed in the new version (no longer direct children).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_children: Vec<String>,
-    /// Props removed from this component that now exist on a child component.
+    /// Members removed from this type that now exist on a child type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub migrated_props: Vec<MigratedProp>,
+    pub migrated_members: Vec<MigratedMember>,
 }
 
-/// A prop that migrated from a parent component to a child component.
+/// A member that migrated from a parent type to a child type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MigratedProp {
-    /// The prop name on the old parent component.
-    pub prop_name: String,
-    /// The child component the prop moved to.
+pub struct MigratedMember {
+    /// The member name on the old parent type.
+    pub member_name: String,
+    /// The child type the member moved to.
     pub target_child: String,
-    /// The prop name on the child, if different from the parent prop name
+    /// The member name on the child, if different from the parent member name
     /// (e.g., parent `bodyAriaRole` → child ModalBody `role`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_prop_name: Option<String>,
+    pub target_member_name: Option<String>,
 }
 
 /// The hierarchy of a single component family, as inferred by the LLM.
@@ -569,14 +588,14 @@ pub struct SuffixRename {
     pub to: String,
 }
 
-/// A component that was added in the new version.
+/// A symbol that was added (newly exported) in the new version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddedComponent {
-    /// Component name (e.g., "ModalHeader").
+pub struct AddedExport {
+    /// Symbol name (e.g., "ModalHeader").
     pub name: String,
     /// Fully qualified name from the API surface.
     pub qualified_name: String,
-    /// NPM package this component belongs to.
+    /// Package this symbol belongs to.
     pub package: String,
 }
 
@@ -693,10 +712,16 @@ pub struct MigrationTarget {
     pub removed_symbol: String,
     /// Qualified name of the removed symbol.
     pub removed_qualified_name: String,
+    /// Package of the removed symbol (from Symbol::package).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed_package: Option<String>,
     /// The suggested replacement symbol name (e.g., "EmptyStateProps").
     pub replacement_symbol: String,
     /// Qualified name of the replacement symbol.
     pub replacement_qualified_name: String,
+    /// Package of the replacement symbol (from Symbol::package).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement_package: Option<String>,
     /// Member names that overlap between removed and replacement.
     pub matching_members: Vec<MemberMapping>,
     /// Member names only in the removed symbol (no match in replacement).
@@ -867,7 +892,7 @@ pub struct AnalysisResult<L: Language> {
     pub old_surface: ApiSurface,
     pub new_surface: ApiSurface,
     pub inferred_rename_patterns: Option<InferredRenamePatterns>,
-    pub composition_changes: Vec<(String, Vec<CompositionPatternChange>)>,
+    pub container_changes: Vec<(String, Vec<ContainerChange>)>,
     pub hierarchy_deltas: Vec<HierarchyDelta>,
     pub new_hierarchies: HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
 }

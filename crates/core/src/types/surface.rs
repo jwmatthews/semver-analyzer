@@ -1,9 +1,10 @@
 //! Core data structures for representing API surfaces and their components.
 //!
-//! These are language-agnostic: the per-language `ApiExtractor` implementations
-//! populate them, and the language-agnostic `diff_surfaces()` engine consumes them.
+//! These are language-agnostic: the per-language `Language` implementations
+//! populate them, and the language-agnostic `diff_surfaces_with_semantics()` engine consumes them.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 
 /// Language-agnostic public API surface extracted from source code at a git ref.
@@ -14,8 +15,28 @@ pub struct ApiSurface {
     pub symbols: Vec<Symbol>,
 }
 
+impl Default for ApiSurface {
+    fn default() -> Self {
+        Self {
+            symbols: Vec::new(),
+        }
+    }
+}
+
+impl ApiSurface {
+    /// Returns true if the surface has no symbols.
+    pub fn is_empty(&self) -> bool {
+        self.symbols.is_empty()
+    }
+
+    /// Returns the number of symbols in the surface.
+    pub fn len(&self) -> usize {
+        self.symbols.len()
+    }
+}
+
 /// A single exported symbol in the API surface.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Symbol {
     /// Simple name (e.g., "createUser").
     pub name: String,
@@ -65,8 +86,8 @@ pub struct Symbol {
     /// Example: `fn createUser(opts: UserOptions): Promise<User>`
     ///   -> type_dependencies: `["UserOptions", "User"]`
     ///
-    /// Includes type-only imports which don't create runtime references
-    /// but DO create API surface dependencies.
+    /// Includes compile-time-only dependencies that affect the API surface
+    /// but may not exist at runtime.
     pub type_dependencies: Vec<String>,
 
     // -- Member modifiers (for class/interface members) --
@@ -164,7 +185,7 @@ pub enum AccessorKind {
 }
 
 /// Function or method signature.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature {
     /// Ordered list of parameters.
     pub parameters: Vec<Parameter>,
@@ -181,7 +202,7 @@ pub struct Signature {
 }
 
 /// A generic type parameter declaration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeParameter {
     /// Name of the type parameter (e.g., "T").
     pub name: String,
@@ -194,7 +215,7 @@ pub struct TypeParameter {
 }
 
 /// A function/method parameter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parameter {
     /// Parameter name.
     pub name: String,
@@ -212,6 +233,40 @@ pub struct Parameter {
     /// e.g., `"10"`, `"'hello'"`, `"[]"`.
     pub default_value: Option<String>,
 
-    /// Whether this is a rest parameter (`...args`).
-    pub is_rest: bool,
+    /// Whether this is a variadic/rest parameter (`...args`).
+    pub is_variadic: bool,
+}
+
+impl fmt::Display for SymbolKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Function => write!(f, "function"),
+            Self::Method => write!(f, "method"),
+            Self::Class => write!(f, "class"),
+            Self::Struct => write!(f, "struct"),
+            Self::Interface => write!(f, "interface"),
+            Self::TypeAlias => write!(f, "type alias"),
+            Self::Enum => write!(f, "enum"),
+            Self::EnumMember => write!(f, "enum member"),
+            Self::Constant => write!(f, "constant"),
+            Self::Variable => write!(f, "variable"),
+            Self::Property => write!(f, "property"),
+            Self::Constructor => write!(f, "constructor"),
+            Self::GetAccessor => write!(f, "get accessor"),
+            Self::SetAccessor => write!(f, "set accessor"),
+            Self::Namespace => write!(f, "namespace"),
+        }
+    }
+}
+
+impl fmt::Display for Visibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exported => write!(f, "exported"),
+            Self::Public => write!(f, "public"),
+            Self::Protected => write!(f, "protected"),
+            Self::Internal => write!(f, "internal"),
+            Self::Private => write!(f, "private"),
+        }
+    }
 }

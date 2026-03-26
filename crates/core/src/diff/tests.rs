@@ -28,7 +28,7 @@ fn param(name: &str, ty: &str) -> Parameter {
         optional: false,
         has_default: false,
         default_value: None,
-        is_rest: false,
+        is_variadic: false,
     }
 }
 
@@ -39,7 +39,7 @@ fn opt_param(name: &str, ty: &str) -> Parameter {
         optional: true,
         has_default: false,
         default_value: None,
-        is_rest: false,
+        is_variadic: false,
     }
 }
 
@@ -50,7 +50,7 @@ fn rest_param(name: &str, ty: &str) -> Parameter {
         optional: false,
         has_default: false,
         default_value: None,
-        is_rest: true,
+        is_variadic: true,
     }
 }
 
@@ -795,8 +795,10 @@ fn detect_interface_property_added() {
         )
     });
     assert_eq!(c.symbol, "age");
-    // New required property on interface is breaking
-    assert!(c.is_breaking);
+    // With MinimalSemantics, member additions are never breaking.
+    // Language-specific breaking rules (e.g., TS required interface members)
+    // are tested in the language crate.
+    assert!(!c.is_breaking);
 }
 
 // ── Class member changes ─────────────────────────────────────────
@@ -1476,71 +1478,10 @@ fn multiple_symbols_moved_to_deprecated() {
 
 // ── Default export deduplication ──────────────────────────────────
 
-#[test]
-fn dedup_default_export_removal() {
-    // File exports both named and default: removing the file should only
-    // report the named removal, not the default.
-    let mk = |name: &str, file: &str| {
-        let mut s = sym(name, SymbolKind::Constant);
-        s.qualified_name = format!("pkg/dist/{}.{}", file, name);
-        s
-    };
-
-    let old = surface(vec![mk("c_button", "c_button"), mk("default", "c_button")]);
-    let new = surface(vec![]);
-    let changes = diff_surfaces(&old, &new);
-
-    // Named removal should be present
-    assert!(
-        changes.iter().any(|c| c.symbol == "c_button"
-            && matches!(
-                c.change_type,
-                StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
-            )),
-        "Named export removal should be present"
-    );
-
-    // Default removal should be suppressed
-    assert!(
-        !changes.iter().any(|c| c.symbol == "default"
-            && matches!(
-                c.change_type,
-                StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
-            )),
-        "Default export removal should be deduplicated"
-    );
-}
-
-#[test]
-fn dedup_default_export_addition() {
-    // Both named and default added — suppress default
-    let mk = |name: &str, file: &str| {
-        let mut s = sym(name, SymbolKind::Constant);
-        s.qualified_name = format!("pkg/dist/{}.{}", file, name);
-        s
-    };
-
-    let old = surface(vec![]);
-    let new = surface(vec![mk("c_button", "c_button"), mk("default", "c_button")]);
-    let changes = diff_surfaces(&old, &new);
-
-    assert!(
-        changes.iter().any(|c| c.symbol == "c_button"
-            && matches!(
-                c.change_type,
-                StructuralChangeType::Added(ChangeSubject::Symbol { .. })
-            )),
-        "Named export addition should be present"
-    );
-    assert!(
-        !changes.iter().any(|c| c.symbol == "default"
-            && matches!(
-                c.change_type,
-                StructuralChangeType::Added(ChangeSubject::Symbol { .. })
-            )),
-        "Default export addition should be deduplicated"
-    );
-}
+// NOTE: dedup_default_export_removal and dedup_default_export_addition tests
+// were removed — they test TypeScript-specific post_process behavior
+// (deduplicating JS default exports). This behavior is tested in the ts
+// crate's baseline snapshot tests with TypeScript semantics.
 
 #[test]
 fn keep_default_when_no_named_sibling() {

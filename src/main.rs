@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cli::{Cli, Command};
-use semver_analyzer_core::diff::diff_surfaces;
+use semver_analyzer_core::diff::diff_surfaces_with_semantics;
 use semver_analyzer_core::traits::Language;
 use semver_analyzer_core::{
     AnalysisReport, AnalysisSummary, ApiSurface, BehavioralChange, ChangeTypeCounts,
@@ -155,7 +155,8 @@ fn cmd_diff(from_path: &Path, to_path: &Path, output: Option<&Path>) -> Result<(
     let new: ApiSurface = serde_json::from_str(&new_json)
         .with_context(|| format!("Failed to parse {} as ApiSurface", to_path.display()))?;
 
-    let changes = diff_surfaces(&old, &new);
+    let ts = TypeScript::default();
+    let changes = diff_surfaces_with_semantics(&old, &new, &ts);
 
     let breaking = changes.iter().filter(|c| c.is_breaking).count();
     let non_breaking = changes.len() - breaking;
@@ -553,6 +554,7 @@ async fn cmd_konveyor(
 /// The envelope separates language-agnostic data (summary, structural changes)
 /// from language-specific data (behavioral/manifest changes), which is serialized
 /// as a `serde_json::Value` so consumers can read the envelope without knowing `L`.
+#[allow(dead_code)]
 fn build_envelope<L: Language>(
     report: &AnalysisReport<L>,
     structural_changes: &[StructuralChange],
@@ -606,6 +608,7 @@ fn build_envelope<L: Language>(
 }
 
 /// Count structural changes by lifecycle type for the envelope summary.
+#[allow(dead_code)]
 fn count_change_types(structural_changes: &[StructuralChange]) -> ChangeTypeCounts {
     let mut counts = ChangeTypeCounts::default();
     for change in structural_changes {

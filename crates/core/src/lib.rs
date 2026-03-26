@@ -3,8 +3,8 @@
 //! This crate contains language-agnostic components:
 //! - API surface types (`ApiSurface`, `Symbol`, etc.)
 //! - Report types (`AnalysisReport`, `StructuralChange`, etc.)
-//! - Traits for language-pluggable analysis (`Language`, `ApiExtractor`, etc.)
-//! - The structural diff engine (`diff_surfaces`)
+//! - Traits for language-pluggable analysis (`Language`, `LanguageSemantics`, etc.)
+//! - The structural diff engine (`diff_surfaces_with_semantics`)
 
 pub mod diff;
 pub mod shared;
@@ -57,7 +57,7 @@ pub(crate) mod test_support {
         const SOURCE_FILE_PATTERNS: &'static [&'static str] = &[];
 
         fn extract(&self, _repo: &Path, _git_ref: &str) -> anyhow::Result<ApiSurface> {
-            Ok(ApiSurface { symbols: vec![] })
+            Ok(ApiSurface::default())
         }
         fn parse_changed_functions(&self, _repo: &Path, _from_ref: &str, _to_ref: &str) -> anyhow::Result<Vec<ChangedFunction>> {
             Ok(vec![])

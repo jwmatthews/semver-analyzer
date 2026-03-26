@@ -7,7 +7,7 @@ expression: "diff(&old, &new)"
   kind: Function
   change_type: Changed(ReturnType)
   is_breaking: true
-  description: "`f` was made sync (Promise wrapper removed)"
+  description: "`f` was made sync (async wrapper removed)"
   before: Promise<string>
   after: string
   has_migration_target: false

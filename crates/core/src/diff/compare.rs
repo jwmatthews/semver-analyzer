@@ -8,11 +8,9 @@ use crate::traits::LanguageSemantics;
 use crate::types::{
     ChangeSubject, Parameter, Signature, StructuralChange, StructuralChangeType, Symbol, SymbolKind,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
-use super::helpers::{
-    change, kind_label, param_summary, symbol_summary, type_param_summary, visibility_rank,
-};
+use super::helpers::{change, kind_label, param_summary, symbol_summary, type_param_summary};
 use super::rename::detect_renames;
 
 // ─── Symbol-level diff ───────────────────────────────────────────────────
@@ -268,10 +266,10 @@ fn diff_parameters(
     let old_params = &old_sig.parameters;
     let new_params = &new_sig.parameters;
 
-    let old_non_rest: Vec<&Parameter> = old_params.iter().filter(|p| !p.is_rest).collect();
-    let new_non_rest: Vec<&Parameter> = new_params.iter().filter(|p| !p.is_rest).collect();
-    let old_rest = old_params.iter().find(|p| p.is_rest);
-    let new_rest = new_params.iter().find(|p| p.is_rest);
+    let old_non_rest: Vec<&Parameter> = old_params.iter().filter(|p| !p.is_variadic).collect();
+    let new_non_rest: Vec<&Parameter> = new_params.iter().filter(|p| !p.is_variadic).collect();
+    let old_rest = old_params.iter().find(|p| p.is_variadic);
+    let new_rest = new_params.iter().find(|p| p.is_variadic);
 
     // Compare matched parameters (by position)
     let common_len = old_non_rest.len().min(new_non_rest.len());
@@ -458,28 +456,28 @@ fn diff_return_type(
     let old_ret = old_sig.return_type.as_deref().unwrap_or("void");
     let new_ret = new_sig.return_type.as_deref().unwrap_or("void");
 
-    let old_is_promise = old_ret.starts_with("Promise<");
-    let new_is_promise = new_ret.starts_with("Promise<");
+    let old_is_async = semantics.is_async_wrapper(old_ret);
+    let new_is_async = semantics.is_async_wrapper(new_ret);
 
-    if !old_is_promise && new_is_promise {
+    if !old_is_async && new_is_async {
         changes.push(change(
             sym,
             StructuralChangeType::Changed(ChangeSubject::ReturnType),
             old_sig.return_type.clone(),
             new_sig.return_type.clone(),
             format!(
-                "`{}` was made async (return type wrapped in Promise)",
+                "`{}` was made async (return type wrapped in async wrapper)",
                 sym.name
             ),
             true,
         ));
-    } else if old_is_promise && !new_is_promise {
+    } else if old_is_async && !new_is_async {
         changes.push(change(
             sym,
             StructuralChangeType::Changed(ChangeSubject::ReturnType),
             old_sig.return_type.clone(),
             new_sig.return_type.clone(),
-            format!("`{}` was made sync (Promise wrapper removed)", sym.name),
+            format!("`{}` was made sync (async wrapper removed)", sym.name),
             true,
         ));
     } else {
@@ -797,51 +795,6 @@ pub(super) fn diff_members(
 }
 
 // ─── Union literal value diffing ─────────────────────────────────────────
-
-/// Parse a TypeScript string literal union type into its individual members.
-///
-/// Handles: `'primary' | 'secondary' | 'tertiary'` → `{"primary", "secondary", "tertiary"}`
-///
-/// Also handles mixed unions like `'primary' | ButtonVariant | undefined` by
-/// extracting only the string literal members (quoted with single or double quotes).
-///
-/// This is generic — works for any TypeScript union of string literals.
-fn parse_union_literals(type_str: &str) -> Option<BTreeSet<String>> {
-    // Quick check: must contain at least one string literal (quoted value)
-    if !type_str.contains('\'') && !type_str.contains('"') {
-        return None;
-    }
-
-    // Must look like a union (contains |)
-    if !type_str.contains('|') {
-        // Single literal — still valid but not a union to diff
-        return None;
-    }
-
-    let mut literals = BTreeSet::new();
-
-    for part in type_str.split('|') {
-        let trimmed = part.trim();
-        // Extract string literal values (single or double quoted)
-        if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-            || (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        {
-            let value = &trimmed[1..trimmed.len() - 1];
-            if !value.is_empty() {
-                literals.insert(value.to_string());
-            }
-        }
-        // Skip non-literal members (type references, undefined, null, etc.)
-    }
-
-    // Only return if we found at least 2 literal members
-    // (a single literal in a union with types isn't a value-level concern)
-    if literals.len() >= 2 {
-        Some(literals)
-    } else {
-        None
-    }
-}
 
 /// Emit per-member union literal value changes.
 ///

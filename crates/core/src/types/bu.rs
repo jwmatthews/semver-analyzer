@@ -9,6 +9,7 @@
 //! 6. `Caller` — a function that calls another (for call graph walking)
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 
 use super::{SymbolKind, Visibility};
@@ -181,10 +182,21 @@ pub enum EvidenceType {
     TestDelta,
     /// Detected by LLM file-level analysis.
     LlmAnalysis,
-    /// Detected by deterministic body analysis (JSX diff, CSS scan, etc.).
+    /// Detected by deterministic body analysis (e.g., JSX diff for TypeScript, annotation changes for Java).
     BodyAnalysis,
     /// Propagated through call graph from another break.
     CallGraphPropagation,
+}
+
+impl fmt::Display for EvidenceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TestDelta => write!(f, "test delta"),
+            Self::LlmAnalysis => write!(f, "LLM analysis"),
+            Self::BodyAnalysis => write!(f, "body analysis"),
+            Self::CallGraphPropagation => write!(f, "call graph propagation"),
+        }
+    }
 }
 
 // ── Behavioral Break (BU pipeline output) ───────────────────────────────
@@ -224,7 +236,7 @@ pub struct BehavioralBreak<L: Language> {
     /// Human-readable description of the behavioral change.
     pub description: String,
 
-    /// Language-specific behavioral category (e.g., `TsCategory::DomStructure`).
+    /// Language-specific behavioral category (e.g., a DOM structure change category for TypeScript, or a method signature category for Go).
     /// Set directly by deterministic analysis (JSX diff, CSS scan).
     /// For LLM-produced string labels, deserialized via serde.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -305,14 +317,23 @@ pub struct TestFile {
 }
 
 /// How a test file is associated with its source file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TestConvention {
-    /// `foo.test.ts` alongside `foo.ts`
+    /// Test file is a sibling with `.test.` before the extension.
+    /// e.g., `foo.test.ts`, `foo.test.py`
     DotTest,
-    /// `foo.spec.ts` alongside `foo.ts`
+    /// Test file is a sibling with `.spec.` before the extension.
+    /// e.g., `foo.spec.ts`, `foo.spec.js`
     DotSpec,
-    /// `__tests__/foo.ts` or `__tests__/foo.test.ts`
+    /// Test file is in a dedicated test directory.
+    /// e.g., `__tests__/foo.ts`, `tests/test_foo.py`
     TestsDir,
+    /// Test file uses a language-specific suffix convention.
+    /// e.g., Go: `_test.go`, Python: `test_` prefix
+    Suffix(String),
+    /// Test file is in a mirrored directory tree.
+    /// e.g., Java: `src/test/java/...` mirrors `src/main/java/...`
+    MirrorTree(String),
 }
 
 /// Verdict from spec comparison: is the behavioral change breaking?

@@ -47,8 +47,6 @@ fn min_overlap_count(member_count: usize) -> usize {
 pub(super) struct MigrationMatch<'a> {
     /// The removed symbol (interface/class).
     pub removed: &'a Symbol,
-    /// The candidate replacement symbol.
-    pub replacement: &'a Symbol,
     /// The migration target metadata.
     pub target: MigrationTarget,
 }
@@ -92,12 +90,6 @@ pub(super) fn detect_migrations<'a>(
     // but gained new members). We detect "added members" by checking which
     // members exist in the new version but not the old.
     let old_by_qname: HashMap<&str, &Symbol> = old_symbols
-        .iter()
-        .filter(|s| is_container_kind(s.kind))
-        .map(|s| (s.qualified_name.as_str(), *s))
-        .collect();
-
-    let new_by_qname: HashMap<&str, &Symbol> = new_symbols
         .iter()
         .filter(|s| is_container_kind(s.kind))
         .map(|s| (s.qualified_name.as_str(), *s))
@@ -217,12 +209,13 @@ pub(super) fn detect_migrations<'a>(
                 matched_removed.insert(&removed_sym.qualified_name);
                 results.push(MigrationMatch {
                     removed: removed_sym,
-                    replacement,
                     target: MigrationTarget {
                         removed_symbol: removed_sym.name.clone(),
                         removed_qualified_name: removed_sym.qualified_name.clone(),
+                        removed_package: removed_sym.package.clone(),
                         replacement_symbol: replacement.name.clone(),
                         replacement_qualified_name: replacement.qualified_name.clone(),
+                        replacement_package: replacement.package.clone(),
                         matching_members,
                         removed_only_members,
                         overlap_ratio: ratio,
@@ -243,70 +236,11 @@ fn is_container_kind(kind: SymbolKind) -> bool {
     )
 }
 
-/// Extract the component directory from a file path, stripping /deprecated/
-/// and /next/ segments for canonical matching.
-///
-/// `packages/react-core/dist/esm/deprecated/components/Select/Select.d.ts`
-/// → `packages/react-core/dist/esm/components/Select`
-///
-/// `packages/react-core/dist/esm/components/EmptyState/EmptyStateHeader.d.ts`
-/// → `packages/react-core/dist/esm/components/EmptyState`
-fn canonical_component_dir(file_path: &str) -> String {
-    // Strip /deprecated/ and /next/ for canonical matching.
-    // Handle both mid-path (`foo/deprecated/bar`) and start-of-path (`deprecated/bar`).
-    let canonical = file_path
-        .replace("/deprecated/", "/")
-        .replace("/next/", "/");
-    let canonical = if canonical.starts_with("deprecated/") {
-        canonical.strip_prefix("deprecated/").unwrap().to_string()
-    } else {
-        canonical
-    };
-    let canonical = if canonical.starts_with("next/") {
-        canonical.strip_prefix("next/").unwrap().to_string()
-    } else {
-        canonical
-    };
-
-    // Extract directory (everything up to the last `/`).
-    match canonical.rsplit_once('/') {
-        Some((dir, _)) => dir.to_string(),
-        None => canonical,
-    }
-}
-
-/// Strip a "Props" suffix from a symbol name for comparison.
-///
-/// `EmptyStateHeaderProps` → `EmptyStateHeader`
-/// `SelectProps` → `Select`
-/// `Modal` → `Modal`
-fn strip_props_suffix(name: &str) -> &str {
-    name.strip_suffix("Props").unwrap_or(name)
-}
-
-/// Normalize a qualified_name by stripping `/deprecated/` and `/next/`.
-fn canonical_path(qualified_name: &str) -> String {
-    let result = qualified_name
-        .replace("/deprecated/", "/")
-        .replace("/next/", "/");
-    let result = if result.starts_with("deprecated/") {
-        result.strip_prefix("deprecated/").unwrap().to_string()
-    } else {
-        result
-    };
-    if result.starts_with("next/") {
-        result.strip_prefix("next/").unwrap().to_string()
-    } else {
-        result
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::DefaultSemantics;
+    use crate::diff::MinimalSemantics;
     use crate::types::{Symbol, SymbolKind, Visibility};
-    use std::path::PathBuf;
 
     fn make_interface(name: &str, file: &str, members: &[&str]) -> Symbol {
         let mut sym = Symbol::new(
@@ -374,7 +308,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_parent];
         let removed: Vec<&Symbol> = vec![&old_header];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
         assert_eq!(results.len(), 1);
 
         let m = &results[0];
@@ -402,6 +336,10 @@ mod tests {
 
     #[test]
     fn test_same_name_replacement_select_pattern() {
+        // This test exercises deprecated/ → main path migration which requires
+        // language-specific same_family behavior (stripping /deprecated/).
+        // MinimalSemantics uses plain directory comparison, so this test
+        // is covered by the ts crate's baseline_migration tests instead.
         // Old Select removed from deprecated path, new Select survives at main path.
         let old_select = make_interface(
             "SelectProps",
@@ -480,17 +418,12 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_main_select];
         let removed: Vec<&Symbol> = vec![&old_select];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
-        assert_eq!(results.len(), 1);
-
-        let m = &results[0];
-        assert_eq!(m.target.removed_symbol, "SelectProps");
-        assert_eq!(m.target.replacement_symbol, "SelectProps");
-        assert!(
-            m.target.matching_members.len() >= 10,
-            "Expected >= 10 matching members for Select, got {}",
-            m.target.matching_members.len()
-        );
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
+        // MinimalSemantics uses plain directory comparison, so deprecated/
+        // and non-deprecated paths are different families. No migration is
+        // detected. Language-specific same_family behavior (stripping
+        // /deprecated/) is tested in the ts crate's baseline_migration tests.
+        assert_eq!(results.len(), 0);
     }
 
     #[test]
@@ -553,7 +486,7 @@ mod tests {
         // This module handles the case where the INTERFACE is removed, not props.
         let removed: Vec<&Symbol> = vec![];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
         assert_eq!(
             results.len(),
             0,
@@ -580,7 +513,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_bar];
         let removed: Vec<&Symbol> = vec![&removed_foo];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
         assert_eq!(results.len(), 0, "Different directories should not match");
     }
 
@@ -616,7 +549,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_foo];
         let removed: Vec<&Symbol> = vec![&removed_header];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
         // 1 match (title) from 2-member interface = 50% ratio.
         // Adaptive min_overlap_count(2) = 1, ratio 50% > 25%.
         // This is correctly detected as an absorption.
@@ -627,28 +560,6 @@ mod tests {
         );
         assert_eq!(results[0].target.removed_symbol, "FooHeaderProps");
         assert_eq!(results[0].target.replacement_symbol, "FooProps");
-    }
-
-    #[test]
-    fn test_canonical_component_dir() {
-        assert_eq!(
-            canonical_component_dir(
-                "packages/react-core/dist/esm/deprecated/components/Select/Select.d.ts"
-            ),
-            "packages/react-core/dist/esm/components/Select"
-        );
-        assert_eq!(
-            canonical_component_dir(
-                "packages/react-core/dist/esm/components/EmptyState/EmptyStateHeader.d.ts"
-            ),
-            "packages/react-core/dist/esm/components/EmptyState"
-        );
-        assert_eq!(
-            canonical_component_dir(
-                "packages/react-core/dist/esm/next/components/Modal/ModalHeader.d.ts"
-            ),
-            "packages/react-core/dist/esm/components/Modal"
-        );
     }
 
     // ── Adaptive threshold: small interface absorption ──────────────
@@ -689,7 +600,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_parent];
         let removed: Vec<&Symbol> = vec![&old_icon_props];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
 
         assert_eq!(
             results.len(),
@@ -759,7 +670,7 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_parent];
         let removed: Vec<&Symbol> = vec![&old_tiny];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &DefaultSemantics);
+        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
         assert!(
             results.is_empty(),
             "Should NOT produce migration for non-matching single-member interface"

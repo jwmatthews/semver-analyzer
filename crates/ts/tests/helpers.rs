@@ -73,7 +73,7 @@ pub fn param(name: &str, ty: &str) -> Parameter {
         optional: false,
         has_default: false,
         default_value: None,
-        is_rest: false,
+        is_variadic: false,
     }
 }
 
@@ -84,7 +84,7 @@ pub fn opt_param(name: &str, ty: &str) -> Parameter {
         optional: true,
         has_default: false,
         default_value: None,
-        is_rest: false,
+        is_variadic: false,
     }
 }
 
@@ -95,7 +95,7 @@ pub fn rest_param(name: &str, ty: &str) -> Parameter {
         optional: false,
         has_default: false,
         default_value: None,
-        is_rest: true,
+        is_variadic: true,
     }
 }
 

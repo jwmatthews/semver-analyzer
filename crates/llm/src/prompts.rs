@@ -405,9 +405,9 @@ Return ONLY a JSON object:
   ],
   "composition_pattern_changes": [
     {{
-      "component": "<component whose parent changed>",
-      "old_parent": "<previous parent component or null>",
-      "new_parent": "<new parent component or null>",
+      "component": "<symbol whose container changed>",
+      "old_parent": "<previous container/parent or null>",
+      "new_parent": "<new container/parent or null>",
       "description": "<what nesting changed>"
     }}
   ]
@@ -424,18 +424,18 @@ Rules:
 - For API: use "InterfaceName.propName" format for property changes
 - For API removals: include `removal_disposition` when you can determine
   where the prop's functionality went:
-  - `{{"type": "moved_to_child", "target_component": "ChildName", "mechanism": "prop"}}` —
-    prop moved to a named prop on a child component (e.g., title → ModalHeader.title)
-  - `{{"type": "moved_to_child", "target_component": "ChildName", "mechanism": "children"}}` —
-    prop value should now be passed as children of the child component
+  - `{{"type": "moved_to_related_type", "target_type": "ChildName", "mechanism": "prop"}}` —
+    member moved to a named prop on a child/related type (e.g., title → ModalHeader.title)
+  - `{{"type": "moved_to_related_type", "target_type": "ChildName", "mechanism": "children"}}` —
+    member value should now be passed as children of the child type
     (e.g., actions → <ModalFooter>{{actions}}</ModalFooter>)
-   - `{{"type": "replaced_by_prop", "new_prop": "newPropName"}}` —
-     replaced by a different prop on the SAME component. Rules:
-     * `new_prop` MUST be an exact prop name that was ADDED to the same interface in the diff
-     * The new prop must serve the same purpose (e.g., `chips` → `labels`, NOT `chips` → `deleteLabel`)
+   - `{{"type": "replaced_by_member", "new_member": "newMemberName"}}` —
+     replaced by a different member on the SAME type. Rules:
+     * `new_member` MUST be an exact member name that was ADDED to the same interface in the diff
+     * The new member must serve the same purpose (e.g., `chips` → `labels`, NOT `chips` → `deleteLabel`)
      * If the types are fundamentally different (e.g., boolean → element, callback → array), use `truly_removed` instead
-     * If the new prop name contains "or" or you're unsure which prop replaced it, use `null` instead
-     * Do NOT guess — if you cannot find a clear 1:1 replacement in the added props, use `null`
+     * If the new member name contains "or" or you're unsure which member replaced it, use `null` instead
+     * Do NOT guess — if you cannot find a clear 1:1 replacement in the added members, use `null`
    - `{{"type": "made_automatic"}}` — functionality is now inferred automatically
    - `{{"type": "truly_removed"}}` — removed with no replacement
    - `null` if you cannot determine the disposition
@@ -643,9 +643,9 @@ Return ONLY a JSON object inside a ```json fenced block:
 {{
   "composition_changes": [
     {{
-      "component": "the component whose parent changed",
-      "old_parent": "the previous parent component (null if newly added)",
-      "new_parent": "the new parent component (null if removed from nesting)",
+      "component": "the symbol whose container changed",
+      "old_parent": "the previous container/parent (null if newly added)",
+      "new_parent": "the new container/parent (null if removed from nesting)",
       "description": "brief description of the nesting change"
     }}
   ]

@@ -21,21 +21,28 @@
 use anyhow::{Context, Result};
 use semver_analyzer_core::{
     ApiSurface, BehavioralBreak, BehavioralChange,
-    ChangeSubject, ChangedFunction, CompositionPatternChange,
+    ChangeSubject, ChangedFunction, ContainerChange, EvidenceType,
     ExpectedChild, HierarchyDelta, InferenceMetadata,
     InferredConstantPattern, InferredInterfaceMapping, InferredRenamePatterns,
     Language, LlmApiChange, ManifestChange,
     SharedFindings, StructuralChange, StructuralChangeType,
-    SymbolKind, Visibility,
+    Visibility,
     diff_surfaces_with_semantics, should_skip_for_bu,
 };
 use semver_analyzer_llm::LlmBehaviorAnalyzer;
 
+use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Maximum concurrent LLM calls for file analysis and hierarchy inference.
+const LLM_CONCURRENCY: usize = 5;
+
+/// Maximum number of interfaces to include in a single LLM rename inference prompt.
+const MAX_INTERFACES_FOR_INFERENCE: usize = 20;
 
 /// Bundles a language implementation with its analysis components.
 ///
@@ -56,7 +63,7 @@ impl<L: Language> Analyzer<L> {
         from_ref: &str,
         to_ref: &str,
         no_llm: bool,
-        _llm_command: Option<&str>,
+        llm_command: Option<&str>,
         build_command: Option<&str>,
         llm_all_files: bool,
     ) -> Result<AnalysisResult<L>> {
@@ -70,7 +77,7 @@ impl<L: Language> Analyzer<L> {
     let from_bu = from_ref.to_string();
     let to_bu = to_ref.to_string();
     let build_cmd = build_command.map(|s| s.to_string());
-    let llm_cmd = _llm_command.map(|s| s.to_string());
+    let llm_cmd = llm_command.map(|s| s.to_string());
     let shared_td = shared.clone();
     let shared_bu = shared.clone();
 
@@ -118,7 +125,7 @@ impl<L: Language> Analyzer<L> {
     //
     // Uses LLM to discover systematic rename patterns for constants and
     // interfaces. Requires TD results (structural changes) and API surfaces.
-    let empty_surface = ApiSurface { symbols: vec![] };
+    let empty_surface = ApiSurface::default();
     let inferred_rename_patterns = if !no_llm {
         let old_surf = shared.try_get_old_surface().unwrap_or(&empty_surface);
         let new_surf = shared.try_get_new_surface().unwrap_or(&empty_surface);
@@ -141,21 +148,18 @@ impl<L: Language> Analyzer<L> {
 
     // BU Phase 2: Concurrent LLM file analysis (async, 5 at a time)
     let mut llm_stats = LlmPhaseStats::default();
-    let mut composition_changes: Vec<(String, Vec<CompositionPatternChange>)> = vec![];
+    let mut container_changes: Vec<(String, Vec<ContainerChange>)> = vec![];
     let llm_api_entries = Arc::new(Mutex::new(Vec::<LlmApiChange>::new()));
     if !no_llm && !phase1.files_for_llm.is_empty() {
         let (stats, comp) = Self::run_bu_phase2_llm(
-            repo,
-            from_ref,
-            to_ref,
-            &phase1.llm_command,
+            phase1.llm_command.as_deref(),
             &phase1.files_for_llm,
             &shared,
             &llm_api_entries,
         )
         .await;
         llm_stats = stats;
-        composition_changes = comp;
+        container_changes = comp;
     }
 
     // Merge results
@@ -189,11 +193,11 @@ impl<L: Language> Analyzer<L> {
     let old_surface = shared
         .try_get_old_surface()
         .cloned()
-        .unwrap_or_else(|| ApiSurface { symbols: vec![] });
+        .unwrap_or_else(ApiSurface::default);
     let new_surface = shared
         .try_get_new_surface()
         .cloned()
-        .unwrap_or_else(|| ApiSurface { symbols: vec![] });
+        .unwrap_or_else(ApiSurface::default);
 
     // ── Hierarchy Inference Phase ──────────────────────────────────────
     //
@@ -229,7 +233,7 @@ impl<L: Language> Analyzer<L> {
         old_surface,
         new_surface,
         inferred_rename_patterns,
-        composition_changes,
+        container_changes,
         hierarchy_deltas,
         new_hierarchies,
     })
@@ -240,7 +244,9 @@ impl<L: Language> Analyzer<L> {
 pub use semver_analyzer_core::AnalysisResult;
 
 /// Stats from the TD pipeline.
-pub struct TdStats {
+/// Fields are printed during analysis and retained for future structured output.
+#[allow(dead_code)]
+pub(crate) struct TdStats {
     pub old_symbol_count: usize,
     pub new_symbol_count: usize,
     pub structural_change_count: usize,
@@ -248,7 +254,7 @@ pub struct TdStats {
 }
 
 /// Stats from the BU pipeline.
-pub struct BuStats {
+pub(crate) struct BuStats {
     pub changed_function_count: usize,
     pub skipped_by_td: usize,
     pub test_behavioral_breaks: usize,
@@ -279,7 +285,6 @@ struct BuPhase1Result {
 struct LlmPhaseStats {
     llm_calls: usize,
     llm_behavioral_breaks: usize,
-    llm_api_changes: usize,
 }
 
 // ── TD Pipeline ─────────────────────────────────────────────────────────
@@ -287,6 +292,7 @@ struct LlmPhaseStats {
 struct TdResult<L: Language> {
     structural_changes: Vec<StructuralChange>,
     manifest_changes: Vec<ManifestChange<L>>,
+    #[allow(dead_code)]
     stats: TdStats,
 }
 
@@ -345,12 +351,9 @@ fn run_td(
     for manifest_file in L::MANIFEST_FILES {
         let old_content = read_git_file(repo, from_ref, manifest_file);
         let new_content = read_git_file(repo, to_ref, manifest_file);
-        match (old_content, new_content) {
-            (Some(old_str), Some(new_str)) => {
-                let changes = L::diff_manifest_content(&old_str, &new_str);
-                manifest_changes.extend(changes);
-            }
-            _ => {}
+        if let (Some(old_str), Some(new_str)) = (old_content, new_content) {
+            let changes = L::diff_manifest_content(&old_str, &new_str);
+            manifest_changes.extend(changes);
         }
     }
 
@@ -447,7 +450,7 @@ fn run_bu_phase1(
                 confidence: 0.95,
                 description,
                 category: None, // Test-delta: category inferred later or by body analyzer
-                evidence_type: semver_analyzer_core::EvidenceType::TestDelta,
+                evidence_type: EvidenceType::TestDelta,
                 is_internal_only: None,
             };
             stats.test_behavioral_breaks += 1;
@@ -512,7 +515,7 @@ fn run_bu_phase1(
                     confidence: result.confidence,
                     description: result.description,
                     category,
-                    evidence_type: semver_analyzer_core::EvidenceType::BodyAnalysis,
+                    evidence_type: EvidenceType::BodyAnalysis,
                     is_internal_only: None,
                 };
                 shared.insert_behavioral_break(brk);
@@ -560,24 +563,7 @@ fn run_bu_phase1(
                 }
 
                 if !llm_all_files {
-                    let source_path = Path::new(path);
-                    let test_files = lang
-                        .find_tests(repo, source_path)
-                        .unwrap_or_default();
-
-                    if test_files.is_empty() {
-                        return false;
-                    }
-
-                    let any_test_changed = test_files.iter().any(|tf| {
-                        lang
-                            .diff_test_assertions(repo, tf, from_ref, to_ref)
-                            .ok()
-                            .map(|td| !td.full_diff.is_empty())
-                            .unwrap_or(false)
-                    });
-
-                    if !any_test_changed {
+                    if fetch_test_diff(lang, repo, Path::new(path), from_ref, to_ref).is_none() {
                         return false;
                     }
                 }
@@ -601,21 +587,9 @@ fn run_bu_phase1(
 
         // Pre-fetch git diffs for each file
         for (file_path, funcs) in filtered {
-            let diff_output = Command::new("git")
-                .args([
-                    "-C",
-                    &repo.to_string_lossy(),
-                    "diff",
-                    from_ref,
-                    to_ref,
-                    "--",
-                    &file_path,
-                ])
-                .output();
-
-            let diff_content = match diff_output {
-                Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
-                Err(_) => continue,
+            let diff_content = match git_diff_file(repo, from_ref, to_ref, &file_path) {
+                Some(d) => d,
+                None => continue,
             };
 
             if diff_content.trim().is_empty() {
@@ -626,22 +600,7 @@ fn run_bu_phase1(
                 funcs.iter().map(|f| (*f).clone()).collect();
 
             // Fetch associated test file diff for composition pattern detection
-            let test_diff = {
-                let source_path = Path::new(&file_path);
-                let test_files = lang
-                    .find_tests(repo, source_path)
-                    .unwrap_or_default();
-                test_files.iter().find_map(|tf| {
-                    let td = lang
-                        .diff_test_assertions(repo, tf, from_ref, to_ref)
-                        .ok()?;
-                    if td.full_diff.is_empty() {
-                        None
-                    } else {
-                        Some(td.full_diff)
-                    }
-                })
-            };
+            let test_diff = fetch_test_diff(lang, repo, Path::new(&file_path), from_ref, to_ref);
 
             files_for_llm.push(LlmFileTask {
                 file_path,
@@ -699,66 +658,20 @@ fn run_bu_phase1(
                     }
 
                     // Must have changed tests
-                    let source_path = Path::new(&file_path);
-                    let test_files = lang
-                        .find_tests(repo, source_path)
-                        .unwrap_or_default();
-
-                    if test_files.is_empty() {
-                        continue;
-                    }
-
-                    let any_test_changed = test_files.iter().any(|tf| {
-                        lang
-                            .diff_test_assertions(repo, tf, from_ref, to_ref)
-                            .ok()
-                            .map(|td| !td.full_diff.is_empty())
-                            .unwrap_or(false)
-                    });
-
-                    if !any_test_changed {
+                    let test_diff_content = fetch_test_diff(lang, repo, Path::new(&file_path), from_ref, to_ref);
+                    if test_diff_content.is_none() {
                         continue;
                     }
 
                     // Get the diff
-                    let diff_output = Command::new("git")
-                        .args([
-                            "-C",
-                            &repo.to_string_lossy(),
-                            "diff",
-                            from_ref,
-                            to_ref,
-                            "--",
-                            &file_path,
-                        ])
-                        .output();
-
-                    let diff_content = match diff_output {
-                        Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
-                        Err(_) => continue,
+                    let diff_content = match git_diff_file(repo, from_ref, to_ref, &file_path) {
+                        Some(d) => d,
+                        None => continue,
                     };
 
                     if diff_content.trim().is_empty() {
                         continue;
                     }
-
-                    // Fetch test diff for these extra files too
-                    let test_diff_content = {
-                        let source_path = Path::new(&file_path);
-                        let test_files = lang
-                            .find_tests(repo, source_path)
-                            .unwrap_or_default();
-                        test_files.iter().find_map(|tf| {
-                            let td = lang
-                                .diff_test_assertions(repo, tf, from_ref, to_ref)
-                                .ok()?;
-                            if td.full_diff.is_empty() {
-                                None
-                            } else {
-                                Some(td.full_diff)
-                            }
-                        })
-                    };
 
                     extra_count += 1;
                     files_for_llm.push(LlmFileTask {
@@ -882,7 +795,7 @@ fn infer_rename_patterns(
                 let mut total_hits = 0;
 
                 for llm_pat in patterns {
-                    let re = match regex::Regex::new(&llm_pat.match_regex) {
+                    let re = match Regex::new(&llm_pat.match_regex) {
                         Ok(r) => r,
                         Err(e) => {
                             eprintln!(
@@ -986,15 +899,15 @@ fn infer_rename_patterns(
             added_interfaces.len()
         );
 
-        // Cap at 20 each to keep the prompt manageable
+        // Cap to keep the prompt manageable
         let removed_capped: Vec<(&str, &[String])> = removed_interfaces
             .iter()
-            .take(20)
+            .take(MAX_INTERFACES_FOR_INFERENCE)
             .map(|(n, m)| (*n, m.as_slice()))
             .collect();
         let added_capped: Vec<(&str, &[String])> = added_interfaces
             .iter()
-            .take(20)
+            .take(MAX_INTERFACES_FOR_INFERENCE)
             .map(|(n, m)| (*n, m.as_slice()))
             .collect();
 
@@ -1084,13 +997,14 @@ fn infer_rename_patterns(
         return None;
     }
 
+    let interface_mappings_count = interface_mappings.len();
     Some(InferredRenamePatterns {
         constant_patterns,
-        interface_mappings: interface_mappings.clone(),
+        interface_mappings,
         metadata: InferenceMetadata {
             llm_calls,
             constant_hit_rate,
-            interface_mappings_found: interface_mappings.len(),
+            interface_mappings_found: interface_mappings_count,
         },
     })
 }
@@ -1098,28 +1012,24 @@ fn infer_rename_patterns(
 /// BU Phase 2: Concurrent LLM file analysis.
 ///
 /// Runs up to `concurrency` LLM calls in parallel using tokio tasks.
-async fn run_bu_phase2_llm(
-    _repo: &Path,
-    _from_ref: &str,
-    _to_ref: &str,
-    llm_command: &Option<String>,
+    async fn run_bu_phase2_llm(
+    llm_command: Option<&str>,
     files: &[LlmFileTask],
     shared: &Arc<SharedFindings<L>>,
     llm_api_entries: &Arc<Mutex<Vec<LlmApiChange>>>,
-) -> (LlmPhaseStats, Vec<(String, Vec<CompositionPatternChange>)>) {
+) -> (LlmPhaseStats, Vec<(String, Vec<ContainerChange>)>) {
     let cmd = match llm_command {
-        Some(c) => c.clone(),
+        Some(c) => c.to_string(),
         None => return (LlmPhaseStats::default(), vec![]),
     };
 
     let total = files.len();
-    let concurrency = 5;
+    let concurrency = LLM_CONCURRENCY;
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let llm_calls = Arc::new(AtomicUsize::new(0));
     let llm_breaks = Arc::new(AtomicUsize::new(0));
-    let llm_api_count = Arc::new(AtomicUsize::new(0));
     let completed = Arc::new(AtomicUsize::new(0));
-    let composition_entries: Arc<Mutex<Vec<(String, Vec<CompositionPatternChange>)>>> =
+    let composition_entries: Arc<Mutex<Vec<(String, Vec<ContainerChange>)>>> =
         Arc::new(Mutex::new(Vec::new()));
 
     eprintln!("[BU] Starting LLM analysis ({} concurrent)...", concurrency);
@@ -1132,7 +1042,6 @@ async fn run_bu_phase2_llm(
         let api_entries = llm_api_entries.clone();
         let calls = llm_calls.clone();
         let breaks = llm_breaks.clone();
-        let api_count = llm_api_count.clone();
         let comp_entries = composition_entries.clone();
         let done = completed.clone();
         let cmd = cmd.clone();
@@ -1140,10 +1049,9 @@ async fn run_bu_phase2_llm(
         let diff_content = task.diff_content.clone();
         let functions = task.functions.clone();
         let test_diff = task.test_diff.clone();
-        let total = total;
 
         let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+            let _permit = sem.acquire().await.expect("semaphore closed");
             let idx = done.fetch_add(1, Ordering::Relaxed) + 1;
             let label = format!("[BU] [{}/{}]", idx, total);
 
@@ -1167,13 +1075,13 @@ async fn run_bu_phase2_llm(
 
                     // Store composition pattern changes
                     if !comp_changes.is_empty() {
-                        let mapped: Vec<CompositionPatternChange> =
+                        let mapped: Vec<ContainerChange> =
                             comp_changes
                                 .into_iter()
-                                .map(|c| CompositionPatternChange {
-                                    component: c.component,
-                                    old_parent: c.old_parent,
-                                    new_parent: c.new_parent,
+                                .map(|c| ContainerChange {
+                                    symbol: c.component,
+                                    old_container: c.old_parent,
+                                    new_container: c.new_parent,
                                     description: c.description,
                                 })
                                 .collect();
@@ -1195,14 +1103,13 @@ async fn run_bu_phase2_llm(
                             confidence: 0.70,
                             description: change.description,
                             category,
-                            evidence_type: semver_analyzer_core::EvidenceType::LlmAnalysis,
+                            evidence_type: EvidenceType::LlmAnalysis,
                             is_internal_only: change.is_internal_only,
                         };
                         shared_ref.insert_behavioral_break(brk);
                     }
 
                     for change in api_changes {
-                        api_count.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut entries) = api_entries.lock() {
                             entries.push(LlmApiChange {
                                 file_path: file_path.clone(),
@@ -1249,7 +1156,6 @@ async fn run_bu_phase2_llm(
         LlmPhaseStats {
             llm_calls: llm_calls.load(Ordering::Relaxed),
             llm_behavioral_breaks: llm_breaks.load(Ordering::Relaxed),
-            llm_api_changes: llm_api_count.load(Ordering::Relaxed),
         },
         comp_results,
     )
@@ -1315,7 +1221,7 @@ fn walk_up_call_graph(
                         original_break.caused_by
                     ),
                     category: original_break.category.clone(), // Propagate parent's category
-                    evidence_type: semver_analyzer_core::EvidenceType::CallGraphPropagation,
+                    evidence_type: EvidenceType::CallGraphPropagation,
                     is_internal_only: original_break.is_internal_only,
                 });
                 propagated += 1;
@@ -1353,13 +1259,8 @@ fn merge_behavioral_breaks(lang: &L, shared: &SharedFindings<L>) -> Vec<Behavior
             };
 
             let kind = lang.behavioral_change_kind(&brk.evidence_type);
-            let evidence_type = Some(match &brk.evidence_type {
-                semver_analyzer_core::EvidenceType::TestDelta => "TestDelta".to_string(),
-                semver_analyzer_core::EvidenceType::LlmAnalysis => "LlmOnly".to_string(),
-                semver_analyzer_core::EvidenceType::BodyAnalysis => "BodyAnalysis".to_string(),
-                semver_analyzer_core::EvidenceType::CallGraphPropagation => "CallGraphPropagation".to_string(),
-            });
-            let referenced_components = lang.extract_referenced_symbols(&brk.description);
+            let evidence_type = Some(brk.evidence_type.clone());
+            let referenced_symbols = lang.extract_referenced_symbols(&brk.description);
             let is_internal_only = brk.is_internal_only;
 
             BehavioralChange {
@@ -1370,7 +1271,7 @@ fn merge_behavioral_breaks(lang: &L, shared: &SharedFindings<L>) -> Vec<Behavior
                 source_file,
                 confidence: Some(brk.confidence),
                 evidence_type,
-                referenced_components,
+                referenced_symbols,
                 is_internal_only,
             }
         })
@@ -1379,8 +1280,37 @@ fn merge_behavioral_breaks(lang: &L, shared: &SharedFindings<L>) -> Vec<Behavior
 
 } // end impl Analyzer<L> (private methods, part 1)
 
-// extract_component_refs and extract_display_name moved to Language trait methods
-// (TypeScript impl: extract_referenced_symbols and display_name)
+
+
+fn git_diff_file(repo: &Path, from_ref: &str, to_ref: &str, file_path: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args([
+            "-C", &repo.to_string_lossy(),
+            "diff",
+            &format!("{}..{}", from_ref, to_ref),
+            "--", file_path,
+        ])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let content = String::from_utf8_lossy(&output.stdout).to_string();
+        if content.is_empty() { None } else { Some(content) }
+    } else {
+        None
+    }
+}
+
+fn fetch_test_diff<L: Language>(lang: &L, repo: &Path, source_file: &Path, from_ref: &str, to_ref: &str) -> Option<String> {
+    let test_files = lang.find_tests(repo, source_file).unwrap_or_default();
+    test_files.iter().find_map(|tf| {
+        let td = lang.diff_test_assertions(repo, tf, from_ref, to_ref).ok()?;
+        if td.full_diff.is_empty() {
+            None
+        } else {
+            Some(td.full_diff)
+        }
+    })
+}
 
 fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> {
     let output = Command::new("git")
@@ -1450,14 +1380,7 @@ async fn infer_and_diff_hierarchies(
         // Group new surface symbols by family
         let mut family_components: HashMap<String, HashSet<String>> = HashMap::new();
         for sym in &new_surface.symbols {
-            match sym.kind {
-                SymbolKind::Variable
-                | SymbolKind::Class
-                | SymbolKind::Function
-                | SymbolKind::Constant => {}
-                _ => continue,
-            }
-            if !sym.name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            if !hierarchy.is_hierarchy_candidate(sym) {
                 continue;
             }
             if let Some(family_name) = hierarchy.family_name_from_symbols(&[sym]) {
@@ -1519,8 +1442,8 @@ async fn infer_and_diff_hierarchies(
         related_signatures.len(),
     );
 
-    // Run LLM calls concurrently (5 at a time)
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
+    // Run LLM calls concurrently
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(LLM_CONCURRENCY));
     let completed = Arc::new(AtomicUsize::new(0));
     let total = families.len();
 
@@ -1543,7 +1466,7 @@ async fn infer_and_diff_hierarchies(
         let related = related_signatures.get(&family).cloned();
 
         let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+            let _permit = sem.acquire().await.expect("semaphore closed");
             let idx = done.fetch_add(1, Ordering::Relaxed) + 1;
 
             eprintln!("[Hierarchy] [{}/{}] {}{}", idx, total, family,
@@ -1717,18 +1640,11 @@ async fn infer_and_diff_hierarchies(
                     component: component.clone(),
                     added_children: added,
                     removed_children: removed,
-                    migrated_props: Vec::new(), // Populated during report building
+                    migrated_members: Vec::new(), // Populated during report building
                 });
             }
         }
 
-        // Check for components that existed in old but not in new
-        for (component, _old_children) in &old_hierarchy {
-            if !new_hierarchy.contains_key(component) {
-                // Component was removed entirely — not a hierarchy change,
-                // handled by component removal rules
-            }
-        }
     }
 
     eprintln!(
@@ -1742,5 +1658,4 @@ async fn infer_and_diff_hierarchies(
 
 } // end impl Analyzer<L> (private methods, part 2)
 
-// Tests for extract_display_name and extract_component_refs moved to
-// TypeScript Language trait impl tests (crates/ts/src/language.rs).
+

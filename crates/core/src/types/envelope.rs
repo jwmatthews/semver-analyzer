@@ -196,7 +196,7 @@ mod tests {
             _repo: &Path,
             _git_ref: &str,
         ) -> anyhow::Result<crate::types::ApiSurface> {
-            Ok(crate::types::ApiSurface { symbols: vec![] })
+            Ok(crate::types::ApiSurface::default())
         }
         fn parse_changed_functions(
             &self,

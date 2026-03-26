@@ -146,6 +146,34 @@ pub trait LanguageSemantics {
         None
     }
 
+    /// Whether a return type string represents an async wrapper.
+    ///
+    /// Used by the diff engine to detect sync→async and async→sync changes,
+    /// which are always breaking regardless of the inner type.
+    ///
+    /// TypeScript/JavaScript: `Promise<T>`
+    /// Python: `Coroutine[...]`, `Awaitable[...]`
+    /// Java: `CompletableFuture<T>`, `Future<T>`
+    /// Go: returns `false` (async handled via goroutines, not return types)
+    fn is_async_wrapper(&self, _type_str: &str) -> bool {
+        false
+    }
+
+    /// Format an import/use statement change hint for migration descriptions.
+    ///
+    /// When a symbol is renamed across packages, the diff engine includes
+    /// import guidance so consumers know to update their import paths.
+    ///
+    /// TypeScript: `"replace \`import { X } from 'old-pkg'\` with \`import { X } from 'new-pkg'\`"`
+    /// Go: `"replace \`\"old/pkg\"\` with \`\"new/pkg\"\`"`
+    /// Default: generic format without language-specific syntax.
+    fn format_import_change(&self, symbol: &str, old_path: &str, new_path: &str) -> String {
+        format!(
+            "replace import of `{}` from `{}` with `{}`",
+            symbol, old_path, new_path,
+        )
+    }
+
     /// Post-process the change list before returning from diff_surfaces.
     ///
     /// TypeScript: dedup default export changes.
@@ -237,7 +265,16 @@ pub trait HierarchySemantics {
         relationship_names: &[String],
     ) -> Option<String>;
 
-    /// Minimum number of exported components for a family to qualify
+    /// Whether a symbol is a candidate for hierarchy inference.
+    ///
+    /// The orchestrator calls this to filter symbols when grouping into
+    /// families. Only candidates are counted toward the minimum threshold.
+    ///
+    /// TypeScript/React: PascalCase Variable/Class/Function/Constant
+    /// (React components are PascalCase functions or classes).
+    fn is_hierarchy_candidate(&self, sym: &Symbol) -> bool;
+
+    /// Minimum number of exported types for a family to qualify
     /// for hierarchy inference. Default: 2.
     fn min_components_for_hierarchy(&self) -> usize {
         2
@@ -498,10 +535,11 @@ pub fn diff_surfaces_with_semantics(
     crate::diff::diff_surfaces_with_semantics(old, new, semantics)
 }
 
-/// Compare two API surfaces using default (TypeScript) semantics.
+/// Compare two API surfaces using minimal semantics (no language-specific rules).
 ///
-/// Backward-compatible convenience function. Prefer
-/// `diff_surfaces_with_semantics` for new code.
+/// This uses `MinimalSemantics` which is language-agnostic: no member additions
+/// are breaking, no union parsing, no post-processing. For language-aware
+/// diffing, use `diff_surfaces_with_semantics` with a `LanguageSemantics` impl.
 pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange> {
     crate::diff::diff_surfaces(old, new)
 }

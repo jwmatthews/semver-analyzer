@@ -7,7 +7,7 @@ expression: "diff(&old, &new)"
   kind: Method
   change_type: Changed(ReturnType)
   is_breaking: true
-  description: "`getUser` was made async (return type wrapped in Promise)"
+  description: "`getUser` was made async (return type wrapped in async wrapper)"
   before: User
   after: Promise<User>
   has_migration_target: false

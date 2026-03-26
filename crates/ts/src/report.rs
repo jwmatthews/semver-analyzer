@@ -11,12 +11,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use semver_analyzer_core::{
-    AddedComponent, AnalysisMetadata, AnalysisReport, AnalysisResult, ApiChange, ApiChangeKind,
+    AddedExport, AnalysisMetadata, AnalysisReport, AnalysisResult, ApiChange, ApiChangeKind,
     ApiChangeType, ApiSurface, BehavioralChange, ChangeSubject, ChildComponent,
     ChildComponentStatus, Comparison, ComponentStatus, ComponentSummary, ConstantGroup,
     ExpectedChild, FileChanges, FileStatus, HierarchyDelta, InferredRenamePatterns, LlmApiChange,
-    ManifestChange, MigratedProp, PackageChanges, PropertySummary, RemovalDisposition,
-    RemovedProperty, StructuralChange, StructuralChangeType, SuffixRename, Summary, Symbol,
+    ManifestChange, MemberSummary, MigratedMember, PackageChanges, RemovalDisposition,
+    RemovedMember, StructuralChange, StructuralChangeType, SuffixRename, Summary, Symbol,
     SymbolKind, TypeChange,
 };
 
@@ -48,14 +48,14 @@ pub(crate) fn build_report(
         results.inferred_rename_patterns.clone(),
     );
 
-    // Merge composition pattern changes into the report's file entries.
-    for (source_path, comp_changes) in &results.composition_changes {
+    // Merge container changes into the report's file entries.
+    for (source_path, comp_changes) in &results.container_changes {
         let existing = report
             .changes
             .iter_mut()
             .find(|fc| fc.file.to_string_lossy().starts_with(source_path));
         if let Some(fc) = existing {
-            fc.composition_pattern_changes.extend(comp_changes.clone());
+            fc.container_changes.extend(comp_changes.clone());
         } else if !comp_changes.is_empty() {
             report.changes.push(FileChanges {
                 file: PathBuf::from(source_path),
@@ -63,7 +63,7 @@ pub(crate) fn build_report(
                 renamed_from: None,
                 breaking_api_changes: vec![],
                 breaking_behavioral_changes: vec![],
-                composition_pattern_changes: comp_changes.clone(),
+                container_changes: comp_changes.clone(),
             });
         }
     }
@@ -255,7 +255,7 @@ fn build_report_inner(
                 renamed_from: None,
                 breaking_api_changes: api_changes,
                 breaking_behavioral_changes: behavioral,
-                composition_pattern_changes: vec![],
+                container_changes: vec![],
             }
         })
         .collect();
@@ -413,10 +413,10 @@ fn build_package_summaries(
             continue;
         }
 
-        let interface_name = &old_sym.name;
-        let component_name = interface_name
+        let definition_name = &old_sym.name;
+        let component_name = definition_name
             .strip_suffix("Props")
-            .unwrap_or(interface_name)
+            .unwrap_or(definition_name)
             .to_string();
 
         let total_members = old_sym.members.len();
@@ -425,7 +425,7 @@ fn build_package_summaries(
         let mut renamed = 0usize;
         let mut type_changed = 0usize;
         let mut added = 0usize;
-        let mut removed_properties = Vec::new();
+        let mut removed_members = Vec::new();
         let mut type_changes = Vec::new();
 
         if let Some(changes) = member_changes {
@@ -433,11 +433,11 @@ fn build_package_summaries(
                 match &change.change_type {
                     StructuralChangeType::Removed(ChangeSubject::Member { .. }) => {
                         removed += 1;
-                        let lookup_key = format!("{}.{}", interface_name, change.symbol);
+                        let lookup_key = format!("{}.{}", definition_name, change.symbol);
                         let disposition = llm_disposition_map
                             .get(lookup_key.as_str())
                             .and_then(|entry| entry.removal_disposition.clone());
-                        removed_properties.push(RemovedProperty {
+                        removed_members.push(RemovedMember {
                             name: change.symbol.clone(),
                             old_type: change.before.clone(),
                             removal_disposition: disposition,
@@ -518,11 +518,8 @@ fn build_package_summaries(
             .iter()
             .filter(|bc| {
                 bc.symbol == component_name
-                    || bc.symbol == *interface_name
-                    || bc
-                        .referenced_components
-                        .iter()
-                        .any(|r| r == &component_name)
+                    || bc.symbol == *definition_name
+                    || bc.referenced_symbols.iter().any(|r| r == &component_name)
             })
             .map(|bc| BehavioralChange {
                 symbol: bc.symbol.clone(),
@@ -532,17 +529,15 @@ fn build_package_summaries(
                 source_file: bc.source_file.clone(),
                 confidence: bc.confidence,
                 evidence_type: bc.evidence_type.clone(),
-                referenced_components: bc.referenced_components.clone(),
+                referenced_symbols: bc.referenced_symbols.clone(),
                 is_internal_only: bc.is_internal_only,
             })
             .collect();
 
         let source_file = old_sym.qualified_name.split('.').next().map(PathBuf::from);
 
-        let removed_prop_names: Vec<&str> = removed_properties
-            .iter()
-            .map(|rp| rp.name.as_str())
-            .collect();
+        let removed_member_names: Vec<&str> =
+            removed_members.iter().map(|rp| rp.name.as_str()).collect();
         let child_components = discover_child_components(
             &component_name,
             &old_sym.qualified_name,
@@ -550,15 +545,15 @@ fn build_package_summaries(
             new_surface,
             structural_changes,
             behavioral_changes,
-            &removed_prop_names,
-            &removed_properties,
+            &removed_member_names,
+            &removed_members,
         );
 
         let summary = ComponentSummary {
             name: component_name.clone(),
-            interface_name: interface_name.clone(),
+            definition_name: definition_name.clone(),
             status,
-            property_summary: PropertySummary {
+            member_summary: MemberSummary {
                 total: total_members,
                 removed,
                 renamed,
@@ -566,7 +561,7 @@ fn build_package_summaries(
                 added,
                 removal_ratio,
             },
-            removed_properties,
+            removed_members,
             type_changes,
             migration_target,
             behavioral_changes: component_behavioral,
@@ -581,11 +576,11 @@ fn build_package_summaries(
                 name: pkg_name,
                 old_version: None,
                 new_version: None,
-                components: Vec::new(),
+                type_summaries: Vec::new(),
                 constants: Vec::new(),
-                added_components: Vec::new(),
+                added_exports: Vec::new(),
             });
-        pkg_entry.components.push(summary);
+        pkg_entry.type_summaries.push(summary);
     }
 
     // ── Step 5: Build constant groups ────────────────────────────────
@@ -651,9 +646,9 @@ fn build_package_summaries(
                 name: pkg_name.clone(),
                 old_version: None,
                 new_version: None,
-                components: Vec::new(),
+                type_summaries: Vec::new(),
                 constants: Vec::new(),
-                added_components: Vec::new(),
+                added_exports: Vec::new(),
             });
         pkg_entry.constants.push(group);
     }
@@ -685,7 +680,7 @@ fn build_package_summaries(
             None => continue,
         };
 
-        let added = AddedComponent {
+        let added = AddedExport {
             name: new_sym.name.clone(),
             qualified_name: new_sym.qualified_name.clone(),
             package: pkg_name.clone(),
@@ -697,11 +692,11 @@ fn build_package_summaries(
                 name: pkg_name,
                 old_version: None,
                 new_version: None,
-                components: Vec::new(),
+                type_summaries: Vec::new(),
                 constants: Vec::new(),
-                added_components: Vec::new(),
+                added_exports: Vec::new(),
             });
-        pkg_entry.added_components.push(added);
+        pkg_entry.added_exports.push(added);
     }
 
     package_map.into_values().collect()
@@ -717,8 +712,8 @@ fn discover_child_components(
     new_surface: &ApiSurface,
     structural_changes: &[StructuralChange],
     _behavioral_changes: &[BehavioralChange<TypeScript>],
-    removed_prop_names: &[&str],
-    removed_properties: &[RemovedProperty],
+    removed_member_names: &[&str],
+    removed_members: &[RemovedMember],
 ) -> Vec<ChildComponent> {
     let parent_dir = parent_qn.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
     if parent_dir.is_empty() {
@@ -733,7 +728,7 @@ fn discover_child_components(
         .map(|s| s.qualified_name.as_str())
         .collect();
 
-    let removed_set: HashSet<&str> = removed_prop_names.iter().copied().collect();
+    let removed_set: HashSet<&str> = removed_member_names.iter().copied().collect();
 
     let mut children_map: BTreeMap<String, ChildComponent> = BTreeMap::new();
 
@@ -790,7 +785,7 @@ fn discover_child_components(
             continue;
         }
 
-        let known_props: Vec<String> = sym.members.iter().map(|m| m.name.clone()).collect();
+        let known_members: Vec<String> = sym.members.iter().map(|m| m.name.clone()).collect();
 
         let props_iface_name = format!("{}Props", name);
         let props_members: Vec<String> = new_surface
@@ -800,15 +795,15 @@ fn discover_child_components(
             .map(|s| s.members.iter().map(|m| m.name.clone()).collect())
             .unwrap_or_default();
 
-        let mut all_props: HashSet<String> = known_props.into_iter().collect();
-        all_props.extend(props_members);
-        let all_props_sorted: Vec<String> = {
-            let mut v: Vec<String> = all_props.into_iter().collect();
+        let mut all_members: HashSet<String> = known_members.into_iter().collect();
+        all_members.extend(props_members);
+        let all_members_sorted: Vec<String> = {
+            let mut v: Vec<String> = all_members.into_iter().collect();
             v.sort();
             v
         };
 
-        let absorbed: Vec<String> = all_props_sorted
+        let absorbed: Vec<String> = all_members_sorted
             .iter()
             .filter(|p| removed_set.contains(p.as_str()))
             .cloned()
@@ -823,36 +818,36 @@ fn discover_child_components(
                 } else {
                     ChildComponentStatus::Added
                 },
-                known_props: all_props_sorted,
-                absorbed_props: absorbed,
+                known_members: all_members_sorted,
+                absorbed_members: absorbed,
             },
         );
     }
 
     // ── Enrichment pass: LLM removal_disposition ──
-    for rp in removed_properties {
-        if let Some(RemovalDisposition::MovedToChild {
-            target_component,
+    for rp in removed_members {
+        if let Some(RemovalDisposition::MovedToRelatedType {
+            target_type,
             mechanism,
         }) = &rp.removal_disposition
         {
-            if let Some(child) = children_map.get_mut(target_component) {
-                if !child.absorbed_props.contains(&rp.name) {
-                    child.absorbed_props.push(rp.name.clone());
-                    child.absorbed_props.sort();
+            if let Some(child) = children_map.get_mut(target_type) {
+                if !child.absorbed_members.contains(&rp.name) {
+                    child.absorbed_members.push(rp.name.clone());
+                    child.absorbed_members.sort();
                 }
             } else {
                 children_map.insert(
-                    target_component.clone(),
+                    target_type.clone(),
                     ChildComponent {
-                        name: target_component.clone(),
+                        name: target_type.clone(),
                         status: ChildComponentStatus::Added,
-                        known_props: if mechanism == "children" {
+                        known_members: if mechanism == "children" {
                             vec!["children".to_string()]
                         } else {
                             vec![rp.name.clone()]
                         },
-                        absorbed_props: vec![rp.name.clone()],
+                        absorbed_members: vec![rp.name.clone()],
                     },
                 );
             }
@@ -906,22 +901,17 @@ fn enrich_hierarchy_deltas(
         }
     }
 
-    // Enrich each delta with migrated props
+    // Enrich each delta with migrated members
     for delta in &mut deltas {
-        let removed_props: Vec<String> = report
+        let removed_member_names: Vec<String> = report
             .packages
             .iter()
-            .flat_map(|pkg| &pkg.components)
+            .flat_map(|pkg| &pkg.type_summaries)
             .find(|c| c.name == delta.component)
-            .map(|c| {
-                c.removed_properties
-                    .iter()
-                    .map(|rp| rp.name.clone())
-                    .collect()
-            })
+            .map(|c| c.removed_members.iter().map(|rp| rp.name.clone()).collect())
             .unwrap_or_default();
 
-        if removed_props.is_empty() {
+        if removed_member_names.is_empty() {
             continue;
         }
 
@@ -931,12 +921,12 @@ fn enrich_hierarchy_deltas(
                 None => continue,
             };
 
-            for removed_prop in &removed_props {
-                if child_props.contains(removed_prop) {
-                    delta.migrated_props.push(MigratedProp {
-                        prop_name: removed_prop.clone(),
+            for removed_member in &removed_member_names {
+                if child_props.contains(removed_member) {
+                    delta.migrated_members.push(MigratedMember {
+                        member_name: removed_member.clone(),
                         target_child: child.name.clone(),
-                        target_prop_name: None,
+                        target_member_name: None,
                     });
                 }
             }
@@ -955,7 +945,7 @@ fn enrich_hierarchy_deltas(
 
             let mut found = false;
             for pkg in &mut report.packages {
-                for comp in &mut pkg.components {
+                for comp in &mut pkg.type_summaries {
                     if comp.name == *comp_name {
                         found = true;
                         for ec in &expected {
@@ -971,21 +961,21 @@ fn enrich_hierarchy_deltas(
                 let target_idx = report
                     .packages
                     .iter()
-                    .position(|p| p.components.iter().any(|c| c.name.starts_with(family)))
+                    .position(|p| p.type_summaries.iter().any(|c| c.name.starts_with(family)))
                     .or_else(|| {
                         report
                             .packages
                             .iter()
-                            .position(|p| !p.components.is_empty())
+                            .position(|p| !p.type_summaries.is_empty())
                     });
 
                 if let Some(idx) = target_idx {
-                    report.packages[idx].components.push(ComponentSummary {
+                    report.packages[idx].type_summaries.push(ComponentSummary {
                         name: comp_name.clone(),
-                        interface_name: format!("{}Props", comp_name),
+                        definition_name: format!("{}Props", comp_name),
                         status: ComponentStatus::Modified,
-                        property_summary: PropertySummary::default(),
-                        removed_properties: vec![],
+                        member_summary: MemberSummary::default(),
+                        removed_members: vec![],
                         type_changes: vec![],
                         migration_target: None,
                         behavioral_changes: vec![],
@@ -1025,7 +1015,7 @@ fn enrich_hierarchy_deltas(
 
         let mut comp_children: HashMap<String, Vec<ExpectedChild>> = HashMap::new();
         for pkg in &report.packages {
-            for comp in &pkg.components {
+            for comp in &pkg.type_summaries {
                 if !comp.expected_children.is_empty() {
                     comp_children.insert(comp.name.clone(), comp.expected_children.clone());
                 }
@@ -1034,8 +1024,8 @@ fn enrich_hierarchy_deltas(
 
         let mut interface_to_component: HashMap<String, String> = HashMap::new();
         for pkg in &report.packages {
-            for comp in &pkg.components {
-                interface_to_component.insert(comp.interface_name.clone(), comp.name.clone());
+            for comp in &pkg.type_summaries {
+                interface_to_component.insert(comp.definition_name.clone(), comp.name.clone());
             }
         }
 
@@ -1043,12 +1033,12 @@ fn enrich_hierarchy_deltas(
         let mut inferred: Vec<(String, Vec<ExpectedChild>)> = Vec::new();
 
         for pkg in &report.packages {
-            for comp in &pkg.components {
+            for comp in &pkg.type_summaries {
                 if !comp.expected_children.is_empty() {
                     continue;
                 }
 
-                let base_interface = match extends_map.get(&comp.interface_name) {
+                let base_interface = match extends_map.get(&comp.definition_name) {
                     Some(b) => b,
                     None => continue,
                 };
@@ -1112,7 +1102,7 @@ fn enrich_hierarchy_deltas(
         // Apply inferred children
         for (comp_name, children) in inferred {
             for pkg in &mut report.packages {
-                for comp in &mut pkg.components {
+                for comp in &mut pkg.type_summaries {
                     if comp.name == comp_name {
                         for ec in &children {
                             if !comp.expected_children.iter().any(|e| e.name == ec.name) {
@@ -1138,10 +1128,10 @@ fn enrich_hierarchy_deltas(
     let total_migrated: usize = report
         .hierarchy_deltas
         .iter()
-        .map(|d| d.migrated_props.len())
+        .map(|d| d.migrated_members.len())
         .sum();
     eprintln!(
-        "[Hierarchy] Enriched {} deltas with {} migrated props, populated expected_children",
+        "[Hierarchy] Enriched {} deltas with {} migrated members, populated expected_children",
         report.hierarchy_deltas.len(),
         total_migrated,
     );
@@ -1407,10 +1397,10 @@ mod tests {
             behavioral_changes: vec![],
             manifest_changes: vec![],
             llm_api_changes: vec![],
-            old_surface: ApiSurface { symbols: vec![] },
-            new_surface: ApiSurface { symbols: vec![] },
+            old_surface: ApiSurface::default(),
+            new_surface: ApiSurface::default(),
             inferred_rename_patterns: None,
-            composition_changes: vec![],
+            container_changes: vec![],
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
         };
@@ -1468,10 +1458,10 @@ mod tests {
             behavioral_changes: vec![],
             manifest_changes: manifest,
             llm_api_changes: vec![],
-            old_surface: ApiSurface { symbols: vec![] },
-            new_surface: ApiSurface { symbols: vec![] },
+            old_surface: ApiSurface::default(),
+            new_surface: ApiSurface::default(),
             inferred_rename_patterns: None,
-            composition_changes: vec![],
+            container_changes: vec![],
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
         };
@@ -1494,7 +1484,7 @@ mod tests {
             source_file: Some("src/api/users.ts".into()),
             confidence: None,
             evidence_type: None,
-            referenced_components: vec![],
+            referenced_symbols: vec![],
             is_internal_only: None,
         }];
 
@@ -1503,10 +1493,10 @@ mod tests {
             behavioral_changes: behavioral,
             manifest_changes: vec![],
             llm_api_changes: vec![],
-            old_surface: ApiSurface { symbols: vec![] },
-            new_surface: ApiSurface { symbols: vec![] },
+            old_surface: ApiSurface::default(),
+            new_surface: ApiSurface::default(),
             inferred_rename_patterns: None,
-            composition_changes: vec![],
+            container_changes: vec![],
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
         };
@@ -1557,7 +1547,7 @@ mod tests {
             }],
         };
 
-        let new_surface = ApiSurface { symbols: vec![] };
+        let new_surface = ApiSurface::default();
 
         let structural_changes = vec![StructuralChange {
             symbol: "FooProps".to_string(),
@@ -1583,7 +1573,7 @@ mod tests {
             old_surface,
             new_surface,
             inferred_rename_patterns: None,
-            composition_changes: vec![],
+            container_changes: vec![],
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
         };
@@ -1592,7 +1582,7 @@ mod tests {
         let foo_comp = report
             .packages
             .iter()
-            .flat_map(|p| &p.components)
+            .flat_map(|p| &p.type_summaries)
             .find(|c| c.name == "Foo");
 
         assert!(foo_comp.is_some(), "Foo should appear in the report");
@@ -1691,7 +1681,7 @@ mod tests {
             old_surface,
             new_surface,
             inferred_rename_patterns: None,
-            composition_changes: vec![],
+            container_changes: vec![],
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
         };
@@ -1700,7 +1690,7 @@ mod tests {
         let icon_comp = report
             .packages
             .iter()
-            .flat_map(|p| &p.components)
+            .flat_map(|p| &p.type_summaries)
             .find(|c| c.name == "Icon");
 
         if let Some(comp) = icon_comp {

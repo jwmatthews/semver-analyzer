@@ -26,9 +26,7 @@ mod rename;
 mod tests;
 
 use crate::traits::LanguageSemantics;
-use crate::types::{
-    ApiSurface, ChangeSubject, StructuralChange, StructuralChangeType, Symbol, SymbolKind,
-};
+use crate::types::{ApiSurface, ChangeSubject, StructuralChange, StructuralChangeType, Symbol};
 use std::collections::{HashMap, HashSet};
 
 use compare::diff_symbol;
@@ -400,35 +398,27 @@ pub fn diff_surfaces_with_semantics(
                         && mig.target.removed_qualified_name
                             != mig.target.replacement_qualified_name
                     {
-                        let old_path = &mig.target.removed_qualified_name;
-                        let new_path = &mig.target.replacement_qualified_name;
-
-                        // Derive npm import paths from qualified names
-                        // e.g., "packages/react-core/src/deprecated/..." -> "@patternfly/react-core/deprecated"
-                        //        "packages/react-core/src/components/..." -> "@patternfly/react-core"
-                        let to_import_path = |qn: &str| -> String {
-                            // Extract "packages/<pkg-name>/src/..." and convert
-                            if let Some(rest) = qn.strip_prefix("packages/") {
-                                if let Some(idx) = rest.find("/src/") {
-                                    let pkg = &rest[..idx];
-                                    let after_src = &rest[idx + 5..]; // skip "/src/"
-                                    if after_src.starts_with("deprecated") {
-                                        return format!("@patternfly/{}/deprecated", pkg);
-                                    }
-                                    return format!("@patternfly/{}", pkg);
-                                }
-                            }
-                            qn.to_string()
-                        };
-
-                        let old_import = to_import_path(old_path);
-                        let new_import = to_import_path(new_path);
+                        // Use package fields (set by the language's extractor) for import paths.
+                        // Falls back to qualified names if package is not set.
+                        let old_import = mig
+                            .target
+                            .removed_package
+                            .as_deref()
+                            .unwrap_or(&mig.target.removed_qualified_name);
+                        let new_import = mig
+                            .target
+                            .replacement_package
+                            .as_deref()
+                            .unwrap_or(&mig.target.replacement_qualified_name);
 
                         if old_import != new_import {
                             format!(
-                                "\n  Import change: replace `import {{ {} }} from '{}'` with `import {{ {} }} from '{}'`",
-                                mig.target.removed_symbol, old_import,
-                                mig.target.replacement_symbol, new_import,
+                                "\n  Import change: {}",
+                                semantics.format_import_change(
+                                    &mig.target.removed_symbol,
+                                    old_import,
+                                    new_import,
+                                ),
                             )
                         } else {
                             String::new()
@@ -466,147 +456,45 @@ pub fn diff_surfaces_with_semantics(
     changes
 }
 
-/// Backward-compatible wrapper that uses the default (TypeScript) semantics.
+/// Compare two API surfaces using minimal semantics (no language-specific rules).
 ///
-/// This exists so that existing callers (orchestrator, tests, convenience
-/// function in traits.rs) continue to work without modification.
-/// Will be removed once all callers migrate to `diff_surfaces_with_semantics`.
+/// For language-aware diffing, use `diff_surfaces_with_semantics` instead.
 pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange> {
-    diff_surfaces_with_semantics(old, new, &DefaultSemantics)
+    diff_surfaces_with_semantics(old, new, &MinimalSemantics)
 }
 
-/// Default semantics that replicates the original hardcoded TypeScript behavior.
+/// Minimal semantics for testing the diff engine without language-specific rules.
 ///
-/// This is a temporary shim that preserves backward compatibility. It will be
-/// removed when all callers switch to passing an explicit `LanguageSemantics`.
-pub(crate) struct DefaultSemantics;
+/// Returns conservative defaults: no member additions are breaking,
+/// symbols in the same directory are the same family, identity is by name only.
+/// No union parsing, no post-processing.
+pub(crate) struct MinimalSemantics;
 
-impl LanguageSemantics for DefaultSemantics {
-    fn is_member_addition_breaking(&self, container: &Symbol, member: &Symbol) -> bool {
-        // Original TS behavior from compare.rs
-        match container.kind {
-            SymbolKind::Interface | SymbolKind::TypeAlias => {
-                let is_optional = member
-                    .signature
-                    .as_ref()
-                    .and_then(|s| s.parameters.first())
-                    .map(|p| p.optional)
-                    .unwrap_or(false);
-                !is_optional
-            }
-            _ => false,
-        }
+impl LanguageSemantics for MinimalSemantics {
+    fn is_member_addition_breaking(&self, _container: &Symbol, _member: &Symbol) -> bool {
+        false
     }
 
     fn same_family(&self, a: &Symbol, b: &Symbol) -> bool {
-        canonical_component_dir(&a.file.to_string_lossy())
-            == canonical_component_dir(&b.file.to_string_lossy())
+        // Same directory = same family (generic, no TS assumptions)
+        let a_dir = a
+            .file
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let b_dir = b
+            .file
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        a_dir == b_dir
     }
 
     fn same_identity(&self, a: &Symbol, b: &Symbol) -> bool {
-        strip_props_suffix(&a.name) == strip_props_suffix(&b.name)
+        a.name == b.name
     }
 
     fn visibility_rank(&self, v: crate::types::Visibility) -> u8 {
         helpers::visibility_rank(v)
     }
-
-    fn parse_union_values(&self, type_str: &str) -> Option<std::collections::BTreeSet<String>> {
-        parse_union_literals(type_str)
-    }
-
-    fn post_process(&self, changes: &mut Vec<StructuralChange>) {
-        dedup_default_exports(changes);
-    }
-}
-
-/// Parse TypeScript string literal union type (used by DefaultSemantics).
-fn parse_union_literals(type_str: &str) -> Option<std::collections::BTreeSet<String>> {
-    if !type_str.contains('\'') && !type_str.contains('"') {
-        return None;
-    }
-    if !type_str.contains('|') {
-        return None;
-    }
-    let mut literals = std::collections::BTreeSet::new();
-    for part in type_str.split('|') {
-        let trimmed = part.trim();
-        if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-            || (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        {
-            let value = &trimmed[1..trimmed.len() - 1];
-            if !value.is_empty() {
-                literals.insert(value.to_string());
-            }
-        }
-    }
-    if literals.len() >= 2 {
-        Some(literals)
-    } else {
-        None
-    }
-}
-
-/// Extract component directory, stripping /deprecated/ and /next/ (used by DefaultSemantics).
-fn canonical_component_dir(file_path: &str) -> String {
-    let canonical = file_path
-        .replace("/deprecated/", "/")
-        .replace("/next/", "/");
-    let canonical = if canonical.starts_with("deprecated/") {
-        canonical.strip_prefix("deprecated/").unwrap().to_string()
-    } else {
-        canonical
-    };
-    let canonical = if canonical.starts_with("next/") {
-        canonical.strip_prefix("next/").unwrap().to_string()
-    } else {
-        canonical
-    };
-    match canonical.rsplit_once('/') {
-        Some((dir, _)) => dir.to_string(),
-        None => canonical,
-    }
-}
-
-/// Strip "Props" suffix (used by DefaultSemantics).
-fn strip_props_suffix(name: &str) -> &str {
-    name.strip_suffix("Props").unwrap_or(name)
-}
-
-/// Remove redundant `default` export changes when a named sibling from the
-/// same file has the same change type.
-///
-/// Pattern: `packages/react-tokens/.../c_button.c_button` (named) and
-/// `packages/react-tokens/.../c_button.default` (default) both removed.
-/// We keep the named one and suppress the default.
-fn dedup_default_exports(changes: &mut Vec<StructuralChange>) {
-    // Build a set of (file_prefix, change_type) for all non-default changes.
-    // We use owned Strings to avoid borrowing from `changes`.
-    let named_changes: HashSet<(String, StructuralChangeType)> = changes
-        .iter()
-        .filter(|c| c.symbol != "default")
-        .filter_map(|c| {
-            file_prefix(&c.qualified_name).map(|prefix| (prefix.to_string(), c.change_type.clone()))
-        })
-        .collect();
-
-    // Retain changes that are either not `default` or don't have a named sibling
-    changes.retain(|c| {
-        if c.symbol != "default" {
-            return true;
-        }
-        // Check if there's a named sibling with the same change type
-        if let Some(prefix) = file_prefix(&c.qualified_name) {
-            !named_changes.contains(&(prefix.to_string(), c.change_type.clone()))
-        } else {
-            true
-        }
-    });
-}
-
-/// Extract the file prefix from a qualified_name (everything before the last `.`).
-///
-/// `packages/react-tokens/dist/esm/c_button.default` → `packages/react-tokens/dist/esm/c_button`
-fn file_prefix(qualified_name: &str) -> Option<&str> {
-    qualified_name.rsplit_once('.').map(|(prefix, _)| prefix)
 }

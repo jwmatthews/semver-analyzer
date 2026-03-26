@@ -1542,7 +1542,7 @@ pub fn api_change_to_strategy(
             }
 
             if matches!(change.kind, ApiChangeKind::Property | ApiChangeKind::Field) {
-                if let Some(RemovalDisposition::ReplacedByProp { ref new_prop }) =
+                if let Some(RemovalDisposition::ReplacedByMember { ref new_member }) =
                     change.removal_disposition
                 {
                     let old_name = change
@@ -1550,7 +1550,7 @@ pub fn api_change_to_strategy(
                         .rsplit_once('.')
                         .map(|(_, p)| p)
                         .unwrap_or(&change.symbol);
-                    return Some(FixStrategyEntry::rename(old_name, new_prop));
+                    return Some(FixStrategyEntry::rename(old_name, new_member));
                 }
 
                 let (component, prop) = extract_component_prop(&change.symbol);

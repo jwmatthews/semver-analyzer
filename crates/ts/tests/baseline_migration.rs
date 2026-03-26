@@ -7,10 +7,15 @@
 mod helpers;
 
 use helpers::*;
-use semver_analyzer_core::diff::diff_surfaces;
+use semver_analyzer_core::diff::diff_surfaces_with_semantics;
+use semver_analyzer_ts::TypeScript;
 
 fn diff(old: &ApiSurface, new: &ApiSurface) -> Vec<NormalizedChange> {
-    normalize(&diff_surfaces(old, new))
+    normalize(&diff_surfaces_with_semantics(
+        old,
+        new,
+        &TypeScript::default(),
+    ))
 }
 
 use semver_analyzer_core::*;
