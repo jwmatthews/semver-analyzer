@@ -1,6 +1,6 @@
 [package]
 name = "semver-analyzer-ts"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/semver-analyzer"
