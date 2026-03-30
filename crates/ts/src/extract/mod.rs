@@ -11,6 +11,7 @@ use oxc_span::{GetSpan, SourceType};
 use semver_analyzer_core::{
     AccessorKind, ApiSurface, Parameter, Signature, Symbol, SymbolKind, TypeParameter, Visibility,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Extracts API surfaces from TypeScript `.d.ts` files using the OXC parser.
@@ -88,12 +89,37 @@ impl OxcExtractor {
             symbols.extend(self.extract_from_source_with_globals(source, &mapped, &global_imports));
         }
 
-        // Phase 3: Set package name based on file path
+        // Phase 3: Set package name based on file path.
+        // Build a cache of directory name -> npm package name by reading
+        // each packages/<dir>/package.json for the "name" field.
+        let mut pkg_name_cache: HashMap<String, String> = HashMap::new();
+        for sym in &symbols {
+            let path_str = sym.file.to_string_lossy();
+            let parts: Vec<&str> = path_str.split('/').collect();
+            if parts.len() >= 2 && parts[0] == "packages" {
+                let dir_name = parts[1].to_string();
+                if !pkg_name_cache.contains_key(&dir_name) {
+                    let pkg_json_path = dir.join("packages").join(&dir_name).join("package.json");
+                    let npm_name = std::fs::read_to_string(&pkg_json_path)
+                        .ok()
+                        .and_then(|content| {
+                            serde_json::from_str::<serde_json::Value>(&content).ok()
+                        })
+                        .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()));
+                    if let Some(name) = npm_name {
+                        pkg_name_cache.insert(dir_name, name);
+                    }
+                }
+            }
+        }
+
         for sym in &mut symbols {
             let path_str = sym.file.to_string_lossy();
             let parts: Vec<&str> = path_str.split('/').collect();
             if parts.len() >= 2 && parts[0] == "packages" {
-                sym.package = Some(format!("@patternfly/{}", parts[1]));
+                if let Some(npm_name) = pkg_name_cache.get(parts[1]) {
+                    sym.package = Some(npm_name.clone());
+                }
             }
         }
 

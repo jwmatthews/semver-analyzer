@@ -903,11 +903,10 @@ pub fn generate_rules(
                     continue;
                 }
                 let symbol_names: Vec<&str> = cg.symbols.iter().map(|s| s.as_str()).collect();
-                let pattern = if cg.common_prefix_pattern.is_empty() {
-                    build_token_prefix_pattern(&symbol_names)
-                } else {
-                    cg.common_prefix_pattern.clone()
-                };
+                // Always recompute the pattern from symbol names for precision.
+                // The pre-computed common_prefix_pattern may use overly broad
+                // heuristics (e.g., `.*`) that cause false positives.
+                let pattern = build_token_prefix_pattern(&symbol_names);
                 let strategy_name = if cg.strategy_hint.is_empty() {
                     "Manual".to_string()
                 } else {
@@ -2685,14 +2684,29 @@ pub fn generate_dependency_update_rules(
 
         let new_version = format!("^{}", version);
 
-        // Match the package name in package.json using filecontent regex.
-        // We use filecontent instead of builtin.json xpath because xpath
-        // cannot handle keys containing '/' (e.g., @patternfly/react-core).
-        let escaped_name = npm_name.replace('/', r"\/").replace('@', r"\@");
-        let condition = KonveyorCondition::FileContent {
-            filecontent: FileContentFields {
-                pattern: format!("\"{}\"\\s*:", escaped_name),
-                file_pattern: "package\\.json$".to_string(),
+        // Use frontend.dependency condition to match by name and version bound.
+        // The provider checks dependencies/devDependencies/peerDependencies
+        // and only matches when the installed version is <= the old version
+        // (i.e., needs updating).
+        let condition = KonveyorCondition::FrontendDependency {
+            dependency: FrontendDependencyFields {
+                name: Some(npm_name.clone()),
+                nameregex: None,
+                // Fire when the dependency version is at or below the old (pre-breaking) version.
+                // The old version is the from_ref version (e.g., "5.4.0").
+                // Use a high patch number to catch all patch releases of the old major.
+                upperbound: {
+                    // Extract the major version from the from_ref (e.g., "v5.4.0" -> "5")
+                    let from_ref = &report.comparison.from_ref;
+                    let major = from_ref
+                        .trim_start_matches('v')
+                        .split('.')
+                        .next()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    Some(format!("{}.99.99", major))
+                },
+                lowerbound: None,
             },
         };
 
@@ -2971,7 +2985,7 @@ pub fn generate_conformance_rules(report: &AnalysisReport<TypeScript>) -> Vec<Ko
                 when: KonveyorCondition::FrontendReferenced {
                     referenced: FrontendReferencedFields {
                         pattern: format!("^{}$", regex_escape(&comp.name)),
-                        location: "IMPORT".to_string(),
+                        location: "JSX_COMPONENT".to_string(),
                         component: None,
                         parent: None,
                         value: None,
@@ -3043,6 +3057,27 @@ pub fn build_package_info_cache(
                 cache.insert(pkg_dir_name.to_string(), info);
             }
         }
+    }
+
+    // Also populate from report.packages which may have scoped names
+    // (e.g., "@patternfly/react-core") set by the report builder from
+    // Symbol.package. This serves as an additional source when git/disk
+    // reads fail.
+    for pkg in &report.packages {
+        // Derive the directory name from the package name
+        // e.g., "@patternfly/react-core" -> "react-core"
+        let dir_name = pkg.name.rsplit('/').next().unwrap_or(&pkg.name);
+        let entry = cache
+            .entry(dir_name.to_string())
+            .or_insert_with(|| PackageInfo {
+                name: dir_name.to_string(),
+                version: None,
+            });
+        // If the cache has a bare directory name but the report has the scoped name, upgrade
+        if !pkg.name.starts_with('@') || entry.name.starts_with('@') {
+            continue;
+        }
+        entry.name = pkg.name.clone();
     }
 
     if !cache.is_empty() {
@@ -3315,6 +3350,13 @@ fn api_change_to_rules(
 
     if let Some(pkg) = from_pkg {
         labels.push(format!("package={}", pkg));
+    }
+
+    // Tag additive (non-breaking) changes so analysis runs can filter them.
+    // These changes add new options without removing or modifying existing ones,
+    // meaning existing consumer code is unaffected.
+    if is_additive_change(change) {
+        labels.push("change-scope=additive".to_string());
     }
 
     let condition = build_frontend_condition(change, leaf_symbol, from_pkg);
@@ -9165,7 +9207,7 @@ mod tests {
         match &rule.when {
             KonveyorCondition::FrontendReferenced { referenced } => {
                 assert_eq!(referenced.pattern, "^MastheadToggle$");
-                assert_eq!(referenced.location, "IMPORT");
+                assert_eq!(referenced.location, "JSX_COMPONENT");
             }
             other => panic!("Expected FrontendReferenced, got {:?}", other),
         }

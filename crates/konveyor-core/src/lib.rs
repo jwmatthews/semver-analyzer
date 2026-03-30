@@ -25,8 +25,8 @@ use semver_analyzer_core::{ApiChange, ApiChangeKind, ApiChangeType, RemovalDispo
 // Rule definition types
 pub use konveyor_core::rule::{
     dedup_conditions, extract_file_pattern_from_condition, extract_frontend_refs,
-    FileContentFields, FrontendPatternFields, FrontendReferencedFields, JsonFields,
-    KonveyorCondition, KonveyorLink, KonveyorRule, KonveyorRuleset,
+    FileContentFields, FrontendDependencyFields, FrontendPatternFields, FrontendReferencedFields,
+    JsonFields, KonveyorCondition, KonveyorLink, KonveyorRule, KonveyorRuleset,
 };
 
 // Fix strategy types
@@ -323,22 +323,22 @@ pub struct PackageInfo {
 
 // ── Shared functions ────────────────────────────────────────────────────
 
-/// Build a regex pattern that matches all symbol names in a group by
-/// extracting common prefixes (up to the first `_` segment).
+/// Build a regex pattern that exactly matches any of the given symbol names.
+///
+/// Uses a precise alternation `^(sym1|sym2|...)$` rather than prefix heuristics.
+/// The `from` field on the condition already scopes to the package, so the pattern
+/// only needs to discriminate which specific exports are affected.
 pub fn build_token_prefix_pattern(symbols: &[&str]) -> String {
-    let mut prefixes: BTreeSet<String> = BTreeSet::new();
-    for sym in symbols {
-        if let Some(idx) = sym.find('_') {
-            prefixes.insert(format!("{}_", &sym[..idx]));
-        } else {
-            prefixes.insert(sym.to_string());
-        }
-    }
-    if prefixes.len() > 20 || prefixes.is_empty() {
+    if symbols.is_empty() {
         return ".*".to_string();
     }
-    let alts: Vec<String> = prefixes.into_iter().map(|p| regex_escape(&p)).collect();
-    format!("^({})", alts.join("|"))
+    let alts: Vec<String> = symbols
+        .iter()
+        .map(|s| regex_escape(s))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    format!("^({})$", alts.join("|"))
 }
 
 /// Build a single combined rule for a group of collapsible constant changes.
@@ -907,36 +907,22 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
     }
 }
 
-/// Build a regex pattern from the common prefix of a list of symbol names.
+/// Build a regex pattern that exactly matches any of the given symbol names.
+///
+/// Uses a precise alternation `^(sym1|sym2|...)$` rather than prefix heuristics.
+/// This replaces the previous approach that fell back to broad patterns when
+/// there were too many unique prefixes.
 pub fn build_common_prefix_pattern(symbols: &[&str]) -> String {
     if symbols.is_empty() {
         return ".*".to_string();
     }
-
-    let mut prefix_groups: BTreeMap<String, usize> = BTreeMap::new();
-    for sym in symbols {
-        let parts: Vec<&str> = sym.splitn(3, '_').collect();
-        let prefix = if parts.len() >= 2 {
-            format!("{}_{}", parts[0], parts[1])
-        } else {
-            sym.to_string()
-        };
-        *prefix_groups.entry(prefix).or_insert(0) += 1;
-    }
-
-    let top_prefixes: Vec<&str> = symbols
+    let alts: Vec<String> = symbols
         .iter()
-        .filter_map(|s| s.split('_').next())
-        .collect::<BTreeSet<&str>>()
+        .map(|s| regex_escape(s))
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-
-    if top_prefixes.len() <= 5 {
-        let alts: Vec<String> = top_prefixes.iter().map(|p| format!("{}_", p)).collect();
-        format!(r"\b({})", alts.join("|"))
-    } else {
-        r"\b[a-z][a-z0-9_]+_(Color|BackgroundColor|FontSize|BorderWidth|BoxShadow|FontWeight|Width|Height|ZIndex)\b".to_string()
-    }
+    format!("^({})$", alts.join("|"))
 }
 
 /// Increment the version number in a CSS prefix string.
@@ -1571,6 +1557,78 @@ pub fn extract_added_union_values(change: &ApiChange) -> Vec<String> {
     after_vals.difference(&before_vals).cloned().collect()
 }
 
+/// Determine whether an API change is purely additive (non-breaking for consumers).
+///
+/// Additive changes introduce new capabilities without removing or modifying
+/// existing ones. Existing consumer code continues to work without modification.
+///
+/// This function checks two categories:
+///
+/// 1. **TypeChanged** (union types): If the `before` union values are a subset of
+///    the `after` union values (i.e., no values were removed, only added), the
+///    change is additive. Example: `'primary' | 'secondary'` → `'primary' |
+///    'secondary' | 'stateful'`.
+///
+/// 2. **SignatureChanged**: Property additions, readonly additions, and base class
+///    widenings where no existing interface is removed. Detected by checking the
+///    description string for known additive patterns.
+///
+/// Returns `true` if the change is additive and should be labeled
+/// `change-scope=additive` so that analysis runs can filter these out.
+///
+/// NOTE: This function is intentionally called at rule creation time (not as a
+/// post-processing filter) because the underlying `ApiChange` data -- including
+/// `before`, `after`, and `description` -- is needed for the detection. Downstream
+/// consumers like `extract_compound_tokens()`, `extract_suffix_inventory()`, and
+/// `detect_css_prefix_changes()` still see the full set of `ApiChange` entries
+/// because they read from `report.breaking_api_changes`, not from generated rules.
+pub fn is_additive_change(change: &ApiChange) -> bool {
+    match change.change {
+        ApiChangeType::TypeChanged => {
+            // For union type changes, check if all before values still exist in after.
+            // If nothing was removed, the change only adds new options.
+            let removed = extract_removed_union_values(change);
+            let added = extract_added_union_values(change);
+
+            // Only consider it additive if we can actually parse union values
+            // from both sides and nothing was removed.
+            if removed.is_empty() && !added.is_empty() {
+                return true;
+            }
+
+            // TODO: Non-union type widening (e.g., `RefObject<HTMLUListElement>` →
+            // `RefObject<HTMLUListElement | null>`) cannot be reliably detected from
+            // string comparison alone. The report should carry structured type
+            // information (e.g., a `TypeChange` enum with `Widened`/`Narrowed`/`Replaced`
+            // variants) set by the diff engine which has the full AST context.
+            // See: semver-analyzer/crates/core/src/diff/compare.rs
+
+            false
+        }
+        ApiChangeType::SignatureChanged => {
+            // Check the description for known additive patterns.
+            let desc = change.description.to_lowercase();
+
+            // "property X was added to Y" -- new optional property
+            if desc.contains("was added to") || desc.contains("was added") {
+                return true;
+            }
+            // "X was made readonly" -- tightening mutability is non-breaking for consumers
+            if desc.contains("was made readonly") {
+                return true;
+            }
+            // "base class changed from none to X" -- adding a base class
+            if desc.contains("base class changed from none to") {
+                return true;
+            }
+
+            false
+        }
+        // Removed, Renamed, VisibilityChanged are never additive
+        _ => false,
+    }
+}
+
 // ── Message building ────────────────────────────────────────────────────
 
 pub fn build_api_message(change: &ApiChange, file_path: &str) -> String {
@@ -1786,5 +1844,268 @@ pub fn capitalize(s: &str) -> String {
             let upper: String = first.to_uppercase().collect();
             upper + chars.as_str()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── build_token_prefix_pattern tests ─────────────────────────────
+
+    #[test]
+    fn test_token_prefix_pattern_empty() {
+        assert_eq!(build_token_prefix_pattern(&[]), ".*");
+    }
+
+    #[test]
+    fn test_token_prefix_pattern_single_symbol() {
+        let result = build_token_prefix_pattern(&["EmptyStateHeader"]);
+        assert_eq!(result, "^(EmptyStateHeader)$");
+    }
+
+    #[test]
+    fn test_token_prefix_pattern_multiple_symbols() {
+        let result = build_token_prefix_pattern(&["Chip", "ChipGroup", "Text"]);
+        // BTreeSet deduplicates and sorts
+        assert_eq!(result, "^(Chip|ChipGroup|Text)$");
+    }
+
+    #[test]
+    fn test_token_prefix_pattern_with_underscores() {
+        // Symbols with underscores should be exact-matched, not prefix-collapsed
+        let result =
+            build_token_prefix_pattern(&["c_about_modal_box", "c_button", "global_font_size"]);
+        assert_eq!(result, "^(c_about_modal_box|c_button|global_font_size)$");
+    }
+
+    #[test]
+    fn test_token_prefix_pattern_many_symbols_no_wildcard() {
+        // Even with >20 symbols, should NOT fall back to .*
+        let symbols: Vec<String> = (0..30).map(|i| format!("Symbol{}", i)).collect();
+        let refs: Vec<&str> = symbols.iter().map(|s| s.as_str()).collect();
+        let result = build_token_prefix_pattern(&refs);
+        assert!(result.starts_with("^("));
+        assert!(result.ends_with(")$"));
+        assert!(!result.contains(".*"));
+        // All 30 symbols should be present
+        for sym in &symbols {
+            assert!(result.contains(sym.as_str()), "Missing symbol: {}", sym);
+        }
+    }
+
+    #[test]
+    fn test_token_prefix_pattern_deduplication() {
+        let result = build_token_prefix_pattern(&["Foo", "Bar", "Foo", "Bar", "Baz"]);
+        assert_eq!(result, "^(Bar|Baz|Foo)$");
+    }
+
+    #[test]
+    fn test_token_prefix_pattern_regex_special_chars() {
+        // Symbols with regex-special characters should be escaped
+        let result = build_token_prefix_pattern(&["Foo.Bar", "Baz(Qux)"]);
+        assert!(result.contains(r"Foo\.Bar"));
+        assert!(result.contains(r"Baz\(Qux\)"));
+    }
+
+    // ── build_common_prefix_pattern tests ────────────────────────────
+
+    #[test]
+    fn test_common_prefix_pattern_empty() {
+        assert_eq!(build_common_prefix_pattern(&[]), ".*");
+    }
+
+    #[test]
+    fn test_common_prefix_pattern_exact_alternation() {
+        let result = build_common_prefix_pattern(&[
+            "c_about_modal_box_brand_PaddingBottom",
+            "global_font_size_100",
+        ]);
+        // Should be exact alternation, not prefix-based
+        assert!(result.starts_with("^("));
+        assert!(result.ends_with(")$"));
+        assert!(result.contains("c_about_modal_box_brand_PaddingBottom"));
+        assert!(result.contains("global_font_size_100"));
+    }
+
+    #[test]
+    fn test_common_prefix_pattern_many_prefixes_no_fallback() {
+        // Even with many unique prefixes, should NOT fall back to a broad CSS suffix pattern
+        let symbols: Vec<String> = (0..10)
+            .map(|i| format!("prefix{}_some_suffix", i))
+            .collect();
+        let refs: Vec<&str> = symbols.iter().map(|s| s.as_str()).collect();
+        let result = build_common_prefix_pattern(&refs);
+        assert!(!result.contains("Color|BackgroundColor|FontSize"));
+        assert!(result.starts_with("^("));
+    }
+
+    // ── is_additive_change tests ─────────────────────────────────────
+
+    fn make_api_change(
+        change: ApiChangeType,
+        before: Option<&str>,
+        after: Option<&str>,
+        description: &str,
+    ) -> ApiChange {
+        ApiChange {
+            symbol: "Test.prop".into(),
+            kind: ApiChangeKind::Property,
+            change,
+            before: before.map(|s| s.into()),
+            after: after.map(|s| s.into()),
+            description: description.into(),
+            migration_target: None,
+            removal_disposition: None,
+            renders_element: None,
+        }
+    }
+
+    #[test]
+    fn test_additive_union_type_change() {
+        // Adding 'stateful' to ButtonVariant is additive
+        let change = make_api_change(
+            ApiChangeType::TypeChanged,
+            Some("'primary' | 'secondary' | 'tertiary'"),
+            Some("'primary' | 'secondary' | 'stateful' | 'tertiary'"),
+            "variant type changed",
+        );
+        assert!(
+            is_additive_change(&change),
+            "Adding union members should be additive"
+        );
+    }
+
+    #[test]
+    fn test_subtractive_union_type_change() {
+        // Removing 'tertiary' from ButtonVariant is NOT additive
+        let change = make_api_change(
+            ApiChangeType::TypeChanged,
+            Some("'primary' | 'secondary' | 'tertiary'"),
+            Some("'primary' | 'secondary'"),
+            "variant type changed",
+        );
+        assert!(
+            !is_additive_change(&change),
+            "Removing union members should NOT be additive"
+        );
+    }
+
+    #[test]
+    fn test_mixed_union_type_change() {
+        // Removing 'light-200' and adding 'secondary' is NOT additive
+        let change = make_api_change(
+            ApiChangeType::TypeChanged,
+            Some("'default' | 'light-200' | 'no-background'"),
+            Some("'default' | 'no-background' | 'secondary'"),
+            "colorVariant type changed",
+        );
+        assert!(
+            !is_additive_change(&change),
+            "Mixed add+remove should NOT be additive"
+        );
+    }
+
+    #[test]
+    fn test_non_union_type_widening_not_yet_detected() {
+        // RefObject<HTMLUListElement> → RefObject<HTMLUListElement | null> is additive
+        // but we can't reliably detect non-union type widening from strings alone.
+        // TODO: The report should carry structured type change info from the diff
+        // engine (e.g., TypeChange::Widened) to enable this detection.
+        let change = make_api_change(
+            ApiChangeType::TypeChanged,
+            Some("RefObject<HTMLUListElement>"),
+            Some("RefObject<HTMLUListElement | null>"),
+            "innerRef type changed",
+        );
+        assert!(
+            !is_additive_change(&change),
+            "Non-union type widening is not yet detected as additive (needs structured type info in report)"
+        );
+    }
+
+    #[test]
+    fn test_signature_property_added() {
+        let change = make_api_change(
+            ApiChangeType::SignatureChanged,
+            None,
+            None,
+            "property `isFullHeight` was added to `CodeEditorProps`",
+        );
+        assert!(
+            is_additive_change(&change),
+            "Property addition should be additive"
+        );
+    }
+
+    #[test]
+    fn test_signature_made_readonly() {
+        let change = make_api_change(
+            ApiChangeType::SignatureChanged,
+            Some("mutable"),
+            Some("readonly"),
+            "`AlertGroup` was made readonly",
+        );
+        assert!(
+            is_additive_change(&change),
+            "Making readonly should be additive"
+        );
+    }
+
+    #[test]
+    fn test_signature_base_class_added() {
+        let change = make_api_change(
+            ApiChangeType::SignatureChanged,
+            None,
+            None,
+            "`AccordionItemProps` base class changed from none to React.HTMLProps",
+        );
+        assert!(
+            is_additive_change(&change),
+            "Adding base class from none should be additive"
+        );
+    }
+
+    #[test]
+    fn test_signature_base_class_changed_not_additive() {
+        // Changing from one base class to another is NOT necessarily additive
+        let change = make_api_change(
+            ApiChangeType::SignatureChanged,
+            None,
+            None,
+            "`ChipProps` base class changed from React.HTMLProps to LabelProps",
+        );
+        assert!(
+            !is_additive_change(&change),
+            "Changing base class should NOT be additive"
+        );
+    }
+
+    #[test]
+    fn test_removed_is_never_additive() {
+        let change = make_api_change(
+            ApiChangeType::Removed,
+            Some("'primary' | 'secondary'"),
+            None,
+            "variant was removed",
+        );
+        assert!(
+            !is_additive_change(&change),
+            "Removed should never be additive"
+        );
+    }
+
+    #[test]
+    fn test_renamed_is_never_additive() {
+        let change = make_api_change(
+            ApiChangeType::Renamed,
+            None,
+            None,
+            "isOpen was renamed to isExpanded",
+        );
+        assert!(
+            !is_additive_change(&change),
+            "Renamed should never be additive"
+        );
     }
 }

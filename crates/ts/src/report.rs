@@ -323,11 +323,34 @@ fn build_package_summaries(
     }
 
     // ── Step 1: Resolve package names from qualified_name paths ──────
+    // Build a directory-name -> npm-scoped-name mapping from the API surfaces.
+    // Symbol.package carries the full scoped name (e.g., "@patternfly/react-core")
+    // while qualified_name paths use bare directory names (e.g., "packages/react-core/...").
+    let mut dir_to_npm: HashMap<String, String> = HashMap::new();
+    for sym in old_surface.symbols.iter().chain(new_surface.symbols.iter()) {
+        if let Some(ref npm_name) = sym.package {
+            let path_str = sym.file.to_string_lossy();
+            let parts: Vec<&str> = path_str.split('/').collect();
+            if let Some(pkg_idx) = parts.iter().position(|&p| p == "packages") {
+                if let Some(dir_name) = parts.get(pkg_idx + 1) {
+                    dir_to_npm
+                        .entry(dir_name.to_string())
+                        .or_insert_with(|| npm_name.clone());
+                }
+            }
+        }
+    }
+
     let resolve_package = |qualified_name: &str| -> Option<String> {
         let parts: Vec<&str> = qualified_name.split('/').collect();
         if let Some(pkg_idx) = parts.iter().position(|&p| p == "packages") {
             if pkg_idx + 1 < parts.len() {
-                return Some(parts[pkg_idx + 1].to_string());
+                let dir_name = parts[pkg_idx + 1];
+                // Prefer the scoped npm name from Symbol.package if available
+                if let Some(npm_name) = dir_to_npm.get(dir_name) {
+                    return Some(npm_name.clone());
+                }
+                return Some(dir_name.to_string());
             }
         }
         if !parts.is_empty() && parts.len() > 1 {
@@ -2085,6 +2108,108 @@ mod tests {
                 "variant"
             ),
             "Button.variant"
+        );
+    }
+
+    #[test]
+    fn package_summaries_use_scoped_npm_name_from_symbol_package() {
+        // When Symbol.package has a scoped npm name (e.g., "@patternfly/react-core"),
+        // the PackageChanges.name should use that instead of the bare directory name.
+        use semver_analyzer_core::StructuralChangeType;
+
+        let old_surface = ApiSurface {
+            symbols: vec![Symbol {
+                name: "ButtonProps".into(),
+                qualified_name: "packages/react-core/src/components/Button/Button.ButtonProps"
+                    .into(),
+                kind: SymbolKind::Interface,
+                visibility: Visibility::Exported,
+                file: "packages/react-core/src/components/Button/Button.d.ts".into(),
+                package: Some("@patternfly/react-core".into()),
+                import_path: None,
+                line: 1,
+                signature: None,
+                extends: None,
+                implements: vec![],
+                is_abstract: false,
+                type_dependencies: vec![],
+                is_readonly: false,
+                is_static: false,
+                accessor_kind: None,
+                members: vec![Symbol {
+                    name: "variant".into(),
+                    qualified_name:
+                        "packages/react-core/src/components/Button/Button.ButtonProps.variant"
+                            .into(),
+                    kind: SymbolKind::Property,
+                    visibility: Visibility::Public,
+                    file: "packages/react-core/src/components/Button/Button.d.ts".into(),
+                    package: Some("@patternfly/react-core".into()),
+                    import_path: None,
+                    line: 5,
+                    signature: None,
+                    extends: None,
+                    implements: vec![],
+                    is_abstract: false,
+                    type_dependencies: vec![],
+                    is_readonly: false,
+                    is_static: false,
+                    accessor_kind: None,
+                    members: vec![],
+                }],
+            }],
+        };
+
+        let new_surface = ApiSurface {
+            symbols: vec![Symbol {
+                name: "ButtonProps".into(),
+                qualified_name: "packages/react-core/src/components/Button/Button.ButtonProps"
+                    .into(),
+                kind: SymbolKind::Interface,
+                visibility: Visibility::Exported,
+                file: "packages/react-core/src/components/Button/Button.d.ts".into(),
+                package: Some("@patternfly/react-core".into()),
+                import_path: None,
+                line: 1,
+                signature: None,
+                extends: None,
+                implements: vec![],
+                is_abstract: false,
+                type_dependencies: vec![],
+                is_readonly: false,
+                is_static: false,
+                accessor_kind: None,
+                members: vec![],
+            }],
+        };
+
+        let structural_changes = vec![semver_analyzer_core::StructuralChange {
+            symbol: "variant".into(),
+            qualified_name: "packages/react-core/src/components/Button/Button.ButtonProps.variant"
+                .into(),
+            kind: SymbolKind::Property,
+            package: Some("@patternfly/react-core".into()),
+            change_type: StructuralChangeType::Removed(
+                semver_analyzer_core::ChangeSubject::Member {
+                    name: "variant".into(),
+                    kind: SymbolKind::Property,
+                },
+            ),
+            before: Some("property: variant: 'primary' | 'secondary'".into()),
+            after: None,
+            is_breaking: true,
+            description: "Property 'variant' was removed from ButtonProps".into(),
+            migration_target: None,
+            impact: None,
+        }];
+
+        let packages =
+            build_package_summaries(&structural_changes, &[], &old_surface, &new_surface, &[]);
+
+        assert_eq!(packages.len(), 1, "Should have one package");
+        assert_eq!(
+            packages[0].name, "@patternfly/react-core",
+            "Package name should be the scoped npm name from Symbol.package, not the bare directory name"
         );
     }
 }
