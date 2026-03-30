@@ -18,106 +18,20 @@ use semver_analyzer_core::{
     MigratedMember, RemovalDisposition, RemovedMember,
 };
 
-// Re-export shared types from konveyor-core so downstream users can access them.
-pub use semver_analyzer_konveyor_core::{
-    api_change_to_strategy,
-    api_change_type_label,
-    api_kind_label,
-    build_api_message,
-    build_combined_constant_rule,
-    build_common_prefix_pattern,
-    build_frontend_condition,
-    build_pattern,
-    build_token_prefix_pattern,
-    capitalize,
-    consolidate_rules,
-    consolidation_key,
-    dedup_conditions,
-    default_effort_1,
-    default_effort_2,
-    default_mandatory,
-    default_potential,
-    // Functions
-    default_ts_file_pattern,
-    derive_common_suffix,
-    detect_version_prefix,
-    effort_for_api_change,
-    extract_added_union_values,
-    extract_component_prop,
-    extract_file_pattern_from_condition,
-    extract_fix_strategies,
-    extract_frontend_refs,
-    extract_leaf_symbol,
-    extract_package_from_path,
-    extract_package_path,
-    extract_removed_union_values,
-    extract_target_prop,
-    extract_trailing_suffix,
-    extract_value_filter,
-    fix_guidance_dir_for,
-    increment_version_prefix,
-    is_single_quoted_value,
-    member_key_re,
-    merge_rule_group,
-    parse_union_string_values,
-    read_package_json_at_ref,
-    read_package_json_from_file,
-    regex_escape,
-    resolve_npm_package,
-    sanitize_id,
-    strategy_priority,
-    suppress_redundant_prop_rules,
-    suppress_redundant_prop_value_rules,
-    suppress_redundant_token_rules,
-    unique_id,
-    write_conformance_rules,
-    write_fix_guidance_dir,
-    write_fix_strategies,
-    ComponentWarningEntry,
-    CompositionRuleEntry,
-    CompoundToken,
-    ConstantGroupKey,
-    FileContentFields,
-    FixConfidence,
-    FixGuidanceDoc,
-    FixGuidanceEntry,
-    FixSource,
-    FixStrategy,
-    FixStrategyEntry,
-    FixSummary,
-    FrontendPatternFields,
-    FrontendReferencedFields,
-    JsonFields,
-    // Enums
-    KonveyorCondition,
-    KonveyorLink,
-    KonveyorRule,
-    KonveyorRuleset,
-    MappingEntry,
-    MemberMappingEntry,
-    MigrationInfo,
-    MissingImportEntry,
-    PackageInfo,
-    PropRenameEntry,
-    // Structs
-    RenamePatternEntry,
-    RenamePatterns,
-    RenamePatternsFile,
-    ValueReviewEntry,
-    // Consts
-    CONSTANT_COLLAPSE_THRESHOLD,
-};
+// Re-export all types and functions from semver-analyzer-konveyor-core.
+// That crate now re-exports shared types from the `konveyor-core` crate,
+// so downstream consumers get the canonical shared types transitively.
+pub use semver_analyzer_konveyor_core::*;
+
+type ConstantGroupEntries<'a> = Vec<(&'a ApiChange, Option<String>, FixStrategyEntry)>;
 
 fn detect_collapsible_constant_groups<'a>(
     report: &'a AnalysisReport<TypeScript>,
     pkg_cache: &HashMap<String, String>,
     rename_patterns: &RenamePatterns,
     member_renames: &HashMap<String, String>,
-) -> HashMap<ConstantGroupKey, Vec<(&'a ApiChange, Option<String>, FixStrategyEntry)>> {
-    let mut groups: HashMap<
-        ConstantGroupKey,
-        Vec<(&'a ApiChange, Option<String>, FixStrategyEntry)>,
-    > = HashMap::new();
+) -> HashMap<ConstantGroupKey, ConstantGroupEntries<'a>> {
+    let mut groups: HashMap<ConstantGroupKey, ConstantGroupEntries<'a>> = HashMap::new();
 
     for file_changes in &report.changes {
         let from_pkg = resolve_npm_package(&file_changes.file.to_string_lossy(), pkg_cache);
@@ -327,7 +241,7 @@ fn build_migration_message_legacy(
                         && sym != prefix
                         && sym != &props_name
                         && !sym.ends_with("Props")
-                        && sym.chars().next().map_or(false, |ch| ch.is_uppercase())
+                        && sym.chars().next().is_some_and(|ch| ch.is_uppercase())
                     {
                         child_components.entry(sym.clone()).or_default();
                     }
@@ -1002,11 +916,7 @@ pub fn generate_rules(
 
                 let change_type_str = api_change_type_label(&cg.change_type);
                 let kind_str = api_kind_label(&ApiChangeKind::Constant);
-                let slug = pkg
-                    .name
-                    .replace('@', "")
-                    .replace('/', "-")
-                    .replace('.', "-");
+                let slug = pkg.name.replace('@', "").replace(['/', '.'], "-");
                 let strategy_slug = strategy_name.to_lowercase().replace(' ', "-");
                 let base_id = format!(
                     "semver-{}-constant-{}-{}-combined",
@@ -1132,7 +1042,7 @@ pub fn generate_rules(
                     if let Some(strat) = api_change_to_strategy(
                         api_change,
                         rename_patterns,
-                        &member_renames,
+                        member_renames,
                         &file_path_str,
                     ) {
                         if collapsed_keys.contains(&(
@@ -1171,7 +1081,7 @@ pub fn generate_rules(
                 from_pkg.as_deref(),
                 &mut id_counts,
                 rename_patterns,
-                &member_renames,
+                member_renames,
             );
             rules.extend(new_rules);
         }
@@ -1508,7 +1418,7 @@ pub fn generate_rules(
                         continue;
                     }
                     let sym = &api_change.symbol;
-                    if !sym.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    if !sym.chars().next().is_some_and(|c| c.is_uppercase()) {
                         continue;
                     }
                     if !sym.chars().any(|c| c.is_lowercase()) {
@@ -2121,7 +2031,7 @@ pub fn generate_rules(
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string()),
                 ) {
-                    if file_stem.chars().next().map_or(false, |c| c.is_uppercase())
+                    if file_stem.chars().next().is_some_and(|c| c.is_uppercase())
                         && !path_str.contains(".d.ts")
                     {
                         dir_to_added.entry(dir).or_default().push(file_stem);
@@ -2166,7 +2076,7 @@ pub fn generate_rules(
                 if !component_name
                     .chars()
                     .next()
-                    .map_or(false, |c| c.is_uppercase())
+                    .is_some_and(|c| c.is_uppercase())
                 {
                     continue;
                 }
@@ -2413,7 +2323,7 @@ pub fn generate_rules(
                                     let type_hint = ac
                                         .after
                                         .as_deref()
-                                        .and_then(|t| t.split(':').last())
+                                        .and_then(|t| t.split(':').next_back())
                                         .map(|t| format!(" ({})", t.trim()))
                                         .unwrap_or_default();
                                     prop_instructions.push(format!(
@@ -2770,10 +2680,7 @@ pub fn generate_dependency_update_rules(
         };
 
         // Generate a slug-safe rule ID from the package name
-        let slug = npm_name
-            .replace('@', "")
-            .replace('/', "-")
-            .replace('.', "-");
+        let slug = npm_name.replace('@', "").replace(['/', '.'], "-");
         let rule_id = format!("semver-dep-update-{}", slug);
 
         let new_version = format!("^{}", version);
@@ -3576,11 +3483,7 @@ fn behavioral_change_to_rule(
     // part) for JSX_COMPONENT matching.  The leaf ("render") is the method that
     // changed, but the detection target is the component consumers use in JSX.
     let leaf_symbol = if change.symbol.contains('.') {
-        change
-            .symbol
-            .splitn(2, '.')
-            .next()
-            .unwrap_or(&change.symbol)
+        change.symbol.split('.').next().unwrap_or(&change.symbol)
     } else {
         extract_leaf_symbol(&change.symbol)
     };

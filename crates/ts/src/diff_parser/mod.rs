@@ -26,6 +26,7 @@ use std::process::Command;
 /// TypeScript/JavaScript DiffParser implementation.
 ///
 /// Uses git commands to retrieve file versions and OXC to parse source ASTs.
+#[derive(Default)]
 pub struct TsDiffParser;
 
 impl TsDiffParser {

@@ -1,0 +1,14 @@
+---
+source: crates/ts/tests/baseline_diff.rs
+assertion_line: 885
+expression: "diff(&old, &new)"
+---
+- symbol: Chart
+  qualified_name: packages/react-charts/src/components/Chart/Chart.Chart
+  kind: Variable
+  change_type: "Relocated { from: Symbol { kind: Variable }, to: Symbol { kind: Variable } }"
+  is_breaking: true
+  description: "variable `Chart` moved from `@patternfly/react-charts` to `@patternfly/react-charts/victory`"
+  before: "@patternfly/react-charts"
+  after: "@patternfly/react-charts/victory"
+  has_migration_target: false

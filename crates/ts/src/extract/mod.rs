@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 /// via span slicing (`source[start..end]`), not by walking/reconstructing the
 /// type AST. This preserves exactly what `tsc` produced, which is already
 /// partially canonicalized. Additional canonicalization is done in Step 4.
+#[derive(Default)]
 pub struct OxcExtractor;
 
 impl OxcExtractor {
@@ -50,7 +51,9 @@ impl OxcExtractor {
 
         // Phase -1: Filter to only files reachable from package entry points (index.d.ts).
         // This excludes internal implementation files that aren't re-exported.
-        let files = filter_to_reachable(&all_files, dir);
+        // Also builds a provenance map for import_path detection.
+        let reachability = filter_to_reachable(&all_files, dir);
+        let files = &reachability.files;
 
         // Phase 0: Scan @types/* for global namespace declarations
         let mut global_imports = scan_types_packages(dir);
@@ -58,7 +61,7 @@ impl OxcExtractor {
 
         // Phase 1: Collect per-file imports, merge namespace/default into global
         let mut file_sources: Vec<(PathBuf, String)> = Vec::new();
-        for file_path in &files {
+        for file_path in files {
             let source = std::fs::read_to_string(file_path)
                 .with_context(|| format!("Failed to read {}", file_path.display()))?;
             let file_imports = collect_imports_from_source(&source);
@@ -92,6 +95,13 @@ impl OxcExtractor {
             if parts.len() >= 2 && parts[0] == "packages" {
                 sym.package = Some(format!("@patternfly/{}", parts[1]));
             }
+        }
+
+        // Phase 4: Set import_path based on entry point provenance.
+        // If a symbol is only reachable from a subpath entry point (e.g.,
+        // victory/index.d.ts), its import_path differs from the package root.
+        if !reachability.provenance.is_empty() {
+            set_import_paths(&mut symbols, &file_sources, &reachability.provenance, dir);
         }
 
         Ok(ApiSurface { symbols })
@@ -252,6 +262,17 @@ fn find_dts_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Result of filtering files to those reachable from package entry points.
+struct ReachabilityResult {
+    /// Files that are reachable from at least one entry point.
+    files: Vec<PathBuf>,
+    /// Map from reachable file to the entry point `index.d.ts` files it was reached from.
+    /// Used to determine `import_path` for each symbol — if a file is only reachable
+    /// from a subpath entry point (e.g., `victory/index.d.ts`), its symbols need a
+    /// different import specifier than those reachable from the root `index.d.ts`.
+    provenance: std::collections::HashMap<PathBuf, Vec<PathBuf>>,
+}
+
 /// Filter files to only those reachable from package entry points (`index.d.ts`).
 ///
 /// Traces the `export * from './path'` and `export { X } from './path'` re-export
@@ -259,10 +280,13 @@ fn find_dts_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// graph are included. This excludes internal implementation files that have `.d.ts`
 /// declarations but are not part of the public API.
 ///
+/// Also builds a provenance map recording which entry point(s) each file is
+/// reachable from, enabling `import_path` detection for subpath exports.
+///
 /// If no `index.d.ts` files are found, returns all files unchanged (fallback for
 /// packages without barrel exports).
-fn filter_to_reachable(files: &[PathBuf], _base_dir: &Path) -> Vec<PathBuf> {
-    use std::collections::{HashSet, VecDeque};
+fn filter_to_reachable(files: &[PathBuf], _base_dir: &Path) -> ReachabilityResult {
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     // Find all index.d.ts entry points
     let index_files: Vec<&PathBuf> = files
@@ -271,41 +295,45 @@ fn filter_to_reachable(files: &[PathBuf], _base_dir: &Path) -> Vec<PathBuf> {
         .collect();
 
     if index_files.is_empty() {
-        return files.to_vec(); // No entry points found — keep everything
+        return ReachabilityResult {
+            files: files.to_vec(),
+            provenance: HashMap::new(),
+        };
     }
 
     // Build a lookup set for fast path resolution
     let file_set: HashSet<PathBuf> = files.iter().cloned().collect();
 
-    // BFS: start from each index.d.ts and follow re-exports
-    let mut reachable: HashSet<PathBuf> = HashSet::new();
-    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+    // Run a separate BFS from each entry point to track provenance.
+    // A file may be reachable from multiple entry points.
+    let mut provenance: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
-    for idx in &index_files {
-        let canonical = idx.to_path_buf();
-        reachable.insert(canonical.clone());
-        queue.push_back(canonical);
-    }
+    for entry_point in &index_files {
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        let mut queue: VecDeque<PathBuf> = VecDeque::new();
 
-    while let Some(file) = queue.pop_front() {
-        let source = match std::fs::read_to_string(&file) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        let ep = entry_point.to_path_buf();
+        visited.insert(ep.clone());
+        queue.push_back(ep.clone());
 
-        // Parse export statements to find re-exported paths
-        let parent_dir = file.parent().unwrap_or(std::path::Path::new("."));
-        for line in source.lines() {
-            let trimmed = line.trim();
-            // Match: export * from './path';
-            //        export { X, Y } from './path';
-            //        export type { X } from './path';
-            if let Some(from_path) = extract_export_from_path(trimmed) {
-                // Resolve the relative path
-                let resolved = resolve_dts_path(parent_dir, &from_path, &file_set);
-                if let Some(resolved) = resolved {
-                    if reachable.insert(resolved.clone()) {
-                        queue.push_back(resolved);
+        while let Some(file) = queue.pop_front() {
+            // Record that this file is reachable from this entry point
+            provenance.entry(file.clone()).or_default().push(ep.clone());
+
+            let source = match std::fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let parent_dir = file.parent().unwrap_or(std::path::Path::new("."));
+            for line in source.lines() {
+                let trimmed = line.trim();
+                if let Some(from_path) = extract_export_from_path(trimmed) {
+                    let resolved = resolve_dts_path(parent_dir, &from_path, &file_set);
+                    if let Some(resolved) = resolved {
+                        if visited.insert(resolved.clone()) {
+                            queue.push_back(resolved);
+                        }
                     }
                 }
             }
@@ -315,7 +343,7 @@ fn filter_to_reachable(files: &[PathBuf], _base_dir: &Path) -> Vec<PathBuf> {
     let original_count = files.len();
     let filtered: Vec<PathBuf> = files
         .iter()
-        .filter(|f| reachable.contains(*f))
+        .filter(|f| provenance.contains_key(*f))
         .cloned()
         .collect();
 
@@ -329,7 +357,10 @@ fn filter_to_reachable(files: &[PathBuf], _base_dir: &Path) -> Vec<PathBuf> {
         );
     }
 
-    filtered
+    ReachabilityResult {
+        files: filtered,
+        provenance,
+    }
 }
 
 /// Extract the `from` path from an export statement.
@@ -399,8 +430,7 @@ fn resolve_dts_path(
 
     // Try: strip .js extension and add .d.ts
     // (TypeScript emits `export * from './Button.js'` in some configs)
-    if from_path.ends_with(".js") {
-        let without_js = &from_path[..from_path.len() - 3];
+    if let Some(without_js) = from_path.strip_suffix(".js") {
         let with_dts = parent_dir.join(without_js).with_extension("d.ts");
         if file_set.contains(&with_dts) {
             return Some(with_dts);
@@ -411,6 +441,142 @@ fn resolve_dts_path(
         }
     }
 
+    None
+}
+
+// ─── Import path resolution ──────────────────────────────────────────────
+
+/// Set `import_path` on symbols based on entry point provenance.
+///
+/// When a symbol is only reachable from a subpath entry point (e.g.,
+/// `victory/index.d.ts` rather than the root `index.d.ts`), its consumer-facing
+/// import path differs from the package name. For example:
+/// - Root entry: `import { Button } from '@patternfly/react-core'` → import_path = None
+/// - Subpath entry: `import { Chart } from '@patternfly/react-charts/victory'` →
+///   import_path = Some("@patternfly/react-charts/victory")
+fn set_import_paths(
+    symbols: &mut [Symbol],
+    file_sources: &[(PathBuf, String)],
+    provenance: &std::collections::HashMap<PathBuf, Vec<PathBuf>>,
+    base_dir: &Path,
+) {
+    use std::collections::HashMap;
+
+    // Build a map from remapped (src/) file path → original file path,
+    // so we can look up provenance for each symbol.
+    let mut remap_to_original: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for (file_path, _) in file_sources {
+        let relative = file_path.strip_prefix(base_dir).unwrap_or(file_path);
+        let mapped = remap_dist_to_src(relative);
+        remap_to_original.insert(mapped, file_path.clone());
+    }
+
+    for sym in symbols.iter_mut() {
+        let original_path = match remap_to_original.get(&sym.file) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let entry_points = match provenance.get(original_path) {
+            Some(eps) => eps,
+            None => continue,
+        };
+
+        if entry_points.is_empty() {
+            continue;
+        }
+
+        // Compute the subpath for each entry point this symbol is reachable from.
+        // If any entry point is the root (no subpath), import_path stays None.
+        let mut shortest_subpath: Option<String> = None;
+        let mut is_root = false;
+
+        for ep in entry_points {
+            let ep_relative = ep.strip_prefix(base_dir).unwrap_or(ep);
+            match entry_point_subpath(ep_relative) {
+                None => {
+                    // Reachable from root entry point — no subpath needed
+                    is_root = true;
+                    break;
+                }
+                Some(subpath) => {
+                    // Track the shortest subpath (most general)
+                    if shortest_subpath
+                        .as_ref()
+                        .is_none_or(|s| subpath.len() < s.len())
+                    {
+                        shortest_subpath = Some(subpath);
+                    }
+                }
+            }
+        }
+
+        if is_root {
+            // Reachable from root — import_path is same as package (leave as None)
+            continue;
+        }
+
+        // Symbol is only reachable from subpath entry point(s).
+        // Set import_path = "<package>/<subpath>"
+        if let (Some(ref pkg), Some(ref subpath)) = (&sym.package, &shortest_subpath) {
+            sym.import_path = Some(format!("{}/{}", pkg, subpath));
+            tracing::trace!(
+                symbol = %sym.name,
+                import_path = %sym.import_path.as_deref().unwrap_or("?"),
+                "Symbol import path set from subpath entry point"
+            );
+        }
+    }
+}
+
+/// Extract the subpath from an entry point `index.d.ts` path.
+///
+/// Given a relative path to an `index.d.ts` entry point file, extracts the
+/// subpath between the `dist/<variant>/` (or `src/`) segment and the `index.d.ts`
+/// filename.
+///
+/// Returns:
+/// - `None` if this is the root entry point (no subpath)
+/// - `Some("victory")` if the entry point is at `dist/esm/victory/index.d.ts`
+///
+/// Examples:
+/// - `packages/react-charts/dist/esm/index.d.ts` → None (root)
+/// - `packages/react-charts/dist/esm/victory/index.d.ts` → Some("victory")
+/// - `packages/react-charts/src/victory/index.d.ts` → Some("victory")
+/// - `packages/react-charts/dist/esm/charts/victory/index.d.ts` → Some("charts/victory")
+fn entry_point_subpath(entry_point_relative: &Path) -> Option<String> {
+    let path_str = entry_point_relative.to_string_lossy();
+
+    // Known dist output directory patterns
+    let dist_segments = [
+        "/dist/esm/",
+        "/dist/js/",
+        "/dist/cjs/",
+        "/dist/mjs/",
+        "/dist/es/",
+        "/dist/commonjs/",
+        "/dist/lib/",
+        "/dist/",
+        "/src/",
+    ];
+
+    for segment in &dist_segments {
+        if let Some(pos) = path_str.find(segment) {
+            let after = &path_str[pos + segment.len()..];
+            // Strip the trailing "index.d.ts" filename
+            let subpath = after
+                .strip_suffix("index.d.ts")
+                .unwrap_or(after)
+                .trim_end_matches('/');
+
+            if subpath.is_empty() {
+                return None; // Root entry point
+            }
+            return Some(subpath.to_string());
+        }
+    }
+
+    // Fallback: no recognized structure, treat as root
     None
 }
 
@@ -520,7 +686,7 @@ fn offset_to_line(offsets: &[u32], offset: u32) -> usize {
 // ─── Source text extraction ───────────────────────────────────────────────
 
 /// Extract source text for a span. Used for type annotations, default values, etc.
-fn span_text<'a>(source: &'a str, span: oxc_span::Span) -> &'a str {
+fn span_text(source: &str, span: oxc_span::Span) -> &str {
     &source[span.start as usize..span.end as usize]
 }
 
@@ -916,7 +1082,7 @@ fn extract_statement(
             } else {
                 // `export * from './module'`
                 let mut sym = Symbol::new(
-                    format!("*"),
+                    "*".to_string(),
                     qualified_name(file, &["*"]),
                     SymbolKind::Namespace,
                     Visibility::Exported,

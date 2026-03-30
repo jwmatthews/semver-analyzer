@@ -182,7 +182,7 @@ fn diff_exports(old: &Value, new: &Value, changes: &mut Vec<ManifestChange<TypeS
             }
 
             // Find added entries
-            for (path, _) in &new_flat {
+            for path in new_flat.keys() {
                 if !old_flat.contains_key(path.as_str()) {
                     changes.push(ManifestChange {
                         field: format!("exports.{}", path),

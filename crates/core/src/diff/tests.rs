@@ -1627,6 +1627,119 @@ fn no_op_rename_is_skipped() {
     );
 }
 
+/// When import_path differs (e.g., root → subpath export), emit a Relocated change.
+#[test]
+fn no_op_rename_with_different_import_path_emits_relocated() {
+    // Old surface: Chart reachable from root entry (@patternfly/react-charts)
+    let mut old_sym = sym("Chart", SymbolKind::Variable);
+    old_sym.qualified_name = "packages/react-charts/src/components/Chart/Chart.Chart".to_string();
+    old_sym.file = "packages/react-charts/src/components/Chart/Chart.d.ts".into();
+    old_sym.package = Some("@patternfly/react-charts".to_string());
+    old_sym.import_path = None; // Root — same as package
+
+    // New surface: Chart reachable only from victory subpath
+    let mut new_sym = sym("Chart", SymbolKind::Variable);
+    new_sym.qualified_name =
+        "packages/react-charts/src/victory/components/Chart/Chart.Chart".to_string();
+    new_sym.file = "packages/react-charts/src/victory/components/Chart/Chart.d.ts".into();
+    new_sym.package = Some("@patternfly/react-charts".to_string());
+    new_sym.import_path = Some("@patternfly/react-charts/victory".to_string());
+
+    let old = surface(vec![old_sym]);
+    let new = surface(vec![new_sym]);
+    let changes = diff_surfaces(&old, &new);
+
+    // Should NOT have a SymbolRenamed change
+    let renames: Vec<_> = changes
+        .iter()
+        .filter(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed {
+                    from: ChangeSubject::Symbol { .. },
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        renames.is_empty(),
+        "Should not emit Renamed for same-name symbol. Got: {:?}",
+        renames.iter().map(|c| &c.symbol).collect::<Vec<_>>()
+    );
+
+    // Should have a Relocated change
+    let relocated: Vec<_> = changes
+        .iter()
+        .filter(|c| matches!(&c.change_type, StructuralChangeType::Relocated { .. }))
+        .collect();
+    assert!(
+        !relocated.is_empty(),
+        "Should emit Relocated when import_path changes (root → victory)"
+    );
+    assert_eq!(relocated[0].symbol, "Chart");
+    assert_eq!(
+        relocated[0].before.as_deref(),
+        Some("@patternfly/react-charts")
+    );
+    assert_eq!(
+        relocated[0].after.as_deref(),
+        Some("@patternfly/react-charts/victory")
+    );
+
+    // Should NOT appear as Removed (it was matched by rename detection)
+    let removed: Vec<_> = changes
+        .iter()
+        .filter(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Removed(ChangeSubject::Symbol { .. })
+            ) && c.symbol == "Chart"
+        })
+        .collect();
+    assert!(
+        removed.is_empty(),
+        "Relocated symbol should not also appear as removed"
+    );
+}
+
+/// When import_path is None on both sides, no-op rename is still skipped.
+#[test]
+fn no_op_rename_same_import_path_is_skipped() {
+    let mut old_sym = sym("Button", SymbolKind::Variable);
+    old_sym.qualified_name = "packages/react-core/src/components/Button/Button.Button".to_string();
+    old_sym.file = "packages/react-core/src/components/Button/Button.d.ts".into();
+    old_sym.package = Some("@patternfly/react-core".to_string());
+    old_sym.import_path = Some("@patternfly/react-core".to_string()); // Explicit root
+
+    let mut new_sym = sym("Button", SymbolKind::Variable);
+    new_sym.qualified_name =
+        "packages/react-core/src/new-layout/components/Button/Button.Button".to_string();
+    new_sym.file = "packages/react-core/src/new-layout/components/Button/Button.d.ts".into();
+    new_sym.package = Some("@patternfly/react-core".to_string());
+    new_sym.import_path = Some("@patternfly/react-core".to_string()); // Same root
+
+    let old = surface(vec![old_sym]);
+    let new = surface(vec![new_sym]);
+    let changes = diff_surfaces(&old, &new);
+
+    // Should NOT have Renamed or Relocated changes
+    let breaking: Vec<_> = changes
+        .iter()
+        .filter(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed { .. } | StructuralChangeType::Relocated { .. }
+            )
+        })
+        .collect();
+    assert!(
+        breaking.is_empty(),
+        "No-op rename with same import_path should be skipped. Got: {:?}",
+        breaking.iter().map(|c| &c.symbol).collect::<Vec<_>>()
+    );
+}
+
 /// A real rename (different names) should still produce a SymbolRenamed change.
 #[test]
 fn real_rename_is_detected() {

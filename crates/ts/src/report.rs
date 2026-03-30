@@ -83,6 +83,7 @@ pub(crate) fn build_report(
 
 // ─── Core report building ────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_report_inner(
     repo: &Path,
     from_ref: &str,
@@ -705,6 +706,7 @@ fn build_package_summaries(
 // ─── Child component discovery ───────────────────────────────────────────
 
 /// Discover child/sibling components for a given parent component.
+#[allow(clippy::too_many_arguments)]
 fn discover_child_components(
     component_name: &str,
     parent_qn: &str,
@@ -1077,11 +1079,9 @@ fn enrich_hierarchy_deltas(
                             name: wrapper_name.to_string(),
                             required: base_child.required,
                         });
-                    } else {
-                        if let Some(sub_children) = comp_children.get(&base_child.name) {
-                            for sub in sub_children {
-                                base_queue.push(sub);
-                            }
+                    } else if let Some(sub_children) = comp_children.get(&base_child.name) {
+                        for sub in sub_children {
+                            base_queue.push(sub);
                         }
                     }
                 }
@@ -1190,7 +1190,7 @@ fn extract_trailing_suffix(name: &str) -> Option<&str> {
         && suffix
             .chars()
             .next()
-            .map_or(false, |c| c.is_ascii_uppercase())
+            .is_some_and(|c| c.is_ascii_uppercase())
         && suffix.chars().any(|c| c.is_ascii_lowercase())
         && !suffix.contains('_')
     {
@@ -1518,6 +1518,7 @@ mod tests {
                 visibility: Visibility::Exported,
                 file: "src/components/Foo/Foo.FooProps.d.ts".into(),
                 package: None,
+                import_path: None,
                 line: 1,
                 signature: None,
                 extends: None,
@@ -1534,6 +1535,7 @@ mod tests {
                     visibility: Visibility::Exported,
                     file: "src/components/Foo/Foo.FooProps.d.ts".into(),
                     package: None,
+                    import_path: None,
                     line: 2,
                     signature: None,
                     extends: None,
@@ -1604,6 +1606,7 @@ mod tests {
                 visibility: Visibility::Exported,
                 file: format!("{}.d.ts", qn).into(),
                 package: None,
+                import_path: None,
                 line: 1,
                 signature: None,
                 extends: None,
@@ -1620,6 +1623,7 @@ mod tests {
                     visibility: Visibility::Exported,
                     file: format!("{}.d.ts", qn).into(),
                     package: None,
+                    import_path: None,
                     line: 2,
                     signature: None,
                     extends: None,
@@ -1714,6 +1718,7 @@ mod tests {
                 visibility: Visibility::Exported,
                 file: format!("{}/{}.d.ts", dir, name).into(),
                 package: None,
+                import_path: None,
                 line: 1,
                 signature: None,
                 extends: None,
@@ -1773,6 +1778,7 @@ mod tests {
                 visibility: Visibility::Exported,
                 file: format!("{}/{}.d.ts", dir, name).into(),
                 package: None,
+                import_path: None,
                 line: 1,
                 signature: None,
                 extends: None,
@@ -1828,6 +1834,7 @@ mod tests {
                 visibility: Visibility::Exported,
                 file: format!("{}/{}.d.ts", dir, name).into(),
                 package: None,
+                import_path: None,
                 line: 1,
                 signature: None,
                 extends: None,
@@ -1915,6 +1922,7 @@ mod tests {
                 visibility: Visibility::Exported,
                 file: format!("{}.d.ts", qn).into(),
                 package: None,
+                import_path: None,
                 line: 1,
                 signature: None,
                 extends: None,

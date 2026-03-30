@@ -864,3 +864,23 @@ fn baseline_real_rename_is_detected() {
     let new = surface(vec![new_sym]);
     insta::assert_yaml_snapshot!(diff(&old, &new));
 }
+
+#[test]
+fn baseline_import_path_relocation_detected() {
+    let mut old_sym = sym("Chart", SymbolKind::Variable);
+    old_sym.qualified_name = "packages/react-charts/src/components/Chart/Chart.Chart".to_string();
+    old_sym.file = "packages/react-charts/src/components/Chart/Chart.d.ts".into();
+    old_sym.package = Some("@patternfly/react-charts".to_string());
+    // Root entry point — import_path is None (same as package)
+
+    let mut new_sym = sym("Chart", SymbolKind::Variable);
+    new_sym.qualified_name =
+        "packages/react-charts/src/victory/components/Chart/Chart.Chart".to_string();
+    new_sym.file = "packages/react-charts/src/victory/components/Chart/Chart.d.ts".into();
+    new_sym.package = Some("@patternfly/react-charts".to_string());
+    new_sym.import_path = Some("@patternfly/react-charts/victory".to_string());
+
+    let old = surface(vec![old_sym]);
+    let new = surface(vec![new_sym]);
+    insta::assert_yaml_snapshot!(diff(&old, &new));
+}

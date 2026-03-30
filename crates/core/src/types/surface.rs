@@ -9,18 +9,10 @@ use std::path::PathBuf;
 
 /// Language-agnostic public API surface extracted from source code at a git ref.
 /// Used by TD (Top-Down) pipeline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ApiSurface {
     /// All exported symbols in the API surface.
     pub symbols: Vec<Symbol>,
-}
-
-impl Default for ApiSurface {
-    fn default() -> Self {
-        Self {
-            symbols: Vec::new(),
-        }
-    }
 }
 
 impl ApiSurface {
@@ -53,12 +45,33 @@ pub struct Symbol {
     /// Source file containing this symbol.
     pub file: PathBuf,
 
-    /// Canonical package/module name this symbol belongs to.
-    /// Set by the language's extractor during extraction.
-    /// TypeScript: "@patternfly/react-tokens" (npm package name)
-    /// Go: "github.com/org/repo/internal/auth" (module path)
+    /// Distribution/dependency identity for this symbol's package.
+    ///
+    /// This is the name that appears in dependency manifests:
+    /// - TypeScript: npm package name (e.g., `"@patternfly/react-charts"`)
+    /// - Go: module path from go.mod (e.g., `"github.com/org/repo"`)
+    /// - Python: PyPI package name (e.g., `"requests"`)
+    ///
+    /// See also [`import_path`](Self::import_path) for the consumer-facing
+    /// import specifier, which may include subpath information.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
+
+    /// Consumer-facing import specifier through which this symbol is accessible.
+    ///
+    /// Distinct from [`package`](Self::package), which identifies the
+    /// distribution/dependency unit (what appears in dependency manifests).
+    /// `import_path` is what consumers write in their source code import
+    /// statements.
+    ///
+    /// Examples:
+    /// - TypeScript: `"@patternfly/react-charts/victory"` (subpath export)
+    /// - Go: `"github.com/org/repo/pkg/auth"` (package import path)
+    /// - Python: `"requests.auth"` (module import path)
+    ///
+    /// When `None`, the import path is assumed to be the same as `package`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_path: Option<String>,
 
     /// Line number in the source file (1-indexed).
     pub line: usize,
@@ -123,6 +136,7 @@ impl Symbol {
             visibility,
             file: file.into(),
             package: None,
+            import_path: None,
             line,
             signature: None,
             extends: None,

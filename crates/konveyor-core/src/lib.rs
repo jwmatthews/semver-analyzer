@@ -1,17 +1,40 @@
 //! Shared types and utilities for Konveyor rule generation.
 //!
 //! This crate contains the language-independent types, structs, enums, and
-//! helper functions used by the Konveyor rule generation pipeline.  All items
+//! helper functions used by the Konveyor rule generation pipeline. All items
 //! here are agnostic of any specific `Language` implementation (e.g., TypeScript)
 //! and can be consumed by both the TS-specific crate and the binary crate.
+//!
+//! Types that are shared with the `frontend-analyzer-provider` are defined in
+//! the `konveyor-core` crate and re-exported here for backward compatibility.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use semver_analyzer_core::{ApiChange, ApiChangeKind, ApiChangeType, RemovalDisposition};
+
+// ── Re-exports from the shared konveyor-core crate ──────────────────────
+//
+// These types are the canonical definitions shared with
+// frontend-analyzer-provider. Re-exported here so existing code that
+// imports from `semver_analyzer_konveyor_core` continues to work.
+
+// Rule definition types
+pub use konveyor_core::rule::{
+    dedup_conditions, extract_file_pattern_from_condition, extract_frontend_refs,
+    FileContentFields, FrontendPatternFields, FrontendReferencedFields, JsonFields,
+    KonveyorCondition, KonveyorLink, KonveyorRule, KonveyorRuleset,
+};
+
+// Fix strategy types
+pub use konveyor_core::fix::{
+    extract_fix_strategies, strategy_priority, write_fix_strategies, FixConfidence, FixGuidanceDoc,
+    FixGuidanceEntry, FixSource, FixStrategyEntry, FixStrategyKind as FixStrategy, FixSummary,
+    MappingEntry, MemberMappingEntry, MigrationInfo,
+};
 
 // ── User-supplied rename patterns ───────────────────────────────────────
 
@@ -70,9 +93,6 @@ pub struct PropRenameEntry {
 
 /// A component warning: emit a JSX_COMPONENT rule for a component whose internal
 /// DOM/CSS rendering changed without an API surface change.
-///
-/// These are informational rules that alert consumers to review usages of a
-/// component whose behavior changed internally.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ComponentWarningEntry {
     /// Regex pattern matching the component name (e.g., `"^TextArea$"`).
@@ -91,9 +111,6 @@ pub struct ComponentWarningEntry {
 }
 
 /// A missing co-requisite import rule: flag when pattern A is present but pattern B is absent.
-///
-/// Uses `and` + `not` combinators with `builtin.filecontent` to detect cases
-/// where a file has one import but is missing a newly required companion import.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MissingImportEntry {
     /// Regex that must be present in the file (the existing import).
@@ -118,9 +135,6 @@ pub fn default_ts_file_pattern() -> String {
 }
 
 /// A value review rule: detect a specific prop value that may need updating.
-///
-/// Used for cases where a prop value is technically still valid but may need
-/// review (e.g., `variant="plain"` on MenuToggle).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValueReviewEntry {
     /// Prop name.
@@ -241,8 +255,6 @@ impl RenamePatterns {
     }
 
     /// Try to find a replacement for a removed symbol name.
-    ///
-    /// Returns `Some(new_name)` if any pattern matches, `None` otherwise.
     pub fn find_replacement(&self, symbol_name: &str) -> Option<String> {
         for (re, replace) in &self.patterns {
             if re.is_match(symbol_name) {
@@ -256,7 +268,6 @@ impl RenamePatterns {
     }
 
     /// Add a single rename pattern (compiled regex + replacement string).
-    /// Used to merge LLM-inferred patterns at runtime.
     pub fn add_pattern(&mut self, match_regex: &str, replace: &str) {
         match regex::Regex::new(match_regex) {
             Ok(re) => self.patterns.push((re, replace.to_string())),
@@ -281,258 +292,6 @@ impl RenamePatterns {
     }
 }
 
-// ── Konveyor YAML types ─────────────────────────────────────────────────
-
-/// Ruleset metadata (written to `ruleset.yaml`).
-#[derive(Debug, Serialize)]
-pub struct KonveyorRuleset {
-    pub name: String,
-    pub description: String,
-    pub labels: Vec<String>,
-}
-
-/// A single Konveyor rule.
-#[derive(Debug, Serialize)]
-pub struct KonveyorRule {
-    #[serde(rename = "ruleID")]
-    pub rule_id: String,
-    pub labels: Vec<String>,
-    pub effort: u32,
-    pub category: String,
-    pub description: String,
-    pub message: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub links: Vec<KonveyorLink>,
-    pub when: KonveyorCondition,
-    /// Fix strategy for this rule. Not serialized to kantra YAML — written
-    /// separately to fix-strategies.json after consolidation.
-    #[serde(skip)]
-    pub fix_strategy: Option<FixStrategyEntry>,
-}
-
-/// A hyperlink attached to a rule.
-#[derive(Debug, Serialize)]
-pub struct KonveyorLink {
-    pub url: String,
-    pub title: String,
-}
-
-/// A Konveyor `when` condition.
-///
-/// Supports `builtin.filecontent` (regex), `builtin.json` (xpath),
-/// `frontend.referenced` (AST-level, requires the frontend-analyzer-provider),
-/// and `or` (disjunction of conditions).
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub enum KonveyorCondition {
-    FileContent {
-        #[serde(rename = "builtin.filecontent")]
-        filecontent: FileContentFields,
-    },
-    Json {
-        #[serde(rename = "builtin.json")]
-        json: JsonFields,
-    },
-    FrontendReferenced {
-        #[serde(rename = "frontend.referenced")]
-        referenced: FrontendReferencedFields,
-    },
-    FrontendCssClass {
-        #[serde(rename = "frontend.cssclass")]
-        cssclass: FrontendPatternFields,
-    },
-    FrontendCssVar {
-        #[serde(rename = "frontend.cssvar")]
-        cssvar: FrontendPatternFields,
-    },
-    Or {
-        or: Vec<KonveyorCondition>,
-    },
-    And {
-        and: Vec<KonveyorCondition>,
-    },
-    /// Negated `builtin.filecontent`: matches when the pattern is NOT found.
-    /// Serializes as `{ "not": true, "builtin.filecontent": { ... } }`.
-    FileContentNegated {
-        #[serde(rename = "not")]
-        negated: bool,
-        #[serde(rename = "builtin.filecontent")]
-        filecontent: FileContentFields,
-    },
-}
-
-/// Fields for `frontend.cssclass` and `frontend.cssvar` conditions.
-#[derive(Debug, Serialize)]
-pub struct FrontendPatternFields {
-    pub pattern: String,
-}
-
-/// Fields for a `builtin.filecontent` condition.
-#[derive(Debug, Serialize)]
-pub struct FileContentFields {
-    pub pattern: String,
-    #[serde(rename = "filePattern")]
-    pub file_pattern: String,
-}
-
-/// Fields for a `builtin.json` condition.
-#[derive(Debug, Serialize)]
-pub struct JsonFields {
-    pub xpath: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub filepaths: Option<Vec<String>>,
-}
-
-/// Fields for a `frontend.referenced` condition.
-///
-/// This condition requires the frontend-analyzer-provider gRPC server.
-/// It performs AST-level symbol matching with location discriminators.
-#[derive(Debug, Serialize)]
-pub struct FrontendReferencedFields {
-    /// Regex pattern for the symbol name.
-    pub pattern: String,
-    /// Where to look: IMPORT, JSX_COMPONENT, JSX_PROP, FUNCTION_CALL, TYPE_REFERENCE.
-    pub location: String,
-    /// Filter JSX props to only those on this component (regex).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub component: Option<String>,
-    /// Filter JSX components to only those inside this parent (regex).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent: Option<String>,
-    /// Filter by the parent component's import source (regex).
-    /// Requires `parent` to be set. Ensures the parent is from a specific
-    /// package (e.g., `@patternfly/react-core`), not a custom app component.
-    #[serde(rename = "parentFrom", skip_serializing_if = "Option::is_none")]
-    pub parent_from: Option<String>,
-    /// Filter JSX prop values to only those matching this regex.
-    /// Used for prop value changes (e.g., `variant="tertiary"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    /// Scope to imports from a specific package (e.g., `@patternfly/react-tokens`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
-}
-
-// ── Fix guidance types ──────────────────────────────────────────────────
-
-/// How to fix a detected issue.
-///
-/// Mirrors the frontend-analyzer-provider's fix engine: each rule is mapped
-/// to a deterministic fix strategy with confidence level.
-#[derive(Debug, Clone, Serialize)]
-pub struct FixGuidanceEntry {
-    /// The rule ID this fix corresponds to.
-    #[serde(rename = "ruleID")]
-    pub rule_id: String,
-
-    /// The fix strategy to apply.
-    pub strategy: FixStrategy,
-
-    /// How confident we are this fix is correct.
-    pub confidence: FixConfidence,
-
-    /// Where this fix guidance came from.
-    pub source: FixSource,
-
-    /// The affected symbol.
-    pub symbol: String,
-
-    /// Source file where the breaking change originates.
-    pub file: String,
-
-    /// Concrete instructions for fixing the issue.
-    pub fix_description: String,
-
-    /// Example of the old code pattern (when available).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub before: Option<String>,
-
-    /// Example of the new code pattern (when available).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<String>,
-
-    /// Search pattern to find code that needs fixing.
-    pub search_pattern: String,
-
-    /// Suggested replacement (for mechanical fixes).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replacement: Option<String>,
-}
-
-/// What kind of fix to apply.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FixStrategy {
-    /// Find-and-replace: rename old symbol to new symbol.
-    Rename,
-    /// Update function call sites to match new signature.
-    UpdateSignature,
-    /// Update type annotations to match new types.
-    UpdateType,
-    /// Remove usages of a deleted symbol and find alternatives.
-    FindAlternative,
-    /// Update import paths or module system (require ↔ import).
-    UpdateImport,
-    /// Update package.json dependency configuration.
-    UpdateDependency,
-    /// Requires manual review — behavioral change or complex refactor.
-    ManualReview,
-}
-
-/// How confident the fix guidance is.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FixConfidence {
-    /// Mechanical rename or direct replacement — safe to auto-apply.
-    Exact,
-    /// Pattern-based fix — likely correct but may need review.
-    High,
-    /// Inferred fix — needs human verification.
-    Medium,
-    /// Best-effort suggestion — may not be applicable.
-    Low,
-}
-
-/// Where the fix guidance originates.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FixSource {
-    /// Deterministic — derived from structural analysis.
-    Pattern,
-    /// AI-generated — from LLM behavioral analysis.
-    Llm,
-    /// Flagged for manual intervention.
-    Manual,
-}
-
-/// Top-level fix guidance document written to `fix-guidance.yaml`.
-#[derive(Debug, Serialize)]
-pub struct FixGuidanceDoc {
-    /// Version range this guidance applies to.
-    pub migration: MigrationInfo,
-    /// Summary statistics.
-    pub summary: FixSummary,
-    /// Per-rule fix entries.
-    pub fixes: Vec<FixGuidanceEntry>,
-}
-
-/// Migration metadata.
-#[derive(Debug, Serialize)]
-pub struct MigrationInfo {
-    pub from_ref: String,
-    pub to_ref: String,
-    pub generated_by: String,
-}
-
-/// Summary of fix guidance.
-#[derive(Debug, Serialize)]
-pub struct FixSummary {
-    pub total_fixes: usize,
-    pub auto_fixable: usize,
-    pub needs_review: usize,
-    pub manual_only: usize,
-}
-
 // ── Public API ───────────────────────────────────────────────────────────
 
 /// Minimum number of constants from the same package with the same change type
@@ -540,7 +299,6 @@ pub struct FixSummary {
 pub const CONSTANT_COLLAPSE_THRESHOLD: usize = 10;
 
 /// Grouping key for collapsible constant changes: package + change type + strategy.
-/// This ensures constants with different fix strategies end up in separate rules.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstantGroupKey {
     pub package: String,
@@ -549,9 +307,6 @@ pub struct ConstantGroupKey {
 }
 
 /// A compound token with its removed and added member key suffixes.
-///
-/// Used to cache compound token data between suffix inventory extraction
-/// and suffix mapping application.
 pub struct CompoundToken {
     pub removed: BTreeSet<String>,
     pub added: BTreeSet<String>,
@@ -564,147 +319,6 @@ pub struct PackageInfo {
     pub name: String,
     /// Package version at the new ref (read from disk).
     pub version: Option<String>,
-}
-
-/// A single from/to mapping within a consolidated fix strategy.
-#[derive(Debug, Clone, Serialize)]
-pub struct MappingEntry {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub component: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prop: Option<String>,
-}
-
-/// A member-level mapping entry for structural migration strategies.
-#[derive(Debug, Clone, Serialize)]
-pub struct MemberMappingEntry {
-    pub old_name: String,
-    pub new_name: String,
-}
-
-/// A machine-readable fix strategy entry.
-///
-/// For non-consolidated rules, `from`/`to` hold the single mapping.
-/// For consolidated rules, `mappings` holds all individual mappings from the
-/// merged rules, allowing the fix engine to apply all renames/removals.
-/// For structural migration rules, `member_mappings` and `removed_members`
-/// describe the member-level overlap between removed and replacement interfaces.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct FixStrategyEntry {
-    pub strategy: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub component: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prop: Option<String>,
-    /// All individual mappings when this strategy was merged from multiple rules.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub mappings: Vec<MappingEntry>,
-    /// Structural migration: matching member mappings between removed and replacement.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub member_mappings: Vec<MemberMappingEntry>,
-    /// Structural migration: member names only in the removed interface (no match).
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub removed_members: Vec<String>,
-    /// Structural migration: the replacement symbol name.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replacement: Option<String>,
-    /// Structural migration: overlap ratio between removed and replacement.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub overlap_ratio: Option<f64>,
-    /// Dependency update: npm package name (e.g., "@patternfly/react-core").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub package: Option<String>,
-    /// Dependency update: new version range (e.g., "^6.1.0").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_version: Option<String>,
-}
-
-impl FixStrategyEntry {
-    /// Create a new strategy entry with only the strategy type set.
-    pub fn new(strategy: &str) -> Self {
-        Self {
-            strategy: strategy.into(),
-            ..Default::default()
-        }
-    }
-
-    /// Create a Rename strategy with a single from/to pair.
-    pub fn rename(from: impl Into<String>, to: impl Into<String>) -> Self {
-        Self {
-            strategy: "Rename".into(),
-            from: Some(from.into()),
-            to: Some(to.into()),
-            ..Default::default()
-        }
-    }
-
-    /// Create a strategy with from/to and a named strategy type.
-    pub fn with_from_to(strategy: &str, from: impl Into<String>, to: impl Into<String>) -> Self {
-        Self {
-            strategy: strategy.into(),
-            from: Some(from.into()),
-            to: Some(to.into()),
-            ..Default::default()
-        }
-    }
-
-    /// Create a RemoveProp strategy.
-    pub fn remove_prop(component: impl Into<String>, prop: impl Into<String>) -> Self {
-        Self {
-            strategy: "RemoveProp".into(),
-            component: Some(component.into()),
-            prop: Some(prop.into()),
-            ..Default::default()
-        }
-    }
-
-    /// Create an LlmAssisted strategy enriched with structural migration data.
-    pub fn structural_migration(
-        removed_symbol: &str,
-        replacement_symbol: &str,
-        member_mappings: Vec<MemberMappingEntry>,
-        removed_members: Vec<String>,
-        overlap_ratio: f64,
-    ) -> Self {
-        Self {
-            strategy: "LlmAssisted".into(),
-            from: Some(removed_symbol.into()),
-            to: Some(replacement_symbol.into()),
-            member_mappings,
-            removed_members,
-            replacement: Some(replacement_symbol.into()),
-            overlap_ratio: Some(overlap_ratio),
-            ..Default::default()
-        }
-    }
-
-    /// Create an UpdateDependency strategy for a package version bump.
-    pub fn update_dependency(package: impl Into<String>, new_version: impl Into<String>) -> Self {
-        Self {
-            strategy: "UpdateDependency".into(),
-            package: Some(package.into()),
-            new_version: Some(new_version.into()),
-            ..Default::default()
-        }
-    }
-
-    /// Convert to a MappingEntry (extracting the single mapping).
-    pub fn to_mapping(&self) -> MappingEntry {
-        MappingEntry {
-            from: self.from.clone(),
-            to: self.to.clone(),
-            component: self.component.clone(),
-            prop: self.prop.clone(),
-        }
-    }
 }
 
 // ── Shared functions ────────────────────────────────────────────────────
@@ -736,16 +350,11 @@ pub fn build_combined_constant_rule(
     let symbol_names: Vec<&str> = changes.iter().map(|(c, _, _)| c.symbol.as_str()).collect();
     let pattern = build_token_prefix_pattern(&symbol_names);
     let from_pkg = changes[0].1.clone();
-    // Strategy is uniform within the group — take the first one
     let strategy = Some(changes[0].2.clone());
 
     let change_type_str = api_change_type_label(&key.change_type);
     let kind_str = api_kind_label(&ApiChangeKind::Constant);
-    let slug = key
-        .package
-        .replace('@', "")
-        .replace('/', "-")
-        .replace('.', "-");
+    let slug = key.package.replace('@', "").replace(['/', '.'], "-");
     let strategy_slug = key.strategy.to_lowercase().replace(' ', "-");
     let base_id = format!(
         "semver-{}-constant-{}-{}-combined",
@@ -753,7 +362,6 @@ pub fn build_combined_constant_rule(
     );
     let rule_id = unique_id(base_id, id_counts);
 
-    // Build a summary message
     let mut message = format!(
         "{} constants from `{}` had breaking changes ({}).\n",
         changes.len(),
@@ -761,7 +369,6 @@ pub fn build_combined_constant_rule(
         change_type_str,
     );
 
-    // If there's a CSS prefix change, include it in the message
     if let Some(ref strat) = strategy {
         if strat.strategy == "CssVariablePrefix" {
             if let (Some(ref from), Some(ref to)) = (&strat.from, &strat.to) {
@@ -773,7 +380,6 @@ pub fn build_combined_constant_rule(
         }
     }
 
-    // Add a sample of the first few symbol names
     let sample_count = 5.min(symbol_names.len());
     message.push_str(&format!(
         "Affected constants include: {}",
@@ -986,17 +592,6 @@ pub fn suppress_redundant_prop_value_rules(rules: Vec<KonveyorRule>) -> Vec<Konv
     rules
 }
 
-/// Extract all `FrontendReferencedFields` from a `KonveyorCondition`,
-/// recursing into `Or`/`And` combinators.
-pub fn extract_frontend_refs(condition: &KonveyorCondition) -> Vec<&FrontendReferencedFields> {
-    match condition {
-        KonveyorCondition::FrontendReferenced { referenced } => vec![referenced],
-        KonveyorCondition::Or { or } => or.iter().flat_map(extract_frontend_refs).collect(),
-        KonveyorCondition::And { and } => and.iter().flat_map(extract_frontend_refs).collect(),
-        _ => vec![],
-    }
-}
-
 /// Consolidate rules by grouping related rules into single combined rules.
 pub fn consolidate_rules(rules: Vec<KonveyorRule>) -> (Vec<KonveyorRule>, HashMap<String, String>) {
     let mut groups: BTreeMap<String, Vec<KonveyorRule>> = BTreeMap::new();
@@ -1059,7 +654,7 @@ pub fn consolidation_key(rule: &KonveyorRule) -> String {
         let is_component_constant = symbol
             .chars()
             .next()
-            .map_or(false, |c| c.is_ascii_uppercase());
+            .is_some_and(|c| c.is_ascii_uppercase());
         if !is_component_constant {
             let package = extract_package_from_path(file_key);
             return format!("{}-constant-removed", package);
@@ -1087,7 +682,6 @@ pub fn consolidation_key(rule: &KonveyorRule) -> String {
 }
 
 /// Read package.json at a specific git ref using `git show`.
-/// Returns (name, version) tuple.
 pub fn read_package_json_at_ref(
     repo_path: &std::path::Path,
     git_ref: &str,
@@ -1111,7 +705,6 @@ pub fn read_package_json_at_ref(
 }
 
 /// Read package.json from a file path on disk.
-/// Returns (name, version) tuple.
 pub fn read_package_json_from_file(
     path: &std::path::Path,
 ) -> Option<(Option<String>, Option<String>)> {
@@ -1130,8 +723,8 @@ pub fn resolve_npm_package(file_path: &str, cache: &HashMap<String, String>) -> 
 
     let base_name = cache.get(*pkg_dir_name)?;
 
-    let has_deprecated = parts.iter().any(|&p| p == "deprecated");
-    let has_next = parts.iter().any(|&p| p == "next");
+    let has_deprecated = parts.contains(&"deprecated");
+    let has_next = parts.contains(&"next");
 
     if has_deprecated {
         Some(format!("^{}/deprecated$", regex_escape(base_name)))
@@ -1147,7 +740,7 @@ pub fn extract_package_from_path(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();
     if let Some(pkg_idx) = parts.iter().position(|&p| p == "packages") {
         if let Some(pkg_name) = parts.get(pkg_idx + 1) {
-            let has_deprecated = parts.iter().any(|&p| p == "deprecated");
+            let has_deprecated = parts.contains(&"deprecated");
             if has_deprecated {
                 return format!("{}-deprecated", pkg_name);
             }
@@ -1255,7 +848,7 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
     };
 
     let fix_strategy = {
-        let strats: Vec<FixStrategyEntry> = all_strategies.into_iter().filter_map(|s| s).collect();
+        let strats: Vec<FixStrategyEntry> = all_strategies.into_iter().flatten().collect();
         if strats.is_empty() {
             None
         } else if strats.len() == 1 {
@@ -1314,20 +907,6 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
     }
 }
 
-/// Priority for fix strategy type. Higher = more actionable.
-pub fn strategy_priority(strategy: &str) -> u8 {
-    match strategy {
-        "Rename" => 5,
-        "RemoveProp" => 4,
-        "CssVariablePrefix" => 4,
-        "ImportPathChange" => 3,
-        "PropValueChange" => 2,
-        "PropTypeChange" => 2,
-        "LlmAssisted" => 1,
-        _ => 0,
-    }
-}
-
 /// Build a regex pattern from the common prefix of a list of symbol names.
 pub fn build_common_prefix_pattern(symbols: &[&str]) -> String {
     if symbols.is_empty() {
@@ -1360,15 +939,6 @@ pub fn build_common_prefix_pattern(symbols: &[&str]) -> String {
     }
 }
 
-/// Extract the file pattern from an existing condition (for reuse in consolidated rules).
-pub fn extract_file_pattern_from_condition(condition: &KonveyorCondition) -> Option<String> {
-    match condition {
-        KonveyorCondition::FileContent { filecontent } => Some(filecontent.file_pattern.clone()),
-        KonveyorCondition::Or { or } => or.first().and_then(extract_file_pattern_from_condition),
-        _ => None,
-    }
-}
-
 /// Increment the version number in a CSS prefix string.
 pub fn increment_version_prefix(prefix: &str) -> String {
     let re = regex::Regex::new(r"v(\d+)").unwrap();
@@ -1379,47 +949,11 @@ pub fn increment_version_prefix(prefix: &str) -> String {
     .to_string()
 }
 
-pub fn dedup_conditions(conditions: Vec<KonveyorCondition>) -> Vec<KonveyorCondition> {
-    let mut seen = BTreeSet::new();
-    let mut unique = Vec::new();
-    for cond in conditions {
-        let key = serde_json::to_string(&cond).unwrap_or_default();
-        if seen.insert(key) {
-            unique.push(cond);
-        }
-    }
-    unique
-}
-
-/// Extract fix strategies from the final (post-consolidation) rules.
-pub fn extract_fix_strategies(rules: &[KonveyorRule]) -> HashMap<String, FixStrategyEntry> {
-    rules
-        .iter()
-        .filter_map(|r| {
-            r.fix_strategy
-                .as_ref()
-                .map(|s| (r.rule_id.clone(), s.clone()))
-        })
-        .collect()
-}
-
-/// Write fix strategies JSON to the fix-guidance directory.
-pub fn write_fix_strategies(
-    fix_dir: &Path,
-    strategies: &HashMap<String, FixStrategyEntry>,
-) -> Result<()> {
-    let path = fix_dir.join("fix-strategies.json");
-    let json =
-        serde_json::to_string_pretty(strategies).context("Failed to serialize fix strategies")?;
-    std::fs::write(&path, &json).with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
-}
-
 /// Write conformance rules to a separate file in the output directory.
 pub fn write_conformance_rules(output_dir: &Path, rules: &[KonveyorRule]) -> Result<()> {
     let ruleset = KonveyorRuleset {
         name: "semver-conformance".to_string(),
-        description: "Component usage conformance checks — verifies child component composition matches expected patterns".to_string(),
+        description: "Component usage conformance checks -- verifies child component composition matches expected patterns".to_string(),
         labels: vec!["source=semver-analyzer".to_string()],
     };
 
@@ -1485,6 +1019,23 @@ pub fn api_change_to_strategy(
         ApiChangeType::Renamed => {
             let before = change.before.as_deref().unwrap_or("");
             let after = change.after.as_deref().unwrap_or("");
+
+            // Handle import path relocations where before/after are direct import
+            // specifiers (e.g., "@patternfly/react-charts" → "@patternfly/react-charts/victory").
+            // These come from Relocated changes detected by the diff engine when a symbol's
+            // import_path changed between versions.
+            if !before.is_empty()
+                && !after.is_empty()
+                && before != after
+                && !before.contains("packages/")
+                && !after.contains("packages/")
+            {
+                let mut e = FixStrategyEntry::new("ImportPathChange");
+                e.from = Some(before.to_string());
+                e.to = Some(after.to_string());
+                return Some(e);
+            }
+
             if after.contains("/deprecated/") && !before.contains("/deprecated/") {
                 let mut e = FixStrategyEntry::new("ImportPathChange");
                 e.from = extract_package_path(before);
@@ -1594,15 +1145,54 @@ pub fn extract_package_path(qualified_name: &str) -> Option<String> {
     let parts: Vec<&str> = qualified_name.split('/').collect();
     let pkg_idx = parts.iter().position(|&p| p == "packages")?;
     let pkg_name = parts.get(pkg_idx + 1)?;
-    let internal_parts: Vec<&str> = parts[parts.iter().position(|&p| p == "dist")?..].to_vec();
-    let has_deprecated = internal_parts.iter().any(|&p| p == "deprecated");
-    let has_next = internal_parts.iter().any(|&p| p == "next");
+
+    // Find the start of internal paths — after dist/<variant>/ or src/
+    let internal_start = parts.iter().position(|&p| p == "dist" || p == "src")?;
+
+    // Skip the "dist" or "src" segment, and if "dist", also skip the variant (esm, js, etc.)
+    let content_start = if parts.get(internal_start) == Some(&"dist") {
+        // dist/<variant>/... — skip both "dist" and the variant
+        internal_start + 2
+    } else {
+        // src/... — skip just "src"
+        internal_start + 1
+    };
+
+    let internal_parts = &parts[content_start..];
+
+    // Check for known subpath patterns (deprecated, next, and other subpath exports)
+    let has_deprecated = internal_parts.contains(&"deprecated");
+    let has_next = internal_parts.contains(&"next");
+
     let mut path = pkg_name.to_string();
     if has_deprecated {
         path.push_str("/deprecated");
     } else if has_next {
         path.push_str("/next");
+    } else if let Some(&first_segment) = internal_parts.first() {
+        // Check if the first segment after src/ or dist/<variant>/ is a
+        // subpath export entry point (e.g., "victory" in src/victory/components/...).
+        // Heuristic: if it's not "components", "helpers", "utils", or other standard
+        // internal directory names, treat it as a subpath export.
+        let standard_dirs = [
+            "components",
+            "helpers",
+            "utils",
+            "hooks",
+            "types",
+            "styles",
+            "layouts",
+            "lib",
+        ];
+        if !standard_dirs.contains(&first_segment)
+            && !first_segment.contains('.')
+            && first_segment != "index"
+        {
+            path.push('/');
+            path.push_str(first_segment);
+        }
     }
+
     Some(path)
 }
 
@@ -1677,7 +1267,7 @@ pub fn build_frontend_condition(
         change
             .before
             .as_deref()
-            .map(|b| extract_leaf_symbol(b))
+            .map(extract_leaf_symbol)
             .unwrap_or(leaf_symbol)
     } else {
         leaf_symbol
@@ -1695,7 +1285,7 @@ pub fn build_frontend_condition(
 
     let is_subpath_scoped = from
         .as_ref()
-        .map_or(false, |f| f.starts_with('^') && f.ends_with('$'));
+        .is_some_and(|f| f.starts_with('^') && f.ends_with('$'));
 
     match change.kind {
         ApiChangeKind::Class | ApiChangeKind::Interface
@@ -1757,8 +1347,7 @@ pub fn build_frontend_condition(
                     parent_from: None,
                 },
             });
-            if match_name.ends_with("Props") {
-                let component_name = &match_name[..match_name.len() - 5];
+            if let Some(component_name) = match_name.strip_suffix("Props") {
                 if !component_name.is_empty() {
                     let comp_pattern = format!("^{}$", regex_escape(component_name));
                     conditions.push(KonveyorCondition::FrontendReferenced {
@@ -1859,7 +1448,7 @@ pub fn build_frontend_condition(
             let is_component = match_name
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_ascii_uppercase());
+                .is_some_and(|c| c.is_ascii_uppercase());
             if is_component && !is_subpath_scoped {
                 KonveyorCondition::Or {
                     or: vec![
@@ -1904,8 +1493,7 @@ pub fn build_frontend_condition(
     }
 }
 
-/// Extract a value filter from an ApiChange if it represents a single union
-/// member removal.
+/// Extract a value filter from an ApiChange if it represents a single union member removal.
 pub fn extract_value_filter(change: &ApiChange) -> Option<String> {
     let before = change.before.as_deref()?;
     if is_single_quoted_value(before) {
@@ -1944,8 +1532,7 @@ pub fn parse_union_string_values(type_expr: &str) -> BTreeSet<String> {
     values
 }
 
-/// Compute the removed union member values between before and after type
-/// expressions.
+/// Compute the removed union member values between before and after type expressions.
 pub fn extract_removed_union_values(change: &ApiChange) -> Vec<String> {
     let before = match change.before.as_deref() {
         Some(b) => b,
@@ -1966,8 +1553,7 @@ pub fn extract_removed_union_values(change: &ApiChange) -> Vec<String> {
     before_vals.difference(&after_vals).cloned().collect()
 }
 
-/// Compute the added union member values between before and after type
-/// expressions.
+/// Compute the added union member values between before and after type expressions.
 pub fn extract_added_union_values(change: &ApiChange) -> Vec<String> {
     let before = match change.before.as_deref() {
         Some(b) => b,
@@ -2070,7 +1656,7 @@ pub fn extract_trailing_suffix(name: &str) -> Option<&str> {
     let last_underscore = name.rfind('_')?;
     let suffix = &name[last_underscore + 1..];
     if !suffix.is_empty()
-        && suffix.chars().next().map_or(false, |c| c.is_uppercase())
+        && suffix.chars().next().is_some_and(|c| c.is_uppercase())
         && suffix.chars().any(|c| c.is_lowercase())
         && !suffix.contains('_')
     {
@@ -2086,7 +1672,7 @@ pub fn derive_common_suffix(names: &[String]) -> Option<String> {
         .iter()
         .map(|s| s.as_str())
         .filter(|s| {
-            s.chars().next().map_or(false, |c| c.is_uppercase())
+            s.chars().next().is_some_and(|c| c.is_uppercase())
                 && !s.contains(' ')
                 && !s.contains('(')
                 && !s.contains('/')

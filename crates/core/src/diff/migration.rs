@@ -198,7 +198,7 @@ pub(super) fn detect_migrations<'a>(
             // Keep the best match (highest overlap ratio).
             if best_match
                 .as_ref()
-                .map_or(true, |(_, r, _, _)| best_ratio > *r)
+                .is_none_or(|(_, r, _, _)| best_ratio > *r)
             {
                 best_match = Some((*candidate, best_ratio, matching, removed_only));
             }

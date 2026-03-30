@@ -213,9 +213,50 @@ pub fn diff_surfaces_with_semantics(
                 });
             }
             RelocationType::Relocated => {
-                // General restructuring — non-breaking if the symbol
-                // is still exported at the package level.
-                // Don't emit a top-level change, just diff members below.
+                // General restructuring — check whether the consumer-facing
+                // import path changed. If so, this is breaking.
+                let old_import = reloc
+                    .old
+                    .import_path
+                    .as_ref()
+                    .or(reloc.old.package.as_ref());
+                let new_import = reloc
+                    .new
+                    .import_path
+                    .as_ref()
+                    .or(reloc.new.package.as_ref());
+
+                if old_import.is_some() && old_import != new_import {
+                    let old_ip = old_import.cloned().unwrap_or_default();
+                    let new_ip = new_import.cloned().unwrap_or_default();
+                    changes.push(StructuralChange {
+                        symbol: reloc.old.name.clone(),
+                        qualified_name: reloc.old.qualified_name.clone(),
+                        kind: reloc.old.kind,
+                        package: reloc.old.package.clone(),
+                        change_type: StructuralChangeType::Relocated {
+                            from: ChangeSubject::Symbol {
+                                kind: reloc.old.kind,
+                            },
+                            to: ChangeSubject::Symbol {
+                                kind: reloc.new.kind,
+                            },
+                        },
+                        before: Some(old_ip),
+                        after: Some(new_ip),
+                        description: format!(
+                            "{} `{}` moved from `{}` to `{}`",
+                            kind_label(reloc.old.kind),
+                            reloc.old.name,
+                            old_import.map(|s| s.as_str()).unwrap_or("?"),
+                            new_import.map(|s| s.as_str()).unwrap_or("?"),
+                        ),
+                        is_breaking: true,
+                        impact: None,
+                        migration_target: None,
+                    });
+                }
+                // Otherwise non-breaking restructuring — just diff members below.
             }
         }
 
@@ -250,17 +291,57 @@ pub fn diff_surfaces_with_semantics(
 
     // Emit rename changes
     for rm in &renames {
-        // Skip no-op renames: same export name, different file path.
-        // This happens when a symbol is relocated (e.g., src/components/ →
-        // src/victory/components/) without changing its export name. The
-        // consumer's import statement doesn't change, so no rule is needed.
+        // Same export name, different file path. Check whether the
+        // consumer-facing import path changed (e.g., a symbol moved from
+        // `@patternfly/react-charts` to `@patternfly/react-charts/victory`).
         if rm.old.name == rm.new.name {
-            tracing::trace!(
-                name = %rm.old.name,
-                from = %rm.old.qualified_name,
-                to = %rm.new.qualified_name,
-                "Skipping no-op rename (moved without export name change)"
-            );
+            let old_import = rm.old.import_path.as_ref().or(rm.old.package.as_ref());
+            let new_import = rm.new.import_path.as_ref().or(rm.new.package.as_ref());
+
+            if old_import.is_some() && old_import != new_import {
+                // Import path changed — this is consumer-visible.
+                let old_ip = old_import.cloned().unwrap_or_default();
+                let new_ip = new_import.cloned().unwrap_or_default();
+                tracing::debug!(
+                    name = %rm.old.name,
+                    from = %old_ip,
+                    to = %new_ip,
+                    "Detected import path relocation (same name, different import path)"
+                );
+                changes.push(StructuralChange {
+                    symbol: rm.old.name.clone(),
+                    qualified_name: rm.old.qualified_name.clone(),
+                    kind: rm.old.kind,
+                    package: rm.old.package.clone(),
+                    change_type: StructuralChangeType::Relocated {
+                        from: ChangeSubject::Symbol { kind: rm.old.kind },
+                        to: ChangeSubject::Symbol { kind: rm.new.kind },
+                    },
+                    before: Some(old_ip),
+                    after: Some(new_ip),
+                    description: format!(
+                        "{} `{}` moved from `{}` to `{}`",
+                        kind_label(rm.old.kind),
+                        rm.old.name,
+                        old_import.map(|s| s.as_str()).unwrap_or("?"),
+                        new_import.map(|s| s.as_str()).unwrap_or("?"),
+                    ),
+                    is_breaking: true,
+                    impact: None,
+                    migration_target: None,
+                });
+                // Also diff members to catch property-level changes
+                diff_symbol(rm.old, rm.new, &mut changes, semantics);
+            } else {
+                tracing::trace!(
+                    name = %rm.old.name,
+                    from = %rm.old.qualified_name,
+                    to = %rm.new.qualified_name,
+                    "Skipping no-op rename (moved without import path change)"
+                );
+                // Still diff members — path changed but import didn't
+                diff_symbol(rm.old, rm.new, &mut changes, semantics);
+            }
             continue;
         }
 

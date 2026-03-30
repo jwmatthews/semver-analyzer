@@ -303,21 +303,15 @@ impl Language for TypeScript {
         let mut remaining = description;
         while let Some(start) = remaining.find('<') {
             let after_lt = &remaining[start + 1..];
-            let end = after_lt
-                .find(|c: char| c == '>' || c == ' ' || c == '/')
-                .unwrap_or(after_lt.len());
+            let end = after_lt.find(['>', ' ', '/']).unwrap_or(after_lt.len());
             let name = &after_lt[..end];
             if !name.is_empty()
-                && name
-                    .chars()
-                    .next()
-                    .map_or(false, |c| c.is_ascii_uppercase())
+                && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
                 && name.chars().all(|c| c.is_ascii_alphanumeric())
                 && name.chars().any(|c| c.is_ascii_lowercase())
+                && seen.insert(name.to_string())
             {
-                if seen.insert(name.to_string()) {
-                    refs.push(name.to_string());
-                }
+                refs.push(name.to_string());
             }
             remaining = &remaining[start + 1..];
         }
@@ -329,17 +323,13 @@ impl Language for TypeScript {
             if let Some(end) = after_tick.find('`') {
                 let name = &after_tick[..end];
                 if !name.is_empty()
-                    && name
-                        .chars()
-                        .next()
-                        .map_or(false, |c| c.is_ascii_uppercase())
+                    && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
                     && name.chars().all(|c| c.is_ascii_alphanumeric())
                     && name.chars().any(|c| c.is_ascii_lowercase())
                     && !name.contains(' ')
+                    && seen.insert(name.to_string())
                 {
-                    if seen.insert(name.to_string()) {
-                        refs.push(name.to_string());
-                    }
+                    refs.push(name.to_string());
                 }
                 remaining = &after_tick[end + 1..];
             } else {
@@ -852,7 +842,7 @@ fn file_prefix(qualified_name: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use semver_analyzer_core::{ApiSurface, Parameter, Signature};
+    use semver_analyzer_core::{Parameter, Signature};
 
     fn sym(name: &str, kind: SymbolKind) -> Symbol {
         Symbol::new(name, name, kind, Visibility::Exported, "test.d.ts", 1)

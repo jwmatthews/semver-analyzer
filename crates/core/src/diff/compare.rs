@@ -352,8 +352,7 @@ fn diff_parameters(
     }
 
     // Parameters removed (old has more non-rest params than new)
-    for i in common_len..old_non_rest.len() {
-        let p = old_non_rest[i];
+    for p in old_non_rest.iter().skip(common_len) {
         changes.push(change(
             sym,
             StructuralChangeType::Removed(ChangeSubject::Parameter {
@@ -367,8 +366,7 @@ fn diff_parameters(
     }
 
     // Parameters added (new has more non-rest params than old)
-    for i in common_len..new_non_rest.len() {
-        let p = new_non_rest[i];
+    for p in new_non_rest.iter().skip(common_len) {
         let is_breaking = !p.optional && !p.has_default;
         changes.push(change(
             sym,
@@ -583,25 +581,24 @@ fn diff_type_parameters(
     }
 
     // Type parameters removed
-    for i in common_len..old_tps.len() {
+    for tp in old_tps.iter().skip(common_len) {
         changes.push(change(
             sym,
             StructuralChangeType::Removed(ChangeSubject::TypeParameter {
-                name: old_tps[i].name.clone(),
+                name: tp.name.clone(),
             }),
-            Some(type_param_summary(&old_tps[i])),
+            Some(type_param_summary(tp)),
             None,
             format!(
                 "Type parameter `{}` was removed from `{}`",
-                old_tps[i].name, sym.name
+                tp.name, sym.name
             ),
             true,
         ));
     }
 
     // Type parameters added
-    for i in common_len..new_tps.len() {
-        let tp = &new_tps[i];
+    for tp in new_tps.iter().skip(common_len) {
         let is_breaking = tp.default.is_none();
         changes.push(change(
             sym,

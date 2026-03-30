@@ -31,6 +31,7 @@ use std::sync::LazyLock;
 ///
 /// Discovers test files by naming convention and analyzes git diffs
 /// for assertion pattern changes.
+#[derive(Default)]
 pub struct TsTestAnalyzer;
 
 impl TsTestAnalyzer {
@@ -280,12 +281,12 @@ fn infer_parent_component_name(stem: &str) -> Option<String> {
 
     // Sort by length descending so we try longer suffixes first
     let mut suffixes: Vec<&&str> = SUFFIXES.iter().collect();
-    suffixes.sort_by(|a, b| b.len().cmp(&a.len()));
+    suffixes.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
     for suffix in suffixes {
         if let Some(prefix) = stem.strip_suffix(suffix) {
             // Must leave at least 2 chars and start with uppercase
-            if prefix.len() >= 2 && prefix.chars().next().map_or(false, |c| c.is_uppercase()) {
+            if prefix.len() >= 2 && prefix.chars().next().is_some_and(|c| c.is_uppercase()) {
                 return Some(prefix.to_string());
             }
         }

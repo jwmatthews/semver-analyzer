@@ -250,11 +250,11 @@ fn extract_json(text: &str) -> Option<String> {
     for mat in JSON_OBJECT_RE.find_iter(text) {
         let candidate = mat.as_str();
         // Validate it's actually parseable JSON
-        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
-            if candidate.len() > best_len {
-                best = Some(candidate.to_string());
-                best_len = candidate.len();
-            }
+        if serde_json::from_str::<serde_json::Value>(candidate).is_ok()
+            && candidate.len() > best_len
+        {
+            best = Some(candidate.to_string());
+            best_len = candidate.len();
         }
     }
 

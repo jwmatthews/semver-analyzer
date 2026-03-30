@@ -154,16 +154,16 @@ impl<L: Language> SharedFindings<L> {
 
     /// Get the old API surface (blocks if TD hasn't set it yet).
     pub async fn get_old_surface(&self) -> &Arc<ApiSurface> {
-        self.old_surface.get_or_init(|| async {
-            panic!("TD must set old_surface before BU reads it")
-        }).await
+        self.old_surface
+            .get_or_init(|| async { panic!("TD must set old_surface before BU reads it") })
+            .await
     }
 
     /// Get the new API surface (blocks if TD hasn't set it yet).
     pub async fn get_new_surface(&self) -> &Arc<ApiSurface> {
-        self.new_surface.get_or_init(|| async {
-            panic!("TD must set new_surface before BU reads it")
-        }).await
+        self.new_surface
+            .get_or_init(|| async { panic!("TD must set new_surface before BU reads it") })
+            .await
     }
 
     /// Try to get the old surface without blocking (returns None if not set yet).
@@ -286,7 +286,9 @@ mod tests {
             qualified_name: name.to_string(),
             kind: SymbolKind::Function,
             package: None,
-            change_type: StructuralChangeType::Removed(ChangeSubject::Symbol { kind: SymbolKind::Function }),
+            change_type: StructuralChangeType::Removed(ChangeSubject::Symbol {
+                kind: SymbolKind::Function,
+            }),
             before: None,
             after: None,
             description: format!("{} was removed", name),
@@ -420,9 +422,7 @@ mod tests {
     fn surface_set_and_get() {
         let shared: SharedFindings<TestLang> = SharedFindings::new();
 
-        let surface = Arc::new(ApiSurface {
-            symbols: vec![],
-        });
+        let surface = Arc::new(ApiSurface { symbols: vec![] });
         shared.set_old_surface(surface);
         assert!(shared.try_get_old_surface().is_some());
         assert_eq!(shared.try_get_old_surface().unwrap().symbols.len(), 0);
@@ -432,9 +432,7 @@ mod tests {
     async fn surface_async_get() {
         let shared: Arc<SharedFindings<TestLang>> = Arc::new(SharedFindings::new());
 
-        let surface = Arc::new(ApiSurface {
-            symbols: vec![],
-        });
+        let surface = Arc::new(ApiSurface { symbols: vec![] });
         shared.set_new_surface(surface);
 
         let result = shared.get_new_surface().await;

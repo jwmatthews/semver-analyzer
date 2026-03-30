@@ -36,6 +36,7 @@ use std::path::Path;
 ///
 /// Parses a source file with OXC and finds all functions that reference
 /// a given symbol within their bodies.
+#[derive(Default)]
 pub struct TsCallGraphBuilder;
 
 impl TsCallGraphBuilder {

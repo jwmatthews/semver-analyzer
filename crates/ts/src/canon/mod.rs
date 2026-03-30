@@ -1053,7 +1053,7 @@ fn import_qualifier_to_string(qualifier: &TSImportTypeQualifier) -> String {
     }
 }
 
-fn span_text<'a>(source: &'a str, span: oxc_span::Span) -> &'a str {
+fn span_text(source: &str, span: oxc_span::Span) -> &str {
     &source[span.start as usize..span.end as usize]
 }
 

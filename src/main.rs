@@ -80,8 +80,8 @@ fn init_tracing(logging: &LoggingArgs, reporter: &ProgressReporter) {
         }
 
         // File: full detail at --log-level (default: info)
-        let file_filter = EnvFilter::try_new(&logging.log_level)
-            .unwrap_or_else(|_| EnvFilter::new("info"));
+        let file_filter =
+            EnvFilter::try_new(&logging.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
         let file = fs::File::create(path).expect("cannot open log file");
         let file_layer = fmt::layer()
@@ -98,7 +98,9 @@ fn init_tracing(logging: &LoggingArgs, reporter: &ProgressReporter) {
 // ─── Extract command (TypeScript) ───────────────────────────────────────
 
 fn cmd_extract_ts(args: TsExtractArgs, reporter: &ProgressReporter) -> Result<()> {
-    let _span = info_span!("extract", repo = %args.common.repo.display(), git_ref = %args.common.git_ref).entered();
+    let _span =
+        info_span!("extract", repo = %args.common.repo.display(), git_ref = %args.common.git_ref)
+            .entered();
     let common = &args.common;
 
     let phase = reporter.start_phase(&format!(
@@ -118,7 +120,11 @@ fn cmd_extract_ts(args: TsExtractArgs, reporter: &ProgressReporter) -> Result<()
         "Extracted API surface",
         &format!("{} symbols from {} files", sym_count, file_count),
     );
-    info!(symbols = sym_count, files = file_count, "extraction complete");
+    info!(
+        symbols = sym_count,
+        files = file_count,
+        "extraction complete"
+    );
 
     write_json_output(&surface, common.output.as_deref(), reporter)?;
     Ok(())
@@ -151,9 +157,17 @@ fn cmd_diff(args: DiffArgs, reporter: &ProgressReporter) -> Result<()> {
     let non_breaking = changes.len() - breaking;
     phase.finish_with_detail(
         "Diff complete",
-        &format!("{} changes ({} breaking, {} non-breaking)", changes.len(), breaking, non_breaking),
+        &format!(
+            "{} changes ({} breaking, {} non-breaking)",
+            changes.len(),
+            breaking,
+            non_breaking
+        ),
     );
-    info!(total = changes.len(), breaking, non_breaking, "diff complete");
+    info!(
+        total = changes.len(),
+        breaking, non_breaking, "diff complete"
+    );
 
     write_json_output(&changes, args.output.as_deref(), reporter)?;
     Ok(())
@@ -219,8 +233,7 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
     // ── Infer CSS suffix renames via LLM ─────────────────────────────
     if !common.no_llm {
         if let Some(ref llm_cmd) = common.llm_command {
-            let (removed_suffixes, added_suffixes) =
-                konveyor::extract_suffix_inventory(&report);
+            let (removed_suffixes, added_suffixes) = konveyor::extract_suffix_inventory(&report);
             if !removed_suffixes.is_empty() && !added_suffixes.is_empty() {
                 let suffix_phase = reporter.start_phase(&format!(
                     "[Suffix] Inferring CSS suffix renames ({} removed, {} added)",
@@ -239,10 +252,8 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
                     let added: Vec<String> = added_suffixes.into_iter().collect();
                     move || {
                         let analyzer = LlmBehaviorAnalyzer::new(&cmd);
-                        let removed_refs: Vec<&str> =
-                            removed.iter().map(|s| s.as_str()).collect();
-                        let added_refs: Vec<&str> =
-                            added.iter().map(|s| s.as_str()).collect();
+                        let removed_refs: Vec<&str> = removed.iter().map(|s| s.as_str()).collect();
+                        let added_refs: Vec<&str> = added.iter().map(|s| s.as_str()).collect();
                         analyzer.infer_suffix_renames(&removed_refs, &added_refs)
                     }
                 })
@@ -259,11 +270,13 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
                             })
                             .collect();
 
-                        let member_renames =
-                            konveyor::apply_suffix_renames(&report, &suffix_map);
+                        let member_renames = konveyor::apply_suffix_renames(&report, &suffix_map);
 
                         if !member_renames.is_empty() {
-                            info!(count = member_renames.len(), "applied suffix member renames");
+                            info!(
+                                count = member_renames.len(),
+                                "applied suffix member renames"
+                            );
                             report.member_renames = member_renames;
                         }
                         suffix_phase.finish_with_detail(
@@ -300,8 +313,7 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
         ));
         reporter.println(&format!(
             "  {} API changes, {} behavioral changes",
-            report.summary.breaking_api_changes,
-            report.summary.breaking_behavioral_changes
+            report.summary.breaking_api_changes, report.summary.breaking_behavioral_changes
         ));
         info!(
             total = total_breaking,
@@ -332,9 +344,13 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
         reporter.println(&format!("Loading report from {}", report_path.display()));
         let json = read_to_string(report_path)
             .with_context(|| format!("Failed to read {}", report_path.display()))?;
-        let report: AnalysisReport<TypeScript> = serde_json::from_str(&json).with_context(
-            || format!("Failed to parse {} as AnalysisReport", report_path.display()),
-        )?;
+        let report: AnalysisReport<TypeScript> =
+            serde_json::from_str(&json).with_context(|| {
+                format!(
+                    "Failed to parse {} as AnalysisReport",
+                    report_path.display()
+                )
+            })?;
         report
     } else {
         let repo = common
@@ -350,7 +366,12 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
             .as_ref()
             .context("--to is required when --from-report is not provided")?;
 
-        reporter.println(&format!("Analyzing {} from {} to {}", repo.display(), from, to));
+        reporter.println(&format!(
+            "Analyzing {} from {} to {}",
+            repo.display(),
+            from,
+            to
+        ));
         if common.no_llm {
             reporter.println("Mode: static analysis only (--no-llm)");
         }
@@ -397,7 +418,11 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     }
     phase.finish_with_detail(
         "Token members analyzed",
-        &format!("{} covered, {} renames", covered_symbols.len(), member_renames.len()),
+        &format!(
+            "{} covered, {} renames",
+            covered_symbols.len(),
+            member_renames.len()
+        ),
     );
 
     // Store member renames into the report
@@ -476,19 +501,13 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     let mut all_rules = rules;
     all_rules.extend(dep_update_rules);
 
-    let fix_guidance =
-        konveyor::generate_fix_guidance(&report, &all_rules, &args.file_pattern);
+    let fix_guidance = konveyor::generate_fix_guidance(&report, &all_rules, &args.file_pattern);
     let rule_count = all_rules.len();
     rule_phase.finish_with_detail("Rules generated", &format!("{} rules", rule_count));
 
     // Write output
     let write_phase = reporter.start_phase("Writing output files");
-    konveyor::write_ruleset_dir(
-        &common.output_dir,
-        &args.ruleset_name,
-        &report,
-        &all_rules,
-    )?;
+    konveyor::write_ruleset_dir(&common.output_dir, &args.ruleset_name, &report, &all_rules)?;
 
     let fix_dir = konveyor::write_fix_guidance_dir(&common.output_dir, &fix_guidance)?;
     konveyor::write_fix_strategies(&fix_dir, &strategies)?;
@@ -524,7 +543,10 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
             conformance_rules.len(),
         ));
     }
-    reporter.println(&format!("  Fixes:    {}/fix-guidance.yaml", fix_dir.display()));
+    reporter.println(&format!(
+        "  Fixes:    {}/fix-guidance.yaml",
+        fix_dir.display()
+    ));
     reporter.println(&format!(
         "  Strategies: {}/fix-strategies.json ({} entries)",
         fix_dir.display(),
@@ -561,14 +583,8 @@ fn build_envelope<L: Language>(
     structural_changes: &[StructuralChange],
 ) -> anyhow::Result<ReportEnvelope> {
     let summary = AnalysisSummary {
-        total_structural_breaking: structural_changes
-            .iter()
-            .filter(|c| c.is_breaking)
-            .count(),
-        total_structural_non_breaking: structural_changes
-            .iter()
-            .filter(|c| !c.is_breaking)
-            .count(),
+        total_structural_breaking: structural_changes.iter().filter(|c| c.is_breaking).count(),
+        total_structural_non_breaking: structural_changes.iter().filter(|c| !c.is_breaking).count(),
         total_behavioral_changes: report
             .changes
             .iter()

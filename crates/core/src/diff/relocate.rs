@@ -76,7 +76,7 @@ pub(super) fn detect_relocations<'a>(
             let best_idx = added_syms
                 .iter()
                 .position(|(_, asym)| asym.name == rsym.name)
-                .or_else(|| {
+                .or({
                     // If no exact name match, take first available
                     if !added_syms.is_empty() {
                         Some(0)

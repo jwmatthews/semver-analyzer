@@ -169,11 +169,7 @@ fn walk_expression<'a>(expr: &'a Expression<'a>, source: &str, info: &mut JsxInf
             }
         }
         Expression::ArrowFunctionExpression(arrow) => {
-            if arrow.expression {
-                walk_statements(&arrow.body.statements, source, info);
-            } else {
-                walk_statements(&arrow.body.statements, source, info);
-            }
+            walk_statements(&arrow.body.statements, source, info);
         }
         _ => {}
     }
@@ -385,10 +381,10 @@ fn diff_element_tags(
         if let Some(new_count) = new.element_tags.get(tag) {
             let diff = (*new_count as i64) - (*old_count as i64);
             if diff.abs() >= 2
-                || (diff.abs() >= 1 && tag.chars().next().map_or(false, |c| c.is_lowercase()))
+                || (diff.abs() >= 1 && tag.chars().next().is_some_and(|c| c.is_lowercase()))
             {
                 // Only report for HTML elements (lowercase), not components
-                if tag.chars().next().map_or(false, |c| c.is_lowercase()) {
+                if tag.chars().next().is_some_and(|c| c.is_lowercase()) {
                     let desc = if diff > 0 {
                         format!(
                             "{} additional <{}> wrapper element{} added",

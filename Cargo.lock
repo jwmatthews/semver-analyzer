@@ -448,6 +448,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "konveyor-core"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f5b7947cf46c3c288a92526ed54c553683d1bd72f98e2593411a06f2c74ef5f"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -992,7 +1004,7 @@ checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
 
 [[package]]
 name = "semver-analyzer"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1014,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "semver-analyzer-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1027,10 +1039,11 @@ dependencies = [
 
 [[package]]
 name = "semver-analyzer-konveyor-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "chrono",
+ "konveyor-core",
  "regex",
  "semver-analyzer-core",
  "serde",
@@ -1041,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "semver-analyzer-llm"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "regex",
@@ -1053,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "semver-analyzer-ts"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "chrono",
