@@ -207,7 +207,7 @@ crates/
 │   └── src/
 │       ├── traits.rs        # Pluggable language support trait
 │       ├── shared.rs        # SharedFindings (DashMap + broadcast)
-│       ├── diff/            # 4-phase API surface differ
+│       ├── diff/            # 6-phase API surface differ
 │       └── types/           # ApiSurface, Symbol, AnalysisReport
 ├── ts/                      # TypeScript/JavaScript support
 │   └── src/
@@ -216,8 +216,13 @@ crates/
 │       ├── diff_parser/     # Git diff -> changed functions
 │       ├── test_analyzer/   # Test discovery + assertion detection
 │       ├── call_graph/      # Same-file caller detection
+│       ├── jsx_diff/        # Deterministic JSX render diffing
+│       ├── css_scan/        # CSS variable/class prefix scanning
 │       ├── manifest/        # package.json diff
+│       ├── konveyor.rs      # Konveyor migration rule generation
 │       └── worktree/        # Git worktree lifecycle, tsc, pkg mgr
+├── konveyor-core/           # Shared Konveyor rule types and utilities
+│   └── src/lib.rs           # Rule construction, consolidation, fix strategies
 └── llm/                     # LLM behavioral analysis
     └── src/
         ├── invoke.rs        # External LLM command execution
@@ -225,7 +230,7 @@ crates/
         └── spec_compare.rs  # Structural spec comparison
 ```
 
-The core crate defines a `LanguageSupport` trait, making the architecture language-pluggable. TypeScript is the first (and currently only) implementation.
+The core crate defines a `Language` trait, making the architecture language-pluggable. TypeScript is the first (and currently only) implementation.
 
 ## Development
 

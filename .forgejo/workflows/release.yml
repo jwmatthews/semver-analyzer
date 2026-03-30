@@ -124,7 +124,7 @@ jobs:
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "next=$NEXT" >> "$GITHUB_OUTPUT"
 
-      - name: Bump all Cargo.toml versions
+      - name: Bump all Cargo.toml versions and internal deps
         run: |
           CURRENT="${{ steps.next.outputs.current }}"
           NEXT="${{ steps.next.outputs.next }}"
@@ -134,7 +134,10 @@ jobs:
             crates/llm/Cargo.toml \
             crates/konveyor-core/Cargo.toml \
             crates/ts/Cargo.toml; do
+            # Bump package version
             sed -i "s/^version *= *\"${CURRENT}\"/version = \"${NEXT}\"/" "$manifest"
+            # Bump internal dependency version requirements
+            sed -i "s/\(semver-analyzer[a-z-]* = { version = \)\"${CURRENT}\"/\1\"${NEXT}\"/" "$manifest"
           done
 
       - name: Create branch and commit
