@@ -7,7 +7,7 @@ repository = "https://forge.hurley.page/shawn_hurley/semver-analyzer"
 description = "LLM-based behavioral analysis for the semver-analyzer"
 
 [dependencies]
-semver-analyzer-core = { version = "0.0.1", path = "../core" }
+semver-analyzer-core = { version = "0.0.2", path = "../core" }
 
 # Serialization (for FunctionSpec JSON)
 serde = { version = "1", features = ["derive"] }

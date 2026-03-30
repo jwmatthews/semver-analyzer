@@ -11,10 +11,10 @@ repository = "https://forge.hurley.page/shawn_hurley/semver-analyzer"
 description = "Deterministic semantic breaking change analyzer for TypeScript/JavaScript"
 
 [dependencies]
-semver-analyzer-core = { version = "0.0.1", path = "crates/core" }
-semver-analyzer-ts = { version = "0.0.1", path = "crates/ts" }
-semver-analyzer-llm = { version = "0.0.1", path = "crates/llm" }
-semver-analyzer-konveyor-core = { version = "0.0.1", path = "crates/konveyor-core" }
+semver-analyzer-core = { version = "0.0.2", path = "crates/core" }
+semver-analyzer-ts = { version = "0.0.2", path = "crates/ts" }
+semver-analyzer-llm = { version = "0.0.2", path = "crates/llm" }
+semver-analyzer-konveyor-core = { version = "0.0.2", path = "crates/konveyor-core" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

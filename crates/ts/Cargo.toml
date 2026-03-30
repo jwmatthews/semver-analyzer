@@ -7,8 +7,8 @@ repository = "https://forge.hurley.page/shawn_hurley/semver-analyzer"
 description = "TypeScript/JavaScript support for the semver-analyzer"
 
 [dependencies]
-semver-analyzer-core = { version = "0.0.1", path = "../core" }
-semver-analyzer-konveyor-core = { version = "0.0.1", path = "../konveyor-core" }
+semver-analyzer-core = { version = "0.0.2", path = "../core" }
+semver-analyzer-konveyor-core = { version = "0.0.2", path = "../konveyor-core" }
 
 # OXC - JavaScript/TypeScript toolchain
 oxc_parser = "0.116"
