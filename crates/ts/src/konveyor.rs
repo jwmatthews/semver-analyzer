@@ -2915,7 +2915,12 @@ pub fn generate_rules(
                 component, deprecated_pkg, component, replacement_str,
             );
 
-            // Import change guidance — list all new components needed
+            // Import change guidance — list all new components AND types needed.
+            // This includes:
+            //   - The parent component itself
+            //   - All child components from the hierarchy tree
+            //   - Props interfaces that have a migration_target (consumers may
+            //     import them directly, e.g., SelectOptionProps)
             let mut import_names: BTreeSet<String> = BTreeSet::new();
             import_names.insert(component.clone());
             // Recursively collect all component names from the composition tree
@@ -2940,6 +2945,25 @@ pub fn generate_rules(
                                 }
                             }
                         }
+                    }
+                }
+            }
+            // Also include any deprecated symbols (Props interfaces, types) that
+            // have a migration_target — consumers importing these need to know
+            // the new import path includes them.
+            for fc in &report.changes {
+                let file_str = fc.file.to_string_lossy();
+                if !file_str.contains(&deprecated_dir) {
+                    continue;
+                }
+                for api in &fc.breaking_api_changes {
+                    if api.migration_target.is_some() && !api.symbol.contains('.') {
+                        let import_name = api
+                            .migration_target
+                            .as_ref()
+                            .map(|mt| mt.replacement_symbol.clone())
+                            .unwrap_or_else(|| api.symbol.clone());
+                        import_names.insert(import_name);
                     }
                 }
             }
@@ -2977,6 +3001,53 @@ pub fn generate_rules(
                         "Removed props (no equivalent in new API): {}\n\n",
                         mt.removed_only_members.join(", "),
                     ));
+                }
+            }
+
+            // Show migration info for related Props interfaces (e.g., SelectOptionProps)
+            // that consumers may import and extend directly.
+            for fc in &report.changes {
+                let file_str = fc.file.to_string_lossy();
+                if !file_str.contains(&deprecated_dir) {
+                    continue;
+                }
+                for api in &fc.breaking_api_changes {
+                    if api.symbol.contains('.') {
+                        continue;
+                    }
+                    // Skip the parent component itself (already shown above)
+                    if api.symbol == *component || api.symbol == format!("{}Props", component) {
+                        continue;
+                    }
+                    if let Some(ref mt) = api.migration_target {
+                        deprecated_msg.push_str(&format!(
+                            "Type '{}' → '{}' (import from '{}'):\n",
+                            api.symbol, mt.replacement_symbol, replacement_str,
+                        ));
+                        if !mt.matching_members.is_empty() {
+                            deprecated_msg.push_str("  Members that carry over: ");
+                            let members: Vec<String> = mt
+                                .matching_members
+                                .iter()
+                                .map(|m| {
+                                    if m.old_name == m.new_name {
+                                        m.old_name.clone()
+                                    } else {
+                                        format!("{} → {}", m.old_name, m.new_name)
+                                    }
+                                })
+                                .collect();
+                            deprecated_msg.push_str(&members.join(", "));
+                            deprecated_msg.push('\n');
+                        }
+                        if !mt.removed_only_members.is_empty() {
+                            deprecated_msg.push_str(&format!(
+                                "  Removed members: {}\n",
+                                mt.removed_only_members.join(", "),
+                            ));
+                        }
+                        deprecated_msg.push('\n');
+                    }
                 }
             }
 
