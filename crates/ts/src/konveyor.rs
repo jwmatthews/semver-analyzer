@@ -2792,7 +2792,11 @@ pub fn generate_rules(
                     continue;
                 }
                 for api in &fc.breaking_api_changes {
-                    if !api.symbol.contains('.') && !api.symbol.ends_with("Props") {
+                    // Include all top-level symbols (not dotted member paths).
+                    // Props interfaces are included because consumers may import
+                    // them directly (e.g., `import { SelectOptionProps } from
+                    // '@patternfly/react-core/deprecated'`).
+                    if !api.symbol.contains('.') {
                         deprecated_symbols.insert(api.symbol.clone());
                     }
                 }
