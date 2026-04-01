@@ -977,10 +977,11 @@ fn is_slot_prop_type(type_str: &str) -> bool {
 /// Examples:
 ///   parent="FormGroup", child="FormGroupLabelHelp"
 ///     → strip "FormGroup" → "LabelHelp" → "labelHelp" → check prop types
+///     → FormGroupProps.labelHelp: ReactElement<any> → match!
 ///   parent="Modal", child="ModalHeader"
 ///     → strip "Modal" → "Header" → "header" → check prop types
-///   parent="Modal", child="ModalFooter"
-///     → strip "Modal" → "Footer" → "footer" → check prop types
+///     → v6 ModalProps has NO "header" prop (it was removed) → no match
+///     → ModalHeader stays as mechanism="child" (correct — direct child in v6)
 fn infer_prop_name_for_child(
     parent_name: &str,
     child_name: &str,
@@ -1023,7 +1024,19 @@ fn enrich_hierarchy_deltas(
     let mut component_props: HashMap<String, HashSet<String>> = HashMap::new();
     let mut component_prop_types: HashMap<String, HashMap<String, String>> = HashMap::new();
 
+    // Skip symbols from deprecated/next subpaths — these represent the OLD
+    // API surface re-exported in v6 for backward compatibility. The prop_name
+    // inference and component_props lookup should only use the MAIN module
+    // (the migration target), not the deprecated module (the migration source).
+    // Without this filter, deprecated ModalProps (with header/footer props)
+    // would merge with main ModalProps (without them), causing the inference
+    // to incorrectly classify ModalHeader as prop-passed.
     for sym in &new_surface.symbols {
+        let file_str = sym.file.to_string_lossy();
+        if file_str.contains("/deprecated/") || file_str.contains("/next/") {
+            continue;
+        }
+
         if matches!(sym.kind, SymbolKind::Interface | SymbolKind::TypeAlias) {
             if let Some(comp_name) = sym.name.strip_suffix("Props") {
                 let props: HashSet<String> = sym.members.iter().map(|m| m.name.clone()).collect();
@@ -3384,5 +3397,219 @@ mod tests {
             modal_title.prop_name, None,
             "Should NOT infer prop_name for non-slot type"
         );
+    }
+
+    #[test]
+    fn test_deprecated_surface_does_not_contaminate_prop_inference() {
+        // Reproduces the real Modal bug: v6 ships both a main ModalProps
+        // (without header/footer) and a deprecated ModalProps (with
+        // header/footer). The prop_name inference should only use the
+        // main module, so ModalHeader stays as mechanism="child".
+        let mut report = make_test_report(
+            vec![ComponentSummary {
+                name: "Modal".to_string(),
+                definition_name: "ModalProps".to_string(),
+                status: ComponentStatus::Modified,
+                member_summary: MemberSummary {
+                    total: 28,
+                    removed: 11,
+                    renamed: 0,
+                    type_changed: 0,
+                    added: 0,
+                    removal_ratio: 0.39,
+                },
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![
+                    ExpectedChild {
+                        name: "ModalHeader".to_string(),
+                        required: false,
+                        mechanism: "child".to_string(), // LLM correctly said child
+                        prop_name: None,
+                    },
+                    ExpectedChild::new("ModalBody", false),
+                    ExpectedChild {
+                        name: "ModalFooter".to_string(),
+                        required: false,
+                        mechanism: "child".to_string(), // LLM correctly said child
+                        prop_name: None,
+                    },
+                ],
+                source_files: vec![],
+            }],
+            vec![],
+        );
+
+        // Main ModalProps (v6) — NO header/footer props, just children
+        let main_modal_props = Symbol {
+            name: "ModalProps".to_string(),
+            qualified_name: "react-core/components/Modal/Modal.ModalProps".to_string(),
+            kind: SymbolKind::Interface,
+            visibility: Visibility::Public,
+            file: PathBuf::from("react-core/src/components/Modal/Modal.d.ts"),
+            package: Some("@patternfly/react-core".to_string()),
+            import_path: None,
+            line: 1,
+            signature: None,
+            extends: None,
+            implements: vec![],
+            is_abstract: false,
+            type_dependencies: vec![],
+            is_readonly: false,
+            is_static: false,
+            accessor_kind: None,
+            members: vec![Symbol {
+                name: "children".to_string(),
+                qualified_name: "react-core/Modal.ModalProps.children".to_string(),
+                kind: SymbolKind::Property,
+                visibility: Visibility::Public,
+                file: PathBuf::from("react-core/src/components/Modal/Modal.d.ts"),
+                package: None,
+                import_path: None,
+                line: 2,
+                signature: Some(Signature {
+                    parameters: vec![],
+                    return_type: Some("ReactNode".to_string()),
+                    type_parameters: vec![],
+                    is_async: false,
+                }),
+                extends: None,
+                implements: vec![],
+                is_abstract: false,
+                type_dependencies: vec![],
+                is_readonly: false,
+                is_static: false,
+                accessor_kind: None,
+                members: vec![],
+                rendered_components: vec![],
+            }],
+            rendered_components: vec![],
+        };
+
+        // Deprecated ModalProps (old API re-exported in v6) — HAS header/footer
+        let deprecated_modal_props = Symbol {
+            name: "ModalProps".to_string(),
+            qualified_name: "react-core/deprecated/components/Modal/Modal.ModalProps".to_string(),
+            kind: SymbolKind::Interface,
+            visibility: Visibility::Public,
+            file: PathBuf::from("react-core/src/deprecated/components/Modal/Modal.d.ts"),
+            package: Some("@patternfly/react-core".to_string()),
+            import_path: None,
+            line: 1,
+            signature: None,
+            extends: None,
+            implements: vec![],
+            is_abstract: false,
+            type_dependencies: vec![],
+            is_readonly: false,
+            is_static: false,
+            accessor_kind: None,
+            members: vec![
+                Symbol {
+                    name: "header".to_string(),
+                    qualified_name: "react-core/deprecated/Modal.ModalProps.header".to_string(),
+                    kind: SymbolKind::Property,
+                    visibility: Visibility::Public,
+                    file: PathBuf::from("react-core/src/deprecated/components/Modal/Modal.d.ts"),
+                    package: None,
+                    import_path: None,
+                    line: 2,
+                    signature: Some(Signature {
+                        parameters: vec![],
+                        return_type: Some("ReactNode".to_string()),
+                        type_parameters: vec![],
+                        is_async: false,
+                    }),
+                    extends: None,
+                    implements: vec![],
+                    is_abstract: false,
+                    type_dependencies: vec![],
+                    is_readonly: false,
+                    is_static: false,
+                    accessor_kind: None,
+                    members: vec![],
+                    rendered_components: vec![],
+                },
+                Symbol {
+                    name: "footer".to_string(),
+                    qualified_name: "react-core/deprecated/Modal.ModalProps.footer".to_string(),
+                    kind: SymbolKind::Property,
+                    visibility: Visibility::Public,
+                    file: PathBuf::from("react-core/src/deprecated/components/Modal/Modal.d.ts"),
+                    package: None,
+                    import_path: None,
+                    line: 3,
+                    signature: Some(Signature {
+                        parameters: vec![],
+                        return_type: Some("ReactNode".to_string()),
+                        type_parameters: vec![],
+                        is_async: false,
+                    }),
+                    extends: None,
+                    implements: vec![],
+                    is_abstract: false,
+                    type_dependencies: vec![],
+                    is_readonly: false,
+                    is_static: false,
+                    accessor_kind: None,
+                    members: vec![],
+                    rendered_components: vec![],
+                },
+            ],
+            rendered_components: vec![],
+        };
+
+        // new_surface contains BOTH — simulating what the real extraction produces
+        let new_surface = ApiSurface {
+            symbols: vec![main_modal_props, deprecated_modal_props],
+        };
+        let new_hierarchies = HashMap::new();
+
+        enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
+
+        let modal = report.packages[0]
+            .type_summaries
+            .iter()
+            .find(|c| c.name == "Modal")
+            .unwrap();
+
+        let modal_header = modal
+            .expected_children
+            .iter()
+            .find(|c| c.name == "ModalHeader")
+            .unwrap();
+        assert_eq!(
+            modal_header.mechanism, "child",
+            "ModalHeader should stay as 'child' — the deprecated header prop must not contaminate inference"
+        );
+        assert_eq!(
+            modal_header.prop_name, None,
+            "ModalHeader should have no prop_name — header was removed from main ModalProps"
+        );
+
+        let modal_footer = modal
+            .expected_children
+            .iter()
+            .find(|c| c.name == "ModalFooter")
+            .unwrap();
+        assert_eq!(
+            modal_footer.mechanism, "child",
+            "ModalFooter should stay as 'child' — the deprecated footer prop must not contaminate inference"
+        );
+        assert_eq!(
+            modal_footer.prop_name, None,
+            "ModalFooter should have no prop_name — footer was removed from main ModalProps"
+        );
+
+        // ModalBody should also remain as child
+        let modal_body = modal
+            .expected_children
+            .iter()
+            .find(|c| c.name == "ModalBody")
+            .unwrap();
+        assert_eq!(modal_body.mechanism, "child");
     }
 }
