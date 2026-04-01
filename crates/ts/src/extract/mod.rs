@@ -131,6 +131,11 @@ impl OxcExtractor {
             set_import_paths(&mut symbols, &file_sources, &reachability.provenance, dir);
         }
 
+        // Phase 5: Populate rendered_components from .tsx source files.
+        // For each symbol that could be a React component, find the corresponding
+        // .tsx file in the worktree and extract its JSX render tree.
+        populate_rendered_components(&mut symbols, dir);
+
         Ok(ApiSurface { symbols })
     }
 
@@ -257,6 +262,80 @@ fn remap_dist_to_src(path: &Path) -> PathBuf {
 
     // No dist segment found -- return unchanged
     path.to_path_buf()
+}
+
+// ─── Rendered-component enrichment ───────────────────────────────────────
+
+/// Populate `rendered_components` on symbols that represent React components.
+///
+/// For each symbol whose `.d.ts` declaration suggests it could be a React
+/// component (PascalCase name, Variable/Function/Constant kind), we look for
+/// the corresponding `.tsx` source file in the worktree and parse its JSX
+/// render tree to discover which other components it renders internally.
+///
+/// Symbol file paths have already been remapped from `dist/` to `src/`
+/// (e.g., `packages/react-core/src/components/Modal/Modal.d.ts`). We
+/// resolve `.tsx` source by replacing the `.d.ts` extension.
+fn populate_rendered_components(symbols: &mut [Symbol], worktree_dir: &Path) {
+    use std::collections::HashMap;
+
+    // Build a cache: source-relative .tsx path -> Vec<rendered component names>.
+    // Multiple symbols can come from the same file (e.g., a file exports
+    // both a component function and a related constant), so we avoid parsing
+    // each .tsx file more than once.
+    let mut cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+
+    let mut enriched = 0u32;
+
+    for sym in symbols.iter_mut() {
+        // Only React component candidates: PascalCase Variable/Function/Constant.
+        if !matches!(
+            sym.kind,
+            SymbolKind::Variable | SymbolKind::Function | SymbolKind::Constant
+        ) {
+            continue;
+        }
+        if !sym.name.starts_with(|c: char| c.is_ascii_uppercase()) {
+            continue;
+        }
+
+        // Derive the .tsx source path from the symbol's .d.ts file path.
+        let dts_path = sym.file.to_string_lossy();
+        let tsx_relative = if dts_path.ends_with(".d.ts") {
+            PathBuf::from(dts_path.trim_end_matches(".d.ts").to_owned() + ".tsx")
+        } else {
+            continue;
+        };
+
+        if let Some(rendered) = cache.get(&tsx_relative) {
+            if !rendered.is_empty() {
+                sym.rendered_components = rendered.clone();
+                enriched += 1;
+            }
+            continue;
+        }
+
+        // Try to read the .tsx file from the worktree.
+        let tsx_abs = worktree_dir.join(&tsx_relative);
+        let rendered = match std::fs::read_to_string(&tsx_abs) {
+            Ok(source) => crate::jsx_diff::extract_rendered_components_from_source(&source),
+            Err(_) => Vec::new(),
+        };
+
+        if !rendered.is_empty() {
+            sym.rendered_components = rendered.clone();
+            enriched += 1;
+        }
+        cache.insert(tsx_relative, rendered);
+    }
+
+    if enriched > 0 {
+        tracing::info!(
+            enriched_symbols = enriched,
+            tsx_files_parsed = cache.values().filter(|v| !v.is_empty()).count(),
+            "Populated rendered_components from .tsx source files"
+        );
+    }
 }
 
 // ─── File discovery ───────────────────────────────────────────────────────
@@ -3810,5 +3889,168 @@ export declare const Foo: MyReact.Component;
             )),
             PathBuf::from("packages/react-core/src/deprecated/components/Chip/Chip.d.ts")
         );
+    }
+
+    // ─── populate_rendered_components tests ───────────────────────────────
+
+    #[test]
+    fn populate_rendered_components_from_tsx_files() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create a component directory structure
+        let comp_dir = base.join("src/components/Dropdown");
+        fs::create_dir_all(&comp_dir).unwrap();
+
+        // Write a .tsx source file with JSX
+        fs::write(
+            comp_dir.join("Dropdown.tsx"),
+            r#"
+import React from 'react';
+export const Dropdown: React.FC = ({ children }) => {
+    return (
+        <div className="dropdown">
+            <DropdownToggle />
+            <DropdownMenu>
+                {children}
+            </DropdownMenu>
+        </div>
+    );
+};
+"#,
+        )
+        .unwrap();
+
+        // Create matching Symbol with .d.ts file path
+        let sym = Symbol::new(
+            "Dropdown",
+            "src/components/Dropdown/Dropdown.Dropdown",
+            SymbolKind::Variable,
+            Visibility::Exported,
+            PathBuf::from("src/components/Dropdown/Dropdown.d.ts"),
+            1,
+        );
+
+        // Also create a non-component symbol (should be skipped)
+        let type_sym = Symbol::new(
+            "DropdownProps",
+            "src/components/Dropdown/Dropdown.DropdownProps",
+            SymbolKind::Interface,
+            Visibility::Exported,
+            PathBuf::from("src/components/Dropdown/Dropdown.d.ts"),
+            5,
+        );
+
+        // Also a lowercase variable (should be skipped)
+        let const_sym = Symbol::new(
+            "defaultDropdownWidth",
+            "src/components/Dropdown/Dropdown.defaultDropdownWidth",
+            SymbolKind::Variable,
+            Visibility::Exported,
+            PathBuf::from("src/components/Dropdown/Dropdown.d.ts"),
+            10,
+        );
+
+        let mut symbols = vec![sym.clone(), type_sym, const_sym];
+        populate_rendered_components(&mut symbols, base);
+
+        // The Dropdown symbol should have rendered_components populated
+        assert!(
+            !symbols[0].rendered_components.is_empty(),
+            "Dropdown should have rendered_components"
+        );
+        assert!(
+            symbols[0]
+                .rendered_components
+                .contains(&"DropdownToggle".to_string()),
+            "should contain DropdownToggle"
+        );
+        assert!(
+            symbols[0]
+                .rendered_components
+                .contains(&"DropdownMenu".to_string()),
+            "should contain DropdownMenu"
+        );
+
+        // Interface and lowercase symbols should NOT have rendered_components
+        assert!(symbols[1].rendered_components.is_empty());
+        assert!(symbols[2].rendered_components.is_empty());
+    }
+
+    #[test]
+    fn populate_rendered_components_missing_tsx_file() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+
+        // Symbol pointing to a .tsx that doesn't exist
+        let sym = Symbol::new(
+            "Missing",
+            "src/components/Missing/Missing.Missing",
+            SymbolKind::Variable,
+            Visibility::Exported,
+            PathBuf::from("src/components/Missing/Missing.d.ts"),
+            1,
+        );
+
+        let mut symbols = vec![sym];
+        populate_rendered_components(&mut symbols, tmp.path());
+
+        // Should gracefully handle missing file
+        assert!(symbols[0].rendered_components.is_empty());
+    }
+
+    #[test]
+    fn populate_rendered_components_caches_per_file() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let comp_dir = tmp.path().join("src/components/Modal");
+        fs::create_dir_all(&comp_dir).unwrap();
+
+        // Single .tsx file with a component
+        fs::write(
+            comp_dir.join("Modal.tsx"),
+            r#"
+export const Modal = () => {
+    return <ModalBody />;
+};
+"#,
+        )
+        .unwrap();
+
+        // Two symbols from the same file
+        let sym1 = Symbol::new(
+            "Modal",
+            "src/components/Modal/Modal.Modal",
+            SymbolKind::Function,
+            Visibility::Exported,
+            PathBuf::from("src/components/Modal/Modal.d.ts"),
+            1,
+        );
+        let sym2 = Symbol::new(
+            "ModalVariant",
+            "src/components/Modal/Modal.ModalVariant",
+            SymbolKind::Variable,
+            Visibility::Exported,
+            PathBuf::from("src/components/Modal/Modal.d.ts"),
+            5,
+        );
+
+        let mut symbols = vec![sym1, sym2];
+        populate_rendered_components(&mut symbols, tmp.path());
+
+        // Both should get the same rendered_components (from cache)
+        assert_eq!(
+            symbols[0].rendered_components,
+            symbols[1].rendered_components
+        );
+        assert!(symbols[0]
+            .rendered_components
+            .contains(&"ModalBody".to_string()));
     }
 }

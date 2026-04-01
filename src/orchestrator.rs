@@ -1559,6 +1559,56 @@ impl<L: Language> Analyzer<L> {
             return (Vec::new(), HashMap::new());
         }
 
+        // ── Phase 0: Deterministic hierarchy ─────────────────────────
+        //
+        // Compute hierarchy without LLM using three signals:
+        // 1. Prop absorption: removed props that moved to new child components
+        // 2. Cross-family extends: components whose props extend another family
+        // 3. Internal rendering: what JSX components are rendered internally
+        //
+        // The old surface uses rendered_components only (no structural changes).
+        // The new surface uses all three signals.
+        let deterministic_old =
+            hierarchy.compute_deterministic_hierarchy(old_surface, &[]);
+        let deterministic_new =
+            hierarchy.compute_deterministic_hierarchy(new_surface, structural_changes);
+
+        let det_old_count = deterministic_old.len();
+        let det_new_count = deterministic_new.len();
+        if det_old_count > 0 || det_new_count > 0 {
+            info!(
+                old_families = det_old_count,
+                new_families = det_new_count,
+                "deterministic hierarchy computed from rendered_components"
+            );
+            for (family, components) in &deterministic_new {
+                let children_count: usize = components.values().map(|v| v.len()).sum();
+                debug!(
+                    family = %family,
+                    components = components.len(),
+                    children = children_count,
+                    "deterministic hierarchy"
+                );
+            }
+        }
+
+        // Families that have deterministic hierarchy data for the new version
+        // can skip LLM inference entirely.
+        let families_needing_llm: Vec<String> = families
+            .iter()
+            .filter(|f| !deterministic_new.contains_key(*f))
+            .cloned()
+            .collect();
+
+        let families_with_det: usize = families.len() - families_needing_llm.len();
+        if families_with_det > 0 {
+            info!(
+                deterministic = families_with_det,
+                llm = families_needing_llm.len(),
+                "hierarchy inference split"
+            );
+        }
+
         // Detect cross-family relationships and prepare related signatures
         let context_rels = hierarchy.cross_family_relationships(repo, to_ref);
 
@@ -1591,19 +1641,23 @@ impl<L: Language> Analyzer<L> {
 
         info!(
             families = families.len(),
+            llm_families = families_needing_llm.len(),
             cross_family = related_signatures.len(),
             "analyzing component hierarchy for both versions"
         );
 
-        let bar = progress.start_counted("[Hierarchy] Inference", families.len() as u64);
+        let bar = progress.start_counted(
+            "[Hierarchy] Inference",
+            families_needing_llm.len() as u64,
+        );
 
-        // Run LLM calls concurrently
+        // Run LLM calls concurrently — only for families without deterministic data
         let semaphore = Arc::new(tokio::sync::Semaphore::new(LLM_CONCURRENCY));
 
-        // For each family, infer hierarchy for BOTH old and new refs
+        // For each family needing LLM, infer hierarchy for BOTH old and new refs
         let mut handles = Vec::new();
 
-        for family in &families {
+        for family in &families_needing_llm {
             // Pre-compute file paths before spawning — hierarchy is a reference
             // that can't cross the 'static boundary of tokio::spawn.
             let old_paths = hierarchy.family_source_paths(repo, from_ref, family);
@@ -1756,7 +1810,7 @@ impl<L: Language> Analyzer<L> {
             handles.push(handle);
         }
 
-        // Collect results
+        // Collect LLM results
         let mut all_old: HashMap<String, HashMap<String, Vec<ExpectedChild>>> = HashMap::new();
         let mut all_new: HashMap<String, HashMap<String, Vec<ExpectedChild>>> = HashMap::new();
 
@@ -1768,6 +1822,7 @@ impl<L: Language> Analyzer<L> {
                     family = %family,
                     old_children = old_count,
                     new_children = new_count,
+                    source = "llm",
                     "hierarchy inferred"
                 );
                 all_old.insert(family.clone(), old_h);
@@ -1776,6 +1831,15 @@ impl<L: Language> Analyzer<L> {
             bar.inc();
         }
         bar.finish();
+
+        // Merge deterministic hierarchy results (from rendered_components).
+        // These cover families that were skipped for LLM inference.
+        for (family, components) in deterministic_old {
+            all_old.entry(family).or_insert(components);
+        }
+        for (family, components) in deterministic_new {
+            all_new.entry(family).or_insert(components);
+        }
 
         // Compute deltas
         let mut deltas = Vec::new();
@@ -1814,6 +1878,8 @@ impl<L: Language> Analyzer<L> {
                         added_children: added,
                         removed_children: removed,
                         migrated_members: Vec::new(), // Populated during report building
+                        source_package: None,
+                        migration_target: None,
                     });
                 }
             }
