@@ -280,6 +280,7 @@ pub fn diff_surfaces_with_semantics(
         .collect();
 
     let renames = detect_renames(&remaining_removed, &remaining_added);
+
     let renamed_old: HashSet<&str> = renames
         .iter()
         .map(|r| r.old.qualified_name.as_str())
@@ -288,6 +289,45 @@ pub fn diff_surfaces_with_semantics(
         .iter()
         .map(|r| r.new.qualified_name.as_str())
         .collect();
+
+    // Build directory rename mappings from cross-directory renames.
+    // If Phase 2 matched `TextVariants` (in `Text/`) → `ContentVariants` (in `Content/`),
+    // then `Text/` → `Content/` is a known directory migration. This lets Phase 5
+    // (detect_migrations) search across directories for unmatched removals.
+    //
+    // Multiple renames from the same source directory may point to different targets
+    // (e.g., `TextVariants` → `Content/`, `TextListVariants` → `Toolbar/`), so we
+    // collect all unique target directories per source.
+    let dir_renames: HashMap<String, Vec<String>> = {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for rm in &renames {
+            let old_dir = rm
+                .old
+                .file
+                .parent()
+                .map(|p| p.to_string_lossy().to_string());
+            let new_dir = rm
+                .new
+                .file
+                .parent()
+                .map(|p| p.to_string_lossy().to_string());
+            if let (Some(od), Some(nd)) = (old_dir, new_dir) {
+                if od != nd {
+                    tracing::debug!(
+                        old_dir = %od,
+                        new_dir = %nd,
+                        via = %rm.old.name,
+                        "Directory rename mapping from Phase 2"
+                    );
+                    let targets = map.entry(od).or_default();
+                    if !targets.contains(&nd) {
+                        targets.push(nd);
+                    }
+                }
+            }
+        }
+        map
+    };
 
     // Emit rename changes
     for rm in &renames {
@@ -441,7 +481,13 @@ pub fn diff_surfaces_with_semantics(
             .copied()
             .collect();
 
-        let migrations = detect_migrations(&final_removed, &old_symbols, &new_symbols, semantics);
+        let migrations = detect_migrations(
+            &final_removed,
+            &old_symbols,
+            &new_symbols,
+            semantics,
+            &dir_renames,
+        );
 
         // Annotate existing Removed(Symbol) changes with migration targets.
         // MigrationSuggested is now represented as Removed(Symbol) with migration_target set.

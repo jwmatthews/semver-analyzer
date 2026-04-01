@@ -57,16 +57,21 @@ pub(super) struct MigrationMatch<'a> {
 /// For each removed interface/class, looks for surviving or added interfaces
 /// in the same component directory with significant member name overlap.
 ///
+/// When no same-directory candidate is found, `dir_renames` provides a fallback:
+/// if a Phase 2 rename detected a cross-directory move (e.g., `TextVariants` in
+/// `Text/` renamed to `ContentVariants` in `Content/`), the directory mapping
+/// `Text/ → Content/` lets us search the target directory for candidates.
+///
 /// `removed` — symbols removed between old and new surfaces (not relocated, not renamed).
 /// `old_symbols` — all symbols from the old surface.
 /// `new_symbols` — all symbols from the new surface.
-/// `added_members_by_parent` — for each surviving interface, the set of member
-///     names that were added in the new version (empty for newly added interfaces).
+/// `dir_renames` — directory mappings from Phase 2 rename detection (old_dir → [new_dirs]).
 pub(super) fn detect_migrations<'a>(
     removed: &[&'a Symbol],
     old_symbols: &[&'a Symbol],
     new_symbols: &[&'a Symbol],
     semantics: &dyn crate::traits::LanguageSemantics,
+    dir_renames: &HashMap<String, Vec<String>>,
 ) -> Vec<MigrationMatch<'a>> {
     // Only consider removed interfaces and classes — these are the container
     // types whose members might have moved.
@@ -110,10 +115,43 @@ pub(super) fn detect_migrations<'a>(
         }
 
         // Find candidate replacements in the same family (same_family check).
-        let candidates: Vec<&&Symbol> = new_containers
+        let mut candidates: Vec<&&Symbol> = new_containers
             .iter()
             .filter(|c| semantics.same_family(removed_sym, c))
             .collect();
+
+        // Cross-directory fallback: if no same-family candidates exist but a
+        // Phase 2 rename links this symbol's directory to others, search there.
+        if candidates.is_empty() && !dir_renames.is_empty() {
+            let removed_dir = removed_sym
+                .file
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if let Some(target_dirs) = dir_renames.get(&removed_dir) {
+                candidates = new_containers
+                    .iter()
+                    .filter(|c| {
+                        c.file
+                            .parent()
+                            .map(|p| {
+                                let ps = p.to_string_lossy();
+                                target_dirs.iter().any(|td| ps == td.as_str())
+                            })
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                if !candidates.is_empty() {
+                    tracing::debug!(
+                        removed = %removed_sym.name,
+                        from_dir = %removed_dir,
+                        target_dirs = ?target_dirs,
+                        candidate_count = candidates.len(),
+                        "Cross-directory fallback via rename chain"
+                    );
+                }
+            }
+        }
 
         let mut best_match: Option<(&Symbol, f64, Vec<MemberMapping>, Vec<String>)> = None;
 
@@ -308,7 +346,13 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_parent];
         let removed: Vec<&Symbol> = vec![&old_header];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
+        let results = detect_migrations(
+            &removed,
+            &old_symbols,
+            &new_symbols,
+            &MinimalSemantics,
+            &HashMap::<String, Vec<String>>::new(),
+        );
         assert_eq!(results.len(), 1);
 
         let m = &results[0];
@@ -418,7 +462,13 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_main_select];
         let removed: Vec<&Symbol> = vec![&old_select];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
+        let results = detect_migrations(
+            &removed,
+            &old_symbols,
+            &new_symbols,
+            &MinimalSemantics,
+            &HashMap::<String, Vec<String>>::new(),
+        );
         // MinimalSemantics uses plain directory comparison, so deprecated/
         // and non-deprecated paths are different families. No migration is
         // detected. Language-specific same_family behavior (stripping
@@ -486,7 +536,13 @@ mod tests {
         // This module handles the case where the INTERFACE is removed, not props.
         let removed: Vec<&Symbol> = vec![];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
+        let results = detect_migrations(
+            &removed,
+            &old_symbols,
+            &new_symbols,
+            &MinimalSemantics,
+            &HashMap::<String, Vec<String>>::new(),
+        );
         assert_eq!(
             results.len(),
             0,
@@ -513,7 +569,13 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_bar];
         let removed: Vec<&Symbol> = vec![&removed_foo];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
+        let results = detect_migrations(
+            &removed,
+            &old_symbols,
+            &new_symbols,
+            &MinimalSemantics,
+            &HashMap::<String, Vec<String>>::new(),
+        );
         assert_eq!(results.len(), 0, "Different directories should not match");
     }
 
@@ -549,7 +611,13 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_foo];
         let removed: Vec<&Symbol> = vec![&removed_header];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
+        let results = detect_migrations(
+            &removed,
+            &old_symbols,
+            &new_symbols,
+            &MinimalSemantics,
+            &HashMap::<String, Vec<String>>::new(),
+        );
         // 1 match (title) from 2-member interface = 50% ratio.
         // Adaptive min_overlap_count(2) = 1, ratio 50% > 25%.
         // This is correctly detected as an absorption.
@@ -600,7 +668,13 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_parent];
         let removed: Vec<&Symbol> = vec![&old_icon_props];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
+        let results = detect_migrations(
+            &removed,
+            &old_symbols,
+            &new_symbols,
+            &MinimalSemantics,
+            &HashMap::<String, Vec<String>>::new(),
+        );
 
         assert_eq!(
             results.len(),
@@ -670,10 +744,89 @@ mod tests {
         let new_symbols: Vec<&Symbol> = vec![&new_parent];
         let removed: Vec<&Symbol> = vec![&old_tiny];
 
-        let results = detect_migrations(&removed, &old_symbols, &new_symbols, &MinimalSemantics);
+        let results = detect_migrations(
+            &removed,
+            &old_symbols,
+            &new_symbols,
+            &MinimalSemantics,
+            &HashMap::<String, Vec<String>>::new(),
+        );
         assert!(
             results.is_empty(),
             "Should NOT produce migration for non-matching single-member interface"
         );
+    }
+
+    #[test]
+    fn test_cross_directory_migration_via_rename_chain() {
+        // Simulates Text/ -> Content/ rename: TextProps (in Text/) should match
+        // ContentProps (in Content/) when a dir_renames mapping exists.
+        let old_text_props = make_interface(
+            "TextProps",
+            "components/Text/Text.d.ts",
+            &[
+                "component",
+                "children",
+                "className",
+                "isVisitedLink",
+                "ouiaId",
+                "ouiaSafe",
+            ],
+        );
+
+        let new_content_props = make_interface(
+            "ContentProps",
+            "components/Content/Content.d.ts",
+            &[
+                "component",
+                "children",
+                "className",
+                "isVisitedLink",
+                "ouiaId",
+                "ouiaSafe",
+                "isEditorial",
+            ],
+        );
+
+        let old_symbols: Vec<&Symbol> = vec![&old_text_props];
+        let new_symbols: Vec<&Symbol> = vec![&new_content_props];
+        let removed: Vec<&Symbol> = vec![&old_text_props];
+
+        // Without dir_renames: no match (different directories)
+        let results = detect_migrations(
+            &removed,
+            &old_symbols,
+            &new_symbols,
+            &MinimalSemantics,
+            &HashMap::<String, Vec<String>>::new(),
+        );
+        assert!(
+            results.is_empty(),
+            "Without dir_renames, cross-directory should NOT match"
+        );
+
+        // With dir_renames from a Phase 2 rename: should match
+        let mut dir_renames = HashMap::new();
+        dir_renames.insert(
+            "components/Text".to_string(),
+            vec!["components/Content".to_string()],
+        );
+
+        let results = detect_migrations(
+            &removed,
+            &old_symbols,
+            &new_symbols,
+            &MinimalSemantics,
+            &dir_renames,
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "Should find TextProps -> ContentProps via dir_renames"
+        );
+        assert_eq!(results[0].target.replacement_symbol, "ContentProps");
+        assert_eq!(results[0].target.matching_members.len(), 6);
+        assert!(results[0].target.removed_only_members.is_empty());
+        assert!(results[0].target.overlap_ratio > 0.85);
     }
 }
