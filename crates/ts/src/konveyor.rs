@@ -2661,38 +2661,68 @@ pub fn generate_rules(
             msg.push('\n');
         }
 
-        // Build example showing new composition using full expected_children
+        // Build example showing new composition using full expected_children.
+        // Prop-passed children appear as props on the parent's opening tag;
+        // direct children appear nested inside.
         if let Some(expected_children) = all_expected {
+            let prop_passed: Vec<&ExpectedChild> = expected_children
+                .iter()
+                .filter(|c| c.mechanism == "prop")
+                .collect();
+            let direct: Vec<&ExpectedChild> = expected_children
+                .iter()
+                .filter(|c| c.mechanism != "prop")
+                .collect();
+
             msg.push_str("Example:\n  <");
             msg.push_str(component);
-            msg.push_str(">\n");
-            for child in expected_children {
-                // Show absorbed props on the child element
-                let child_props: Vec<String> = delta
-                    .migrated_members
-                    .iter()
-                    .filter(|mp| mp.target_child == child.name)
-                    .map(|mp| {
-                        if let Some(ref tn) = mp.target_member_name {
-                            format!("{}={{...}}", tn)
-                        } else {
-                            format!("{}={{...}}", mp.member_name)
-                        }
-                    })
-                    .collect();
 
-                let props_str = if child_props.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", child_props.join(" "))
-                };
-
-                msg.push_str(&format!(
-                    "    <{}{}> ... </{}>\n",
-                    child.name, props_str, child.name,
-                ));
+            // Show prop-passed children as props on the opening tag
+            for child in &prop_passed {
+                let prop = child.prop_name.as_deref().unwrap_or("(unknown prop)");
+                msg.push_str(&format!("\n    {}={{<{} />}}", prop, child.name));
             }
-            msg.push_str(&format!("  </{}>\n", component));
+
+            if direct.is_empty() && prop_passed.is_empty() {
+                msg.push_str(" />\n");
+            } else if direct.is_empty() {
+                msg.push_str("\n  />\n");
+            } else {
+                if !prop_passed.is_empty() {
+                    msg.push('\n');
+                    msg.push_str("  >\n");
+                } else {
+                    msg.push_str(">\n");
+                }
+
+                for child in &direct {
+                    // Show absorbed props on the child element
+                    let child_props: Vec<String> = delta
+                        .migrated_members
+                        .iter()
+                        .filter(|mp| mp.target_child == child.name)
+                        .map(|mp| {
+                            if let Some(ref tn) = mp.target_member_name {
+                                format!("{}={{...}}", tn)
+                            } else {
+                                format!("{}={{...}}", mp.member_name)
+                            }
+                        })
+                        .collect();
+
+                    let props_str = if child_props.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", child_props.join(" "))
+                    };
+
+                    msg.push_str(&format!(
+                        "    <{}{}> ... </{}>\n",
+                        child.name, props_str, child.name,
+                    ));
+                }
+                msg.push_str(&format!("  </{}>\n", component));
+            }
         }
 
         // Resolve the from package
@@ -2903,18 +2933,27 @@ pub fn generate_rules(
                         prefix, component_name, component_name
                     ));
                 } else {
-                    msg.push_str(&format!("{}<{}>\n", prefix, component_name));
-                    for child in &children {
-                        if child.mechanism == "prop" {
-                            msg.push_str(&format!(
-                                "{}  {{/* {} passed via prop */}}\n",
-                                prefix, child.name
-                            ));
-                        } else {
+                    let prop_passed: Vec<&ExpectedChild> =
+                        children.iter().filter(|c| c.mechanism == "prop").collect();
+                    let direct: Vec<&ExpectedChild> =
+                        children.iter().filter(|c| c.mechanism != "prop").collect();
+
+                    // Opening tag with prop-passed children as attributes
+                    msg.push_str(&format!("{}<{}", prefix, component_name));
+                    for child in &prop_passed {
+                        let prop = child.prop_name.as_deref().unwrap_or("(unknown prop)");
+                        msg.push_str(&format!(" {}={{<{} />}}", prop, child.name));
+                    }
+
+                    if direct.is_empty() {
+                        msg.push_str(" />\n");
+                    } else {
+                        msg.push_str(">\n");
+                        for child in &direct {
                             build_nested_example(msg, &child.name, report, indent + 2, visited);
                         }
+                        msg.push_str(&format!("{}</{}>\n", prefix, component_name));
                     }
-                    msg.push_str(&format!("{}</{}>\n", prefix, component_name));
                 }
             }
 
@@ -10276,6 +10315,21 @@ mod tests {
             rule.message.contains("Recommended child components")
                 && rule.message.contains("FormGroup"),
             "Direct children should be in recommended section. Message:\n{}",
+            rule.message,
+        );
+
+        // The example should show FormFieldGroupHeader as a prop on the opening tag,
+        // not as a direct child inside the parent.
+        assert!(
+            rule.message.contains("header={<FormFieldGroupHeader />}"),
+            "Prop-passed children should appear as props on the opening tag. Message:\n{}",
+            rule.message,
+        );
+        assert!(
+            !rule
+                .message
+                .contains("<FormFieldGroupHeader> ... </FormFieldGroupHeader>"),
+            "Prop-passed children should NOT appear as direct children. Message:\n{}",
             rule.message,
         );
     }

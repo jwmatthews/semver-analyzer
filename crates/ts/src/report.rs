@@ -955,6 +955,58 @@ fn discover_child_components(
     children_map.into_values().collect()
 }
 
+// ─── Slot Prop Inference ────────────────────────────────────────────────
+
+/// Check if a type string represents a "slot" prop — one that accepts a
+/// React component instance (ReactElement, ReactNode, JSX.Element).
+fn is_slot_prop_type(type_str: &str) -> bool {
+    let t = type_str.trim();
+    // Match common slot types, including union variants like
+    // "ReactNode | undefined" or "ReactElement<any>"
+    t.contains("ReactElement")
+        || t.contains("ReactNode")
+        || t.contains("JSX.Element")
+        || t.contains("Element")
+}
+
+/// Try to infer which prop on the parent carries a given child component.
+///
+/// Strategy: strip the parent name prefix from the child name, lowercase
+/// the first character, and check if a slot prop with that name exists.
+///
+/// Examples:
+///   parent="FormGroup", child="FormGroupLabelHelp"
+///     → strip "FormGroup" → "LabelHelp" → "labelHelp" → check prop types
+///   parent="Modal", child="ModalHeader"
+///     → strip "Modal" → "Header" → "header" → check prop types
+///   parent="Modal", child="ModalFooter"
+///     → strip "Modal" → "Footer" → "footer" → check prop types
+fn infer_prop_name_for_child(
+    parent_name: &str,
+    child_name: &str,
+    prop_types: &HashMap<String, String>,
+) -> Option<String> {
+    // Strip parent prefix from child name
+    let suffix = child_name.strip_prefix(parent_name)?;
+    if suffix.is_empty() {
+        return None;
+    }
+
+    // Lowercase first character: "LabelHelp" → "labelHelp"
+    let mut chars = suffix.chars();
+    let first = chars.next()?;
+    let candidate = format!("{}{}", first.to_lowercase(), chars.as_str());
+
+    // Check if this prop exists and has a slot type
+    if let Some(type_str) = prop_types.get(&candidate) {
+        if is_slot_prop_type(type_str) {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
 // ─── Hierarchy Delta Enrichment ──────────────────────────────────────────
 
 /// Enrich hierarchy deltas with prop migration data and populate
@@ -966,7 +1018,10 @@ fn enrich_hierarchy_deltas(
     new_hierarchies: &HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
 ) {
     // Build a lookup of component name → props from the new surface.
+    // Each prop maps to its type string (from signature.return_type) for
+    // deterministic prop_name inference on slot props.
     let mut component_props: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut component_prop_types: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     for sym in &new_surface.symbols {
         if matches!(sym.kind, SymbolKind::Interface | SymbolKind::TypeAlias) {
@@ -976,6 +1031,18 @@ fn enrich_hierarchy_deltas(
                     .entry(comp_name.to_string())
                     .or_default()
                     .extend(props);
+
+                // Collect type info for each member
+                let types = component_prop_types
+                    .entry(comp_name.to_string())
+                    .or_default();
+                for m in &sym.members {
+                    if let Some(sig) = &m.signature {
+                        if let Some(rt) = &sig.return_type {
+                            types.insert(m.name.clone(), rt.clone());
+                        }
+                    }
+                }
             }
         }
 
@@ -995,6 +1062,15 @@ fn enrich_hierarchy_deltas(
                     .entry(sym.name.clone())
                     .or_default()
                     .extend(props);
+
+                let types = component_prop_types.entry(sym.name.clone()).or_default();
+                for m in &sym.members {
+                    if let Some(sig) = &m.signature {
+                        if let Some(rt) = &sig.return_type {
+                            types.insert(m.name.clone(), rt.clone());
+                        }
+                    }
+                }
             }
         }
     }
@@ -1216,6 +1292,99 @@ fn enrich_hierarchy_deltas(
             tracing::debug!(
                 count = inferred_count,
                 "Inferred expected_children via extends chain fallback"
+            );
+        }
+    }
+
+    // ── Deterministic prop_name inference for slot props ─────────
+    //
+    // For expected children with mechanism="prop" but no prop_name, or
+    // children the LLM classified as "child" that are actually prop-passed,
+    // infer the prop name from the parent's Props interface.
+    //
+    // A "slot prop" is a member of type ReactElement, ReactNode, or
+    // JSX.Element — these accept a component instance as a value.
+    // If the prop name matches the child component name (after stripping
+    // the parent prefix), we can deterministically set mechanism="prop"
+    // and prop_name.
+    {
+        let mut corrections = 0;
+
+        for pkg in &mut report.packages {
+            for comp in &mut pkg.type_summaries {
+                if comp.expected_children.is_empty() {
+                    continue;
+                }
+
+                let parent_name = &comp.name;
+                let prop_types = match component_prop_types.get(parent_name.as_str()) {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                // Log available slot props for debugging
+                let slot_props: Vec<(&String, &String)> = prop_types
+                    .iter()
+                    .filter(|(_, ty)| is_slot_prop_type(ty))
+                    .collect();
+                if !slot_props.is_empty() {
+                    tracing::debug!(
+                        parent = %parent_name,
+                        slot_props = ?slot_props.iter().map(|(n, t)| format!("{}: {}", n, t)).collect::<Vec<_>>(),
+                        "Slot props available for prop_name inference"
+                    );
+                }
+
+                for child in &mut comp.expected_children {
+                    // Skip if prop_name already set
+                    if child.prop_name.is_some() {
+                        continue;
+                    }
+
+                    // Try to match the child name to a slot prop on the parent
+                    if let Some(prop_name) =
+                        infer_prop_name_for_child(parent_name, &child.name, prop_types)
+                    {
+                        tracing::debug!(
+                            parent = %parent_name,
+                            child = %child.name,
+                            prop_name = %prop_name,
+                            old_mechanism = %child.mechanism,
+                            "Inferred prop_name from Props interface"
+                        );
+                        child.mechanism = "prop".to_string();
+                        child.prop_name = Some(prop_name);
+                        corrections += 1;
+                    }
+                }
+            }
+        }
+
+        // Also fix hierarchy deltas
+        for delta in &mut deltas {
+            let parent_name = &delta.component;
+            let prop_types = match component_prop_types.get(parent_name.as_str()) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            for child in &mut delta.added_children {
+                if child.prop_name.is_some() {
+                    continue;
+                }
+                if let Some(prop_name) =
+                    infer_prop_name_for_child(parent_name, &child.name, prop_types)
+                {
+                    child.mechanism = "prop".to_string();
+                    child.prop_name = Some(prop_name);
+                }
+            }
+        }
+
+        if corrections > 0 {
+            tracing::info!(
+                corrections,
+                "Inferred prop_name for expected_children from Props interface types"
             );
         }
     }
@@ -1658,8 +1827,8 @@ mod tests {
     use super::*;
     use crate::TsManifestChangeType;
     use semver_analyzer_core::{
-        ApiSurface, BehavioralChange, BehavioralChangeKind, MemberMapping, Symbol, SymbolKind,
-        Visibility,
+        ApiSurface, BehavioralChange, BehavioralChangeKind, MemberMapping, Signature, Symbol,
+        SymbolKind, Visibility,
     };
     use std::sync::Arc;
 
@@ -2737,6 +2906,483 @@ mod tests {
                 .iter()
                 .any(|m| m.member_name == "className" && m.target_child == "Dropdown"),
             "className should map to Dropdown"
+        );
+    }
+
+    // ─── Slot prop inference tests ─────────────────────────────────
+
+    #[test]
+    fn test_is_slot_prop_type() {
+        assert!(is_slot_prop_type("ReactElement<any>"));
+        assert!(is_slot_prop_type("ReactNode"));
+        assert!(is_slot_prop_type("ReactElement"));
+        assert!(is_slot_prop_type("JSX.Element"));
+        assert!(is_slot_prop_type("ReactNode | undefined"));
+        assert!(is_slot_prop_type("Element | null"));
+        // Non-slot types
+        assert!(!is_slot_prop_type("string"));
+        assert!(!is_slot_prop_type("boolean"));
+        assert!(!is_slot_prop_type("number"));
+        assert!(!is_slot_prop_type("() => void"));
+    }
+
+    #[test]
+    fn test_infer_prop_name_for_child() {
+        let mut prop_types = HashMap::new();
+        prop_types.insert("labelHelp".to_string(), "ReactElement<any>".to_string());
+        prop_types.insert("children".to_string(), "ReactNode".to_string());
+        prop_types.insert("label".to_string(), "string".to_string());
+
+        // FormGroupLabelHelp → strip FormGroup → LabelHelp → labelHelp → found
+        assert_eq!(
+            infer_prop_name_for_child("FormGroup", "FormGroupLabelHelp", &prop_types),
+            Some("labelHelp".to_string())
+        );
+
+        // No prefix match
+        assert_eq!(
+            infer_prop_name_for_child("Modal", "FormGroupLabelHelp", &prop_types),
+            None
+        );
+
+        // Match exists but type is string, not a slot
+        prop_types.insert("labelHelp".to_string(), "string".to_string());
+        assert_eq!(
+            infer_prop_name_for_child("FormGroup", "FormGroupLabelHelp", &prop_types),
+            None
+        );
+    }
+
+    #[test]
+    fn test_infer_prop_name_modal_header() {
+        let mut prop_types = HashMap::new();
+        prop_types.insert("header".to_string(), "ReactNode".to_string());
+        prop_types.insert("footer".to_string(), "ReactNode".to_string());
+        prop_types.insert("title".to_string(), "string".to_string());
+
+        assert_eq!(
+            infer_prop_name_for_child("Modal", "ModalHeader", &prop_types),
+            Some("header".to_string())
+        );
+        assert_eq!(
+            infer_prop_name_for_child("Modal", "ModalFooter", &prop_types),
+            Some("footer".to_string())
+        );
+        // "title" is a string prop, not a slot — shouldn't match
+        assert_eq!(
+            infer_prop_name_for_child("Modal", "ModalTitle", &prop_types),
+            None
+        );
+    }
+
+    #[test]
+    fn test_prop_name_inference_in_enrich() {
+        // Simulate the FormGroup scenario: LLM returned mechanism="prop"
+        // but prop_name is None. After enrichment, it should be "labelHelp".
+        let mut report = make_test_report(
+            vec![ComponentSummary {
+                name: "FormGroup".to_string(),
+                definition_name: "FormGroupProps".to_string(),
+                status: ComponentStatus::Modified,
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![
+                    ExpectedChild {
+                        name: "FormGroupLabelHelp".to_string(),
+                        required: false,
+                        mechanism: "prop".to_string(),
+                        prop_name: None, // Unknown — should be inferred
+                    },
+                    ExpectedChild::new("FormHelperText", false),
+                ],
+                source_files: vec![],
+            }],
+            vec![],
+        );
+
+        // Build a new surface with FormGroupProps that has labelHelp: ReactElement<any>
+        let form_group_props = Symbol {
+            name: "FormGroupProps".to_string(),
+            qualified_name: "react-core/FormGroup.FormGroupProps".to_string(),
+            kind: SymbolKind::Interface,
+            visibility: Visibility::Public,
+            file: PathBuf::from("react-core/FormGroup.d.ts"),
+            package: Some("@patternfly/react-core".to_string()),
+            import_path: None,
+            line: 1,
+            signature: None,
+            extends: None,
+            implements: vec![],
+            is_abstract: false,
+            type_dependencies: vec![],
+            is_readonly: false,
+            is_static: false,
+            accessor_kind: None,
+            members: vec![
+                Symbol {
+                    name: "labelHelp".to_string(),
+                    qualified_name: "react-core/FormGroup.FormGroupProps.labelHelp".to_string(),
+                    kind: SymbolKind::Property,
+                    visibility: Visibility::Public,
+                    file: PathBuf::from("react-core/FormGroup.d.ts"),
+                    package: None,
+                    import_path: None,
+                    line: 2,
+                    signature: Some(Signature {
+                        parameters: vec![],
+                        return_type: Some("ReactElement<any>".to_string()),
+                        type_parameters: vec![],
+                        is_async: false,
+                    }),
+                    extends: None,
+                    implements: vec![],
+                    is_abstract: false,
+                    type_dependencies: vec!["ReactElement".to_string()],
+                    is_readonly: false,
+                    is_static: false,
+                    accessor_kind: None,
+                    members: vec![],
+                    rendered_components: vec![],
+                },
+                Symbol {
+                    name: "children".to_string(),
+                    qualified_name: "react-core/FormGroup.FormGroupProps.children".to_string(),
+                    kind: SymbolKind::Property,
+                    visibility: Visibility::Public,
+                    file: PathBuf::from("react-core/FormGroup.d.ts"),
+                    package: None,
+                    import_path: None,
+                    line: 3,
+                    signature: Some(Signature {
+                        parameters: vec![],
+                        return_type: Some("ReactNode".to_string()),
+                        type_parameters: vec![],
+                        is_async: false,
+                    }),
+                    extends: None,
+                    implements: vec![],
+                    is_abstract: false,
+                    type_dependencies: vec!["ReactNode".to_string()],
+                    is_readonly: false,
+                    is_static: false,
+                    accessor_kind: None,
+                    members: vec![],
+                    rendered_components: vec![],
+                },
+            ],
+            rendered_components: vec![],
+        };
+
+        let new_surface = ApiSurface {
+            symbols: vec![form_group_props],
+        };
+        let new_hierarchies = HashMap::new();
+
+        enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
+
+        // Check that prop_name was inferred
+        let form_group = report.packages[0]
+            .type_summaries
+            .iter()
+            .find(|c| c.name == "FormGroup")
+            .unwrap();
+
+        let label_help = form_group
+            .expected_children
+            .iter()
+            .find(|c| c.name == "FormGroupLabelHelp")
+            .unwrap();
+
+        assert_eq!(
+            label_help.mechanism, "prop",
+            "mechanism should remain 'prop'"
+        );
+        assert_eq!(
+            label_help.prop_name,
+            Some("labelHelp".to_string()),
+            "prop_name should be inferred as 'labelHelp'"
+        );
+
+        // FormHelperText should remain as direct child
+        let helper_text = form_group
+            .expected_children
+            .iter()
+            .find(|c| c.name == "FormHelperText")
+            .unwrap();
+        assert_eq!(helper_text.mechanism, "child");
+        assert_eq!(helper_text.prop_name, None);
+    }
+
+    #[test]
+    fn test_prop_name_inference_flips_child_to_prop() {
+        // LLM said mechanism="child" but the Props interface proves it's
+        // prop-passed (the parent has a slot prop matching the child name).
+        let mut report = make_test_report(
+            vec![ComponentSummary {
+                name: "FormGroup".to_string(),
+                definition_name: "FormGroupProps".to_string(),
+                status: ComponentStatus::Modified,
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![ExpectedChild {
+                    name: "FormGroupLabelHelp".to_string(),
+                    required: false,
+                    mechanism: "child".to_string(), // LLM got this wrong
+                    prop_name: None,
+                }],
+                source_files: vec![],
+            }],
+            vec![],
+        );
+
+        let form_group_props = Symbol {
+            name: "FormGroupProps".to_string(),
+            qualified_name: "react-core/FormGroup.FormGroupProps".to_string(),
+            kind: SymbolKind::Interface,
+            visibility: Visibility::Public,
+            file: PathBuf::from("react-core/FormGroup.d.ts"),
+            package: Some("@patternfly/react-core".to_string()),
+            import_path: None,
+            line: 1,
+            signature: None,
+            extends: None,
+            implements: vec![],
+            is_abstract: false,
+            type_dependencies: vec![],
+            is_readonly: false,
+            is_static: false,
+            accessor_kind: None,
+            members: vec![Symbol {
+                name: "labelHelp".to_string(),
+                qualified_name: "react-core/FormGroup.FormGroupProps.labelHelp".to_string(),
+                kind: SymbolKind::Property,
+                visibility: Visibility::Public,
+                file: PathBuf::from("react-core/FormGroup.d.ts"),
+                package: None,
+                import_path: None,
+                line: 2,
+                signature: Some(Signature {
+                    parameters: vec![],
+                    return_type: Some("ReactElement<any>".to_string()),
+                    type_parameters: vec![],
+                    is_async: false,
+                }),
+                extends: None,
+                implements: vec![],
+                is_abstract: false,
+                type_dependencies: vec![],
+                is_readonly: false,
+                is_static: false,
+                accessor_kind: None,
+                members: vec![],
+                rendered_components: vec![],
+            }],
+            rendered_components: vec![],
+        };
+
+        let new_surface = ApiSurface {
+            symbols: vec![form_group_props],
+        };
+        let new_hierarchies = HashMap::new();
+        enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
+
+        let label_help = report.packages[0].type_summaries[0]
+            .expected_children
+            .iter()
+            .find(|c| c.name == "FormGroupLabelHelp")
+            .unwrap();
+
+        assert_eq!(
+            label_help.mechanism, "prop",
+            "mechanism should be flipped from 'child' to 'prop'"
+        );
+        assert_eq!(
+            label_help.prop_name,
+            Some("labelHelp".to_string()),
+            "prop_name should be inferred"
+        );
+    }
+
+    #[test]
+    fn test_prop_name_inference_on_hierarchy_deltas() {
+        // The inference should also fix hierarchy deltas, not just
+        // expected_children on type_summaries.
+        let mut report = make_test_report(vec![], vec![]);
+
+        let deltas = vec![HierarchyDelta {
+            component: "FormGroup".to_string(),
+            added_children: vec![ExpectedChild {
+                name: "FormGroupLabelHelp".to_string(),
+                required: false,
+                mechanism: "prop".to_string(),
+                prop_name: None,
+            }],
+            removed_children: vec![],
+            migrated_members: vec![],
+            source_package: None,
+            migration_target: None,
+        }];
+
+        let form_group_props = Symbol {
+            name: "FormGroupProps".to_string(),
+            qualified_name: "react-core/FormGroup.FormGroupProps".to_string(),
+            kind: SymbolKind::Interface,
+            visibility: Visibility::Public,
+            file: PathBuf::from("react-core/FormGroup.d.ts"),
+            package: Some("@patternfly/react-core".to_string()),
+            import_path: None,
+            line: 1,
+            signature: None,
+            extends: None,
+            implements: vec![],
+            is_abstract: false,
+            type_dependencies: vec![],
+            is_readonly: false,
+            is_static: false,
+            accessor_kind: None,
+            members: vec![Symbol {
+                name: "labelHelp".to_string(),
+                qualified_name: "react-core/FormGroup.FormGroupProps.labelHelp".to_string(),
+                kind: SymbolKind::Property,
+                visibility: Visibility::Public,
+                file: PathBuf::from("react-core/FormGroup.d.ts"),
+                package: None,
+                import_path: None,
+                line: 2,
+                signature: Some(Signature {
+                    parameters: vec![],
+                    return_type: Some("ReactElement<any>".to_string()),
+                    type_parameters: vec![],
+                    is_async: false,
+                }),
+                extends: None,
+                implements: vec![],
+                is_abstract: false,
+                type_dependencies: vec![],
+                is_readonly: false,
+                is_static: false,
+                accessor_kind: None,
+                members: vec![],
+                rendered_components: vec![],
+            }],
+            rendered_components: vec![],
+        };
+
+        let new_surface = ApiSurface {
+            symbols: vec![form_group_props],
+        };
+        let new_hierarchies = HashMap::new();
+        enrich_hierarchy_deltas(&mut report, deltas, &new_surface, &new_hierarchies);
+
+        let delta = report
+            .hierarchy_deltas
+            .iter()
+            .find(|d| d.component == "FormGroup")
+            .expect("FormGroup delta should exist");
+
+        let child = &delta.added_children[0];
+        assert_eq!(child.mechanism, "prop");
+        assert_eq!(
+            child.prop_name,
+            Some("labelHelp".to_string()),
+            "prop_name should be inferred on hierarchy delta"
+        );
+    }
+
+    #[test]
+    fn test_prop_name_no_false_positive_on_string_props() {
+        // If the prop exists but has type "string" (not a slot type),
+        // it should NOT be inferred as prop_name.
+        let mut report = make_test_report(
+            vec![ComponentSummary {
+                name: "Modal".to_string(),
+                definition_name: "ModalProps".to_string(),
+                status: ComponentStatus::Modified,
+                member_summary: MemberSummary::default(),
+                removed_members: vec![],
+                type_changes: vec![],
+                migration_target: None,
+                behavioral_changes: vec![],
+                child_components: vec![],
+                expected_children: vec![ExpectedChild {
+                    name: "ModalTitle".to_string(),
+                    required: false,
+                    mechanism: "child".to_string(),
+                    prop_name: None,
+                }],
+                source_files: vec![],
+            }],
+            vec![],
+        );
+
+        let modal_props = Symbol {
+            name: "ModalProps".to_string(),
+            qualified_name: "react-core/Modal.ModalProps".to_string(),
+            kind: SymbolKind::Interface,
+            visibility: Visibility::Public,
+            file: PathBuf::from("react-core/Modal.d.ts"),
+            package: Some("@patternfly/react-core".to_string()),
+            import_path: None,
+            line: 1,
+            signature: None,
+            extends: None,
+            implements: vec![],
+            is_abstract: false,
+            type_dependencies: vec![],
+            is_readonly: false,
+            is_static: false,
+            accessor_kind: None,
+            members: vec![Symbol {
+                name: "title".to_string(),
+                qualified_name: "react-core/Modal.ModalProps.title".to_string(),
+                kind: SymbolKind::Property,
+                visibility: Visibility::Public,
+                file: PathBuf::from("react-core/Modal.d.ts"),
+                package: None,
+                import_path: None,
+                line: 2,
+                signature: Some(Signature {
+                    parameters: vec![],
+                    return_type: Some("string".to_string()),
+                    type_parameters: vec![],
+                    is_async: false,
+                }),
+                extends: None,
+                implements: vec![],
+                is_abstract: false,
+                type_dependencies: vec![],
+                is_readonly: false,
+                is_static: false,
+                accessor_kind: None,
+                members: vec![],
+                rendered_components: vec![],
+            }],
+            rendered_components: vec![],
+        };
+
+        let new_surface = ApiSurface {
+            symbols: vec![modal_props],
+        };
+        let new_hierarchies = HashMap::new();
+        enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
+
+        let modal_title = report.packages[0].type_summaries[0].expected_children[0].clone();
+
+        assert_eq!(
+            modal_title.mechanism, "child",
+            "Should NOT flip to 'prop' when prop type is string"
+        );
+        assert_eq!(
+            modal_title.prop_name, None,
+            "Should NOT infer prop_name for non-slot type"
         );
     }
 }
