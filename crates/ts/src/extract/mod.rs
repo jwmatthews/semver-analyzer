@@ -276,14 +276,35 @@ fn remap_dist_to_src(path: &Path) -> PathBuf {
 /// Symbol file paths have already been remapped from `dist/` to `src/`
 /// (e.g., `packages/react-core/src/components/Modal/Modal.d.ts`). We
 /// resolve `.tsx` source by replacing the `.d.ts` extension.
+/// Extract `styles.xxx` CSS token names from component source code.
+///
+/// Finds all `styles.xxx` references (excluding `styles.modifiers`)
+/// and returns the token names (e.g., `["inputGroup", "inputGroupItem"]`).
+fn extract_css_style_tokens(source: &str) -> Vec<String> {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"styles\.([a-zA-Z][a-zA-Z0-9]+)").unwrap());
+
+    let mut tokens: Vec<String> = Vec::new();
+    for cap in RE.captures_iter(source) {
+        let token = &cap[1];
+        if token == "modifiers" {
+            continue;
+        }
+        if !tokens.contains(&token.to_string()) {
+            tokens.push(token.to_string());
+        }
+    }
+    tokens
+}
+
 fn populate_rendered_components(symbols: &mut [Symbol], worktree_dir: &Path) {
     use std::collections::HashMap;
 
-    // Build a cache: source-relative .tsx path -> Vec<rendered component names>.
+    // Build a cache: source-relative .tsx path -> (rendered components, css tokens).
     // Multiple symbols can come from the same file (e.g., a file exports
     // both a component function and a related constant), so we avoid parsing
     // each .tsx file more than once.
-    let mut cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    let mut cache: HashMap<PathBuf, (Vec<String>, Vec<String>)> = HashMap::new();
 
     let mut enriched = 0u32;
 
@@ -307,32 +328,41 @@ fn populate_rendered_components(symbols: &mut [Symbol], worktree_dir: &Path) {
             continue;
         };
 
-        if let Some(rendered) = cache.get(&tsx_relative) {
+        if let Some((rendered, css_tokens)) = cache.get(&tsx_relative) {
             if !rendered.is_empty() {
                 sym.rendered_components = rendered.clone();
                 enriched += 1;
+            }
+            if !css_tokens.is_empty() {
+                sym.css = css_tokens.clone();
             }
             continue;
         }
 
         // Try to read the .tsx file from the worktree.
         let tsx_abs = worktree_dir.join(&tsx_relative);
-        let rendered = match std::fs::read_to_string(&tsx_abs) {
-            Ok(source) => crate::jsx_diff::extract_rendered_components_from_source(&source),
-            Err(_) => Vec::new(),
+        let (rendered, css_tokens) = match std::fs::read_to_string(&tsx_abs) {
+            Ok(source) => (
+                crate::jsx_diff::extract_rendered_components_from_source(&source),
+                extract_css_style_tokens(&source),
+            ),
+            Err(_) => (Vec::new(), Vec::new()),
         };
 
         if !rendered.is_empty() {
             sym.rendered_components = rendered.clone();
             enriched += 1;
         }
-        cache.insert(tsx_relative, rendered);
+        if !css_tokens.is_empty() {
+            sym.css = css_tokens.clone();
+        }
+        cache.insert(tsx_relative, (rendered, css_tokens));
     }
 
     if enriched > 0 {
         tracing::info!(
             enriched_symbols = enriched,
-            tsx_files_parsed = cache.values().filter(|v| !v.is_empty()).count(),
+            tsx_files_parsed = cache.values().filter(|(v, _)| !v.is_empty()).count(),
             "Populated rendered_components from .tsx source files"
         );
     }

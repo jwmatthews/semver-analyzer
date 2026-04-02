@@ -1,0 +1,292 @@
+# PatternFly v5 → v6 react-token mappings (226 mappings)
+# Built from actual npm package exports:
+#   @patternfly/react-tokens@5.4.0 (5582 exports)
+#   @patternfly/react-tokens@6.4.0 (5961 exports)
+# Cross-referenced with @patternfly/pf-codemods upstream data.
+# All target names verified against actual v6 package exports.
+#
+# Source: https://github.com/patternfly/pf-codemods
+#
+# 7 tokens have no v6 equivalent (marked SKIP in upstream pf-codemods).
+# Migration guidance per token:
+#
+#   global_BoxShadow_inset
+#     Removed — v6 uses outset shadows only. Hardcode the CSS value if needed:
+#     box-shadow: inset 0 0 0.625rem 0 rgba(3, 3, 3, 0.25);
+#     Most v6 components use border-based focus indicators instead.
+#
+#   global_arrow_width / global_arrow_width_lg
+#     Removed — arrow geometry is now component-internal (tooltip, popover).
+#     If custom arrows: hardcode 0.9375rem (standard) / 1.5625rem (large).
+#     PF component consumers need no action.
+#
+#   global_font_path / global_fonticon_path
+#     Removed — font loading is now handled by your bundler, not CSS vars.
+#     Configure font path resolution in Webpack/Vite config instead.
+#
+#   global_target_size_MinHeight / global_target_size_MinWidth
+#     Removed — the 44px WCAG 2.5.8 target size is still enforced
+#     per-component but no longer a global token. Hardcode 44px if needed.
+
+rename_patterns: []
+
+token_mappings:
+  # ── Typography (fonts, sizes, weights) (18) ──
+  global_FontFamily_heading: t_global_font_family_heading
+  global_FontFamily_heading_vf: t_global_font_family_heading
+  global_FontFamily_monospace: t_global_font_family_mono
+  global_FontFamily_monospace_vf: t_global_font_family_mono
+  global_FontFamily_text: t_global_font_family_body
+  global_FontFamily_text_vf: t_global_font_family_body
+  global_FontSize_2xl: t_global_font_size_2xl
+  global_FontSize_3xl: t_global_font_size_3xl
+  global_FontSize_4xl: t_global_font_size_4xl
+  global_FontSize_lg: t_global_font_size_lg
+  global_FontSize_md: t_global_font_size_md
+  global_FontSize_sm: t_global_font_size_sm
+  global_FontSize_xl: t_global_font_size_xl
+  global_FontSize_xs: t_global_font_size_xs
+  global_FontWeight_bold: t_global_font_weight_heading_bold
+  global_FontWeight_normal: t_global_font_weight_body_default
+  global_LineHeight_md: t_global_font_line_height_body
+  global_LineHeight_sm: t_global_font_line_height_heading
+
+  # ── Spacers (11) ──
+  global_gutter: t_global_spacer_gutter_default
+  global_gutter_md: t_global_spacer_lg
+  global_spacer_2xl: t_global_spacer_2xl
+  global_spacer_3xl: t_global_spacer_3xl
+  global_spacer_4xl: t_global_spacer_4xl
+  global_spacer_form_element: t_global_spacer_xs
+  global_spacer_lg: t_global_spacer_400
+  global_spacer_md: t_global_spacer_300
+  global_spacer_sm: t_global_spacer_200
+  global_spacer_xl: t_global_spacer_500
+  global_spacer_xs: t_global_spacer_100
+
+  # ── Border radius / width (6) ──
+  global_BorderRadius_lg: t_global_border_radius_large
+  global_BorderRadius_sm: t_global_border_radius_small
+  global_BorderWidth_lg: t_global_border_width_extra_strong
+  global_BorderWidth_md: t_global_border_width_strong
+  global_BorderWidth_sm: t_global_border_width_regular
+  global_BorderWidth_xl: t_global_border_width_extra_strong
+
+  # ── Box shadows (20) ──
+  global_BoxShadow_lg: t_global_box_shadow_lg
+  global_BoxShadow_lg_bottom: t_global_box_shadow_lg_bottom
+  global_BoxShadow_lg_left: t_global_box_shadow_lg_left
+  global_BoxShadow_lg_right: t_global_box_shadow_lg_right
+  global_BoxShadow_lg_top: t_global_box_shadow_lg_top
+  global_BoxShadow_md: t_global_box_shadow_md
+  global_BoxShadow_md_bottom: t_global_box_shadow_md_bottom
+  global_BoxShadow_md_left: t_global_box_shadow_md_left
+  global_BoxShadow_md_right: t_global_box_shadow_md_right
+  global_BoxShadow_md_top: t_global_box_shadow_md_top
+  global_BoxShadow_sm: t_global_box_shadow_sm
+  global_BoxShadow_sm_bottom: t_global_box_shadow_sm_bottom
+  global_BoxShadow_sm_left: t_global_box_shadow_sm_left
+  global_BoxShadow_sm_right: t_global_box_shadow_sm_right
+  global_BoxShadow_sm_top: t_global_box_shadow_sm_top
+  global_BoxShadow_xl: t_global_box_shadow_lg
+  global_BoxShadow_xl_bottom: t_global_box_shadow_lg_bottom
+  global_BoxShadow_xl_left: t_global_box_shadow_lg_left
+  global_BoxShadow_xl_right: t_global_box_shadow_lg_right
+  global_BoxShadow_xl_top: t_global_box_shadow_lg_top
+
+  # ── Z-index (6) ──
+  global_ZIndex_2xl: t_global_z_index_2xl
+  global_ZIndex_lg: t_global_z_index_lg
+  global_ZIndex_md: t_global_z_index_md
+  global_ZIndex_sm: t_global_z_index_sm
+  global_ZIndex_xl: t_global_z_index_xl
+  global_ZIndex_xs: t_global_z_index_xs
+
+  # ── Breakpoints (11) ──
+  global_breakpoint_2xl: t_global_breakpoint_2xl
+  global_breakpoint_lg: t_global_breakpoint_400
+  global_breakpoint_md: t_global_breakpoint_300
+  global_breakpoint_sm: t_global_breakpoint_200
+  global_breakpoint_xl: t_global_breakpoint_500
+  global_breakpoint_xs: t_global_breakpoint_100
+  global_height_breakpoint_2xl: t_global_breakpoint_height_2xl
+  global_height_breakpoint_lg: t_global_breakpoint_height_lg
+  global_height_breakpoint_md: t_global_breakpoint_height_md
+  global_height_breakpoint_sm: t_global_breakpoint_height_sm
+  global_height_breakpoint_xl: t_global_breakpoint_height_xl
+
+  # ── Transitions / timing (3) ──
+  global_TimingFunction: t_global_motion_timing_function_default
+  global_Transition: t_global_duration_300
+  global_TransitionDuration: t_global_duration_300
+
+  # ── Misc (1) ──
+  global_ListStyle: t_global_list_style
+
+  # ── Status colors (12) ──
+  global_custom_color_100: t_global_color_status_custom_default
+  global_custom_color_200: t_global_color_status_custom_200
+  global_custom_color_300: t_global_color_status_custom_300
+  global_danger_color_100: t_global_color_status_danger_default
+  global_danger_color_200: t_global_color_status_danger_200
+  global_danger_color_300: t_global_color_status_danger_300
+  global_info_color_100: t_global_color_status_info_default
+  global_info_color_200: t_global_color_status_info_200
+  global_success_color_100: t_global_color_status_success_default
+  global_success_color_200: t_global_color_status_success_200
+  global_warning_color_100: t_global_color_status_warning_default
+  global_warning_color_200: t_global_color_status_warning_200
+
+  # ── Brand / primary / active colors (9) ──
+  global_active_color_100: t_global_color_brand_default
+  global_active_color_200: t_global_color_brand_100
+  global_active_color_300: t_global_color_brand_default
+  global_active_color_400: t_global_color_brand_100
+  global_primary_color_100: t_global_color_brand_default
+  global_primary_color_200: t_global_color_brand_200
+  global_primary_color_dark_100: t_global_color_brand_default
+  global_primary_color_light_100: t_global_color_brand_100
+  global_secondary_color_100: t_global_text_color_200
+
+  # ── Text colors (9) ──
+  global_Color_100: t_global_text_color_regular
+  global_Color_200: t_global_text_color_subtle
+  global_Color_300: t_global_text_color_300
+  global_Color_400: t_global_text_color_400
+  global_Color_dark_100: t_global_text_color_regular
+  global_Color_dark_200: t_global_text_color_subtle
+  global_Color_light_100: t_global_text_color_inverse
+  global_Color_light_200: t_global_text_color_200
+  global_Color_light_300: t_global_text_color_300
+
+  # ── Link colors / decorations (9) ──
+  global_link_Color: t_global_text_color_link_default
+  global_link_Color_dark: t_global_text_color_link_default
+  global_link_Color_dark_hover: t_global_text_color_link_hover
+  global_link_Color_hover: t_global_text_color_link_hover
+  global_link_Color_light: t_global_text_color_link_100
+  global_link_Color_light_hover: t_global_text_color_link_200
+  global_link_Color_visited: t_global_text_color_link_visited
+  global_link_TextDecoration: t_global_text_decoration_link_line_default
+  global_link_TextDecoration_hover: t_global_text_decoration_link_line_hover
+
+  # ── Background colors (12) ──
+  global_BackgroundColor_100: t_global_background_color_primary_default
+  global_BackgroundColor_150: t_global_background_color_200
+  global_BackgroundColor_200: t_global_background_color_300
+  global_BackgroundColor_dark_100: t_global_background_color_inverse_default
+  global_BackgroundColor_dark_200: t_global_background_color_400
+  global_BackgroundColor_dark_300: t_global_background_color_500
+  global_BackgroundColor_dark_400: t_global_background_color_600
+  global_BackgroundColor_dark_transparent_100: t_global_background_color_backdrop_default
+  global_BackgroundColor_dark_transparent_200: t_global_background_color_backdrop_default
+  global_BackgroundColor_light_100: t_global_background_color_primary_default
+  global_BackgroundColor_light_200: t_global_background_color_200
+  global_BackgroundColor_light_300: t_global_background_color_300
+
+  # ── Border colors (5) ──
+  global_BorderColor_100: t_global_border_color_default
+  global_BorderColor_200: t_global_border_color_200
+  global_BorderColor_300: t_global_border_color_300
+  global_BorderColor_dark_100: t_global_border_color_default
+  global_BorderColor_light_100: t_global_border_color_100
+
+  # ── Disabled colors (3) ──
+  global_disabled_color_100: t_global_text_color_disabled
+  global_disabled_color_200: t_global_color_disabled_200
+  global_disabled_color_300: t_global_color_disabled_300
+
+  # ── Icon colors / sizes (10) ──
+  global_icon_Color_dark: t_global_icon_color_regular
+  global_icon_Color_dark_dark: t_global_icon_color_regular
+  global_icon_Color_dark_light: t_global_icon_color_inverse
+  global_icon_Color_light: t_global_icon_color_subtle
+  global_icon_Color_light_dark: t_global_icon_color_subtle
+  global_icon_Color_light_light: t_global_icon_color_200
+  global_icon_FontSize_lg: t_global_icon_size_font_2xl
+  global_icon_FontSize_md: t_global_icon_size_font_md
+  global_icon_FontSize_sm: t_global_icon_size_font_xs
+  global_icon_FontSize_xl: t_global_icon_size_font_4xl
+
+  # ── Palette colors (best-effort closest v6 color) (81) ──
+  global_palette_black_100: t_color_gray_10  # #fafafa → #f2f2f2
+  global_palette_black_1000: t_color_gray_95  # #030303 → #151515
+  global_palette_black_150: t_color_gray_10  # #f5f5f5 → #f2f2f2
+  global_palette_black_200: t_color_gray_10  # #f0f0f0 → #f2f2f2
+  global_palette_black_300: t_color_gray_30  # #d2d2d2 → #c7c7c7
+  global_palette_black_400: t_color_gray_30  # #b8bbbe → #c7c7c7
+  global_palette_black_500: t_color_gray_40  # #8a8d90 → #a3a3a3
+  global_palette_black_600: t_color_gray_50  # #6a6e73 → #707070
+  global_palette_black_700: t_color_gray_60  # #4f5255 → #4d4d4d
+  global_palette_black_800: t_color_gray_70  # #3c3f42 → #383838
+  global_palette_black_850: t_color_gray_80  # #212427 → #292929
+  global_palette_black_900: t_color_gray_95  # #151515 → #151515
+  global_palette_blue_100: t_color_blue_20  # #bee1f4 → #b9dafc
+  global_palette_blue_200: t_color_blue_30  # #73bcf7 → #92c5f9
+  global_palette_blue_300: t_color_blue_40  # #2b9af3 → #4394e5
+  global_palette_blue_400: t_color_blue_50  # #06c → #0066cc
+  global_palette_blue_50: t_color_blue_10  # #e7f1fa → #e0f0ff
+  global_palette_blue_500: t_color_blue_60  # #004080 → #004d99
+  global_palette_blue_600: t_color_blue_80  # #002952 → #032142
+  global_palette_blue_700: t_color_blue_80  # #001223 → #032142
+  global_palette_cyan_100: t_color_teal_30  # #a2d9d9 → #9ad8d8
+  global_palette_cyan_200: t_color_teal_40  # #73c5c5 → #63bdbd
+  global_palette_cyan_300: t_color_teal_60  # #009596 → #147878
+  global_palette_cyan_400: t_color_teal_70  # #005f60 → #004d4d
+  global_palette_cyan_50: t_color_teal_10  # #f2f9f9 → #daf2f2
+  global_palette_cyan_500: t_color_teal_80  # #003737 → #003333
+  global_palette_cyan_600: t_color_teal_80  # #002323 → #003333
+  global_palette_cyan_700: t_color_teal_80  # #000f0f → #003333
+  global_palette_gold_100: t_color_yellow_10  # #f9e0a2 → #fff4cc
+  global_palette_gold_200: t_color_yellow_20  # #f6d173 → #ffe072
+  global_palette_gold_300: t_color_yellow_30  # #f4c145 → #ffcc17
+  global_palette_gold_400: t_color_yellow_40  # #f0ab00 → #dca614
+  global_palette_gold_50: t_color_yellow_10  # #fdf7e7 → #fff4cc
+  global_palette_gold_500: t_color_yellow_50  # #c58c00 → #b98412
+  global_palette_gold_600: t_color_yellow_70  # #795600 → #73480b
+  global_palette_gold_700: t_color_yellow_80  # #3d2c00 → #54330b
+  global_palette_green_100: t_color_green_20  # #bde5b8 → #d1f1bb
+  global_palette_green_200: t_color_green_30  # #95d58e → #afdc8f
+  global_palette_green_300: t_color_green_40  # #6ec664 → #87bb62
+  global_palette_green_400: t_color_green_50  # #5ba352 → #63993d
+  global_palette_green_50: t_color_green_10  # #f3faf2 → #e9f7df
+  global_palette_green_500: t_color_green_60  # #3e8635 → #3d7317
+  global_palette_green_600: t_color_green_70  # #1e4f18 → #204d00
+  global_palette_green_700: t_color_green_80  # #0f280d → #183301
+  global_palette_light_blue_100: t_color_blue_20  # #beedf9 → #b9dafc
+  global_palette_light_blue_200: t_color_blue_30  # #7cdbf3 → #92c5f9
+  global_palette_light_blue_300: t_color_blue_40  # #35caed → #4394e5
+  global_palette_light_blue_400: t_color_blue_40  # #00b9e4 → #4394e5
+  global_palette_light_blue_500: t_color_blue_50  # #008bad → #0066cc
+  global_palette_light_blue_600: t_color_blue_60  # #005c73 → #004d99
+  global_palette_light_blue_700: t_color_blue_80  # #002d39 → #032142
+  global_palette_light_green_100: t_color_green_20  # #e4f5bc → #d1f1bb
+  global_palette_light_green_200: t_color_green_30  # #c8eb79 → #afdc8f
+  global_palette_light_green_300: t_color_green_40  # #ace12e → #87bb62
+  global_palette_light_green_400: t_color_green_50  # #92d400 → #63993d
+  global_palette_light_green_500: t_color_green_50  # #6ca100 → #63993d
+  global_palette_light_green_600: t_color_green_60  # #486b00 → #3d7317
+  global_palette_light_green_700: t_color_green_80  # #253600 → #183301
+  global_palette_orange_100: t_color_orange_20  # #f4b678 → #fccb8f
+  global_palette_orange_200: t_color_orange_40  # #ef9234 → #f5921b
+  global_palette_orange_300: t_color_orange_40  # #ec7a08 → #f5921b
+  global_palette_orange_400: t_color_orange_50  # #c46100 → #ca6c0f
+  global_palette_orange_50: t_color_orange_10  # #fff6ec → #ffe8cc
+  global_palette_orange_500: t_color_orange_60  # #8f4700 → #9e4a06
+  global_palette_orange_600: t_color_orange_70  # #773d00 → #732e00
+  global_palette_orange_700: t_color_orange_80  # #3b1f00 → #4d1f00
+  global_palette_purple_100: t_color_purple_20  # #cbc1ff → #d0c5f4
+  global_palette_purple_200: t_color_purple_30  # #b2a3ff → #b6a6e9
+  global_palette_purple_300: t_color_purple_30  # #a18fff → #b6a6e9
+  global_palette_purple_400: t_color_purple_40  # #8476d1 → #876fd4
+  global_palette_purple_50: t_color_purple_10  # #f2f0fc → #ece6ff
+  global_palette_purple_500: t_color_purple_50  # #6753ac → #5e40be
+  global_palette_purple_600: t_color_purple_60  # #40199a → #3d2785
+  global_palette_purple_700: t_color_purple_70  # #1f0066 → #21134d
+  global_palette_red_100: t_color_red_orange_60  # #c9190b → #b1380b
+  global_palette_red_200: t_color_red_60  # #a30000 → #a60000
+  global_palette_red_300: t_color_red_orange_70  # #7d1007 → #731f00
+  global_palette_red_400: t_color_red_80  # #470000 → #3f0000
+  global_palette_red_50: t_color_red_10  # #faeae8 → #fce3e3
+  global_palette_red_500: t_color_red_80  # #2c0000 → #3f0000
+  global_palette_white: t_color_white  # #fff → #ffffff

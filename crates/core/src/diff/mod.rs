@@ -446,8 +446,11 @@ pub fn diff_surfaces_with_semantics(
                     from: ChangeSubject::Symbol { kind: rm.old.kind },
                     to: ChangeSubject::Symbol { kind: rm.new.kind },
                 },
-                before: Some(rm.old.name.clone()),
-                after: Some(rm.new.name.clone()),
+                // Use full symbol_summary (includes CSS var name in the
+                // signature) so downstream CSS prefix detection can extract
+                // the actual old/new CSS variable prefixes.
+                before: Some(symbol_summary(rm.old)),
+                after: Some(symbol_summary(rm.new)),
                 description: format!(
                     "Exported {} `{}` was renamed to `{}`",
                     kind_label(rm.old.kind),

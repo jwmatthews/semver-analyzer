@@ -185,6 +185,15 @@ pub struct RenamePatternsFile {
     pub missing_imports: Vec<MissingImportEntry>,
     #[serde(default)]
     pub component_warnings: Vec<ComponentWarningEntry>,
+    /// Explicit token/constant rename mappings (old_name → new_name).
+    ///
+    /// These override the algorithmic rename detection in the diff engine.
+    /// Use this when the automated matching produces wrong pairings, or when
+    /// upstream documentation provides authoritative mappings.
+    ///
+    /// Format: `{ "global_success_color_100": "t_global_color_status_success_100" }`
+    #[serde(default)]
+    pub token_mappings: HashMap<String, String>,
 }
 
 /// Compiled rename patterns ready for matching.
@@ -196,6 +205,9 @@ pub struct RenamePatterns {
     pub value_reviews: Vec<ValueReviewEntry>,
     pub missing_imports: Vec<MissingImportEntry>,
     pub component_warnings: Vec<ComponentWarningEntry>,
+    /// Explicit token/constant rename mappings (old_name → new_name).
+    /// These override algorithmic rename detection.
+    pub token_mappings: HashMap<String, String>,
 }
 
 impl RenamePatterns {
@@ -244,6 +256,9 @@ impl RenamePatterns {
                 "Loaded component warnings"
             );
         }
+        if !file.token_mappings.is_empty() {
+            tracing::info!(count = file.token_mappings.len(), "Loaded token mappings");
+        }
         Ok(Self {
             patterns,
             composition_rules: file.composition_rules,
@@ -251,6 +266,7 @@ impl RenamePatterns {
             value_reviews: file.value_reviews,
             missing_imports: file.missing_imports,
             component_warnings: file.component_warnings,
+            token_mappings: file.token_mappings,
         })
     }
 
@@ -288,7 +304,13 @@ impl RenamePatterns {
             value_reviews: Vec::new(),
             missing_imports: Vec::new(),
             component_warnings: Vec::new(),
+            token_mappings: HashMap::new(),
         }
+    }
+
+    /// Look up a user-provided token mapping (exact match).
+    pub fn get_token_mapping(&self, old_name: &str) -> Option<&str> {
+        self.token_mappings.get(old_name).map(|s| s.as_str())
     }
 }
 
@@ -350,7 +372,25 @@ pub fn build_combined_constant_rule(
     let symbol_names: Vec<&str> = changes.iter().map(|(c, _, _)| c.symbol.as_str()).collect();
     let pattern = build_token_prefix_pattern(&symbol_names);
     let from_pkg = changes[0].1.clone();
-    let strategy = Some(changes[0].2.clone());
+
+    // For Rename strategies, collect per-token mappings from ALL changes
+    // rather than just using the first change's strategy.
+    let strategy = if key.strategy == "Rename" {
+        let mut combined = FixStrategyEntry::new("Rename");
+        for (_, _, strat) in changes {
+            if strat.strategy == "Rename" {
+                combined.mappings.push(MappingEntry {
+                    from: strat.from.clone(),
+                    to: strat.to.clone(),
+                    component: None,
+                    prop: None,
+                });
+            }
+        }
+        Some(combined)
+    } else {
+        Some(changes[0].2.clone())
+    };
 
     let change_type_str = api_change_type_label(&key.change_type);
     let kind_str = api_kind_label(&ApiChangeKind::Constant);
@@ -423,46 +463,8 @@ pub fn build_combined_constant_rule(
 }
 
 /// Suppress redundant individual token removal rules.
-pub fn suppress_redundant_token_rules(
-    rules: Vec<KonveyorRule>,
-    covered_symbols: &BTreeSet<String>,
-) -> Vec<KonveyorRule> {
-    if covered_symbols.is_empty() {
-        return rules;
-    }
-
-    let before_count = rules.len();
-    let rules: Vec<KonveyorRule> = rules
-        .into_iter()
-        .filter(|rule| {
-            let is_removal = rule.labels.iter().any(|l| l == "change-type=removed");
-            let is_constant = rule.labels.iter().any(|l| l == "kind=constant");
-
-            if !is_removal || !is_constant {
-                return true;
-            }
-
-            let is_index = rule.message.lines().any(|l| l.contains("index.d.ts"));
-            if is_index {
-                return true;
-            }
-
-            let symbol = rule.description.split('`').nth(1).unwrap_or("");
-
-            !covered_symbols.contains(symbol)
-        })
-        .collect();
-
-    let suppressed = before_count - rules.len();
-    if suppressed > 0 {
-        tracing::debug!(
-            count = suppressed,
-            "Suppressed redundant token removal rules (covered by parent type_changed)"
-        );
-    }
-
-    rules
-}
+// suppress_redundant_token_rules has been removed — the V2 constantgroup
+// path and consolidation handle deduplication of token rules.
 
 /// Suppress redundant prop-level removal rules when a component-level
 /// `component-import-deprecated` rule already covers the same component.
@@ -606,10 +608,20 @@ pub fn merge_duplicate_conditions(rules: Vec<KonveyorRule>) -> Vec<KonveyorRule>
     // Build a key from the serialized `when` clause. Rules with identical
     // conditions will produce identical keys. Use a HashMap for grouping
     // and a Vec to preserve insertion order.
+    //
+    // Rules with has-codemod=true are never merged — they carry specific
+    // fix strategy data (Rename mappings, etc.) that would be lost if
+    // merged with other rules sharing the same detection condition.
     let mut group_index: HashMap<String, usize> = HashMap::new();
     let mut groups: Vec<Vec<KonveyorRule>> = Vec::new();
     for rule in rules {
-        let key = serde_json::to_string(&rule.when).unwrap_or_default();
+        let has_codemod = rule.labels.iter().any(|l| l == "has-codemod=true");
+        let key = if has_codemod {
+            // Unique key — ensures this rule is always a singleton group
+            rule.rule_id.clone()
+        } else {
+            serde_json::to_string(&rule.when).unwrap_or_default()
+        };
         if let Some(&idx) = group_index.get(&key) {
             groups[idx].push(rule);
         } else {
@@ -732,6 +744,26 @@ pub fn consolidation_key(rule: &KonveyorRule) -> String {
         return format!("{}-constant-type-changed", package);
     }
 
+    // Renamed constants with codemod data: keep as singleton.
+    // These rules carry per-token Rename mappings in their fix_strategy
+    // that would be lost if merged with other rules.
+    if change_type == "renamed" && kind == "constant" {
+        let has_codemod = rule.labels.iter().any(|l| l == "has-codemod=true");
+        if has_codemod {
+            return rule.rule_id.clone();
+        }
+        // Non-codemod renamed constants: group by package
+        let symbol = rule.description.split('`').nth(1).unwrap_or("");
+        let is_component_constant = symbol
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase());
+        if !is_component_constant {
+            let package = extract_package_from_path(file_key);
+            return format!("{}-constant-renamed-has-codemod=false", package);
+        }
+    }
+
     match change_type {
         "css-variable"
         | "new-sibling-component"
@@ -745,7 +777,17 @@ pub fn consolidation_key(rule: &KonveyorRule) -> String {
         _ => {}
     }
 
-    format!("{}-{}-{}", file_key, kind, change_type)
+    // Include has-codemod in the key so rules with different codemod
+    // flags don't merge. The fix engine can't partially handle a group
+    // where some entries need LLM and others need codemod.
+    let codemod = rule
+        .labels
+        .iter()
+        .find(|l| l.starts_with("has-codemod="))
+        .map(|l| l.as_str())
+        .unwrap_or("has-codemod=false");
+
+    format!("{}-{}-{}-{}", file_key, kind, change_type, codemod)
 }
 
 /// Read package.json at a specific git ref using `git show`.
@@ -826,10 +868,22 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
     let first_category = group[0].category.clone();
     let effort = group.iter().map(|r| r.effort).max().unwrap_or(1);
     let mut all_labels: BTreeSet<String> = BTreeSet::new();
+    // Track has-codemod conservatively: if ANY entry is has-codemod=false,
+    // the entire group should be has-codemod=false because the fix engine
+    // can't partially handle a grouped rule.
+    let mut any_no_codemod = false;
     for rule in &group {
         for label in &rule.labels {
+            if label == "has-codemod=false" {
+                any_no_codemod = true;
+            }
             all_labels.insert(label.clone());
         }
+    }
+    // Resolve conflicting has-codemod labels
+    if any_no_codemod {
+        all_labels.remove("has-codemod=true");
+        all_labels.insert("has-codemod=false".to_string());
     }
     let labels: Vec<String> = all_labels.into_iter().collect();
     let descriptions: Vec<&str> = group.iter().map(|r| r.description.as_str()).collect();
@@ -938,7 +992,21 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
             }
             let matching: Vec<&FixStrategyEntry> =
                 strats.iter().filter(|s| s.strategy == best).collect();
-            let mappings: Vec<MappingEntry> = matching.iter().map(|s| s.to_mapping()).collect();
+            // Preserve nested mappings: if a sub-strategy already has a
+            // `mappings` array (e.g., constantgroup rules with per-token
+            // Rename entries), flatten those into the merged rule instead
+            // of discarding them via to_mapping() (which only reads
+            // top-level from/to).
+            let mappings: Vec<MappingEntry> = matching
+                .iter()
+                .flat_map(|s| {
+                    if s.mappings.is_empty() {
+                        vec![s.to_mapping()]
+                    } else {
+                        s.mappings.clone()
+                    }
+                })
+                .collect();
             let primary = matching
                 .iter()
                 .find(|s| !s.member_mappings.is_empty())
@@ -1073,15 +1141,45 @@ pub fn api_change_to_strategy(
             let before = change.before.as_deref().unwrap_or("");
             let after = change.after.as_deref().unwrap_or("");
 
+            // Structured value rename: "Component.prop = value"
+            // Extract just the value part for the Rename strategy.
+            if let (Some((_, _, old_val)), Some((_, _, new_val))) = (
+                parse_value_rename_field(before),
+                parse_value_rename_field(after),
+            ) {
+                return Some(FixStrategyEntry::rename(old_val, new_val));
+            }
+
+            // Constants / design tokens: generate Rename directly from the symbol
+            // name and the new name extracted from the after summary.
+            // The before/after fields are symbol_summary strings (e.g.,
+            // "variable: global_success_color_100: { ... }") which must NOT be
+            // treated as import paths or fed raw into Rename strategies.
+            //
+            // User-provided token_mappings override the algorithmic pairing.
+            if matches!(change.kind, ApiChangeKind::Constant) {
+                let new_name =
+                    if let Some(user_mapping) = rename_patterns.get_token_mapping(&change.symbol) {
+                        user_mapping
+                    } else {
+                        extract_name_from_summary(after)
+                    };
+                return Some(FixStrategyEntry::rename(&change.symbol, new_name));
+            }
+
             // Handle import path relocations where before/after are direct import
             // specifiers (e.g., "@patternfly/react-charts" → "@patternfly/react-charts/victory").
             // These come from Relocated changes detected by the diff engine when a symbol's
             // import_path changed between versions.
+            // Guard: symbol_summary strings contain ": " (e.g., "variable: foo")
+            // and must not be treated as import paths.
             if !before.is_empty()
                 && !after.is_empty()
                 && before != after
                 && !before.contains("packages/")
                 && !after.contains("packages/")
+                && looks_like_import_path(before)
+                && looks_like_import_path(after)
             {
                 let mut e = FixStrategyEntry::new("ImportPathChange");
                 e.from = Some(before.to_string());
@@ -1156,6 +1254,15 @@ pub fn api_change_to_strategy(
                 if let Some(RemovalDisposition::ReplacedByMember { ref new_member }) =
                     change.removal_disposition
                 {
+                    // Enum value replacement: before is a quoted value like 'light'.
+                    // Rename the VALUE, not the prop name.
+                    if let Some(ref before) = change.before {
+                        if is_single_quoted_value(before) {
+                            let old_val = &before[1..before.len() - 1];
+                            return Some(FixStrategyEntry::rename(old_val, new_member));
+                        }
+                    }
+                    // Prop rename: before is not a quoted value.
                     let old_name = change
                         .symbol
                         .rsplit_once('.')
@@ -1169,6 +1276,14 @@ pub fn api_change_to_strategy(
                 e.component = component;
                 e.prop = prop.or_else(|| Some(change.symbol.clone()));
                 Some(e)
+            } else if matches!(change.kind, ApiChangeKind::Constant)
+                && rename_patterns.get_token_mapping(&change.symbol).is_some()
+            {
+                // User-provided token_mappings override for removed constants
+                // that actually have a v6 replacement (e.g., global_Color_dark_100
+                // → t_global_text_color_regular).
+                let new_name = rename_patterns.get_token_mapping(&change.symbol).unwrap();
+                Some(FixStrategyEntry::rename(&change.symbol, new_name))
             } else if let Some(new_name) = member_renames.get(&change.symbol) {
                 Some(FixStrategyEntry::rename(&change.symbol, new_name))
             } else if let Some(replacement) = rename_patterns.find_replacement(&change.symbol) {
@@ -1311,11 +1426,74 @@ pub fn build_pattern(
 }
 
 /// Build a `frontend.referenced` condition for an API change.
+/// Parse a structured value rename `before`/`after` field.
+///
+/// Format: `"Component.propName = value"`
+/// Returns `(component, prop_name, value)`.
+fn parse_value_rename_field(s: &str) -> Option<(&str, &str, &str)> {
+    let (component_prop, value) = s.split_once(" = ")?;
+    let (component, prop) = component_prop.rsplit_once('.')?;
+    if component.is_empty() || prop.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some((component, prop, value))
+}
+
 pub fn build_frontend_condition(
     change: &ApiChange,
     leaf_symbol: &str,
     from_pkg: Option<&str>,
 ) -> KonveyorCondition {
+    // Detect structured value rename entries (before: "Component.prop = value")
+    // and build a condition matching the prop name with a value filter.
+    if let Some(before) = change.before.as_deref() {
+        if let Some((component, prop_name, value)) = parse_value_rename_field(before) {
+            let from = from_pkg.map(|s| s.to_string());
+            // Match both old and new prop name so the rule fires whether
+            // the prop has been renamed already or not.
+            let new_prop = change
+                .after
+                .as_deref()
+                .and_then(parse_value_rename_field)
+                .map(|(_, p, _)| p);
+
+            let mut conditions = vec![KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: format!("^{}$", regex_escape(prop_name)),
+                    location: "JSX_PROP".to_string(),
+                    component: Some(format!("^{}$", regex_escape(component))),
+                    parent: None,
+                    value: Some(format!("^{}$", regex_escape(value))),
+                    from: from.clone(),
+                    parent_from: None,
+                },
+            }];
+
+            // Also match the new prop name if it differs
+            if let Some(new_p) = new_prop {
+                if new_p != prop_name {
+                    conditions.push(KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern: format!("^{}$", regex_escape(new_p)),
+                            location: "JSX_PROP".to_string(),
+                            component: Some(format!("^{}$", regex_escape(component))),
+                            parent: None,
+                            value: Some(format!("^{}$", regex_escape(value))),
+                            from: from.clone(),
+                            parent_from: None,
+                        },
+                    });
+                }
+            }
+
+            return if conditions.len() == 1 {
+                conditions.into_iter().next().unwrap()
+            } else {
+                KonveyorCondition::Or { or: conditions }
+            };
+        }
+    }
+
     let match_name = if change.change == ApiChangeType::Renamed {
         change
             .before
@@ -1774,6 +1952,28 @@ pub fn api_kind_label(kind: &ApiChangeKind) -> &'static str {
 /// Extract the leaf symbol name from a potentially dotted path.
 pub fn extract_leaf_symbol(symbol: &str) -> &str {
     symbol.rsplit('.').next().unwrap_or(symbol)
+}
+
+/// Extract the symbol name from a `symbol_summary` string.
+///
+/// `symbol_summary` format: `"{kind}: {name}"` or `"{kind}: {name}: {type}"`.
+/// Returns just the `{name}` portion.  Falls back to the full string if the
+/// format is not recognised.
+pub fn extract_name_from_summary(summary: &str) -> &str {
+    // Split on ": " to strip the kind prefix ("variable", "constant", etc.)
+    if let Some(rest) = summary.split_once(": ").map(|(_, r)| r) {
+        // If a type annotation follows (another ": "), take only the name part
+        rest.split_once(": ").map(|(name, _)| name).unwrap_or(rest)
+    } else {
+        summary
+    }
+}
+
+/// Returns `true` if `s` looks like an npm import path rather than a
+/// `symbol_summary` string.  Import paths start with `@` or are simple
+/// identifiers (no `": "` separator that symbol summaries always contain).
+fn looks_like_import_path(s: &str) -> bool {
+    s.starts_with('@') || !s.contains(": ")
 }
 
 /// Extract the trailing PascalCase suffix from a snake_case token constant name.
@@ -2287,5 +2487,226 @@ mod tests {
         assert!(result[0]
             .labels
             .contains(&"change-type=type-changed".to_string()));
+    }
+
+    // ── extract_name_from_summary tests ──────────────────────────────
+
+    #[test]
+    fn test_extract_name_from_summary_with_type() {
+        let summary = r##"constant: global_success_color_100: { ["name"]: "--pf-v5-global--success-color--100"; ["value"]: "#3e8635" }"##;
+        assert_eq!(
+            extract_name_from_summary(summary),
+            "global_success_color_100"
+        );
+    }
+
+    #[test]
+    fn test_extract_name_from_summary_without_type() {
+        assert_eq!(
+            extract_name_from_summary("variable: t_global_color_status_success_100"),
+            "t_global_color_status_success_100"
+        );
+    }
+
+    #[test]
+    fn test_extract_name_from_summary_plain_name() {
+        // No kind prefix — returns as-is
+        assert_eq!(
+            extract_name_from_summary("global_success_color_100"),
+            "global_success_color_100"
+        );
+    }
+
+    // ── looks_like_import_path tests ─────────────────────────────────
+
+    #[test]
+    fn test_looks_like_import_path_scoped_package() {
+        assert!(looks_like_import_path("@patternfly/react-core"));
+        assert!(looks_like_import_path("@patternfly/react-charts/victory"));
+    }
+
+    #[test]
+    fn test_looks_like_import_path_simple_package() {
+        assert!(looks_like_import_path("react"));
+        assert!(looks_like_import_path("lodash/merge"));
+    }
+
+    #[test]
+    fn test_looks_like_import_path_rejects_symbol_summary() {
+        assert!(!looks_like_import_path(
+            "variable: global_success_color_100"
+        ));
+        assert!(!looks_like_import_path(
+            r##"constant: foo: { ["name"]: "bar" }"##
+        ));
+    }
+
+    // ── api_change_to_strategy for token renames ─────────────────────
+
+    #[test]
+    fn test_token_rename_generates_rename_strategy() {
+        let change = ApiChange {
+            symbol: "global_success_color_100".into(),
+            kind: ApiChangeKind::Constant,
+            change: ApiChangeType::Renamed,
+            before: Some(
+                r##"constant: global_success_color_100: { ["name"]: "--pf-v5-global--success-color--100"; ["value"]: "#3e8635"; ["var"]: "var(--pf-v5-global--success-color--100)" }"##
+                    .into(),
+            ),
+            after: Some("variable: t_global_color_status_success_100".into()),
+            description: "Exported constant `global_success_color_100` was renamed to `t_global_color_status_success_100`".into(),
+            migration_target: None,
+            removal_disposition: None,
+            renders_element: None,
+        };
+        let patterns = RenamePatterns::empty();
+        let member_renames = HashMap::new();
+        let strategy =
+            api_change_to_strategy(&change, &patterns, &member_renames, "some/file.d.ts");
+        let s = strategy.expect("should produce a strategy");
+        assert_eq!(s.strategy, "Rename");
+        assert_eq!(s.from.as_deref(), Some("global_success_color_100"));
+        assert_eq!(s.to.as_deref(), Some("t_global_color_status_success_100"));
+    }
+
+    #[test]
+    fn test_token_rename_no_type_annotation() {
+        // Some token renames have no type in the after field
+        let change = ApiChange {
+            symbol: "global_warning_color_100".into(),
+            kind: ApiChangeKind::Constant,
+            change: ApiChangeType::Renamed,
+            before: Some("variable: global_warning_color_100".into()),
+            after: Some("variable: t_chart_global_warning_color_100".into()),
+            description: "renamed".into(),
+            migration_target: None,
+            removal_disposition: None,
+            renders_element: None,
+        };
+        let patterns = RenamePatterns::empty();
+        let member_renames = HashMap::new();
+        let strategy =
+            api_change_to_strategy(&change, &patterns, &member_renames, "some/file.d.ts");
+        let s = strategy.expect("should produce a strategy");
+        assert_eq!(s.strategy, "Rename");
+        assert_eq!(s.from.as_deref(), Some("global_warning_color_100"));
+        assert_eq!(s.to.as_deref(), Some("t_chart_global_warning_color_100"));
+    }
+
+    // ── token_mappings override tests ────────────────────────────────
+
+    #[test]
+    fn test_token_mapping_overrides_algorithmic_rename() {
+        // The algorithm would produce t_global_color_status_danger_100 from the
+        // after field, but the user-provided token_mapping should win.
+        let change = ApiChange {
+            symbol: "global_danger_color_100".into(),
+            kind: ApiChangeKind::Constant,
+            change: ApiChangeType::Renamed,
+            before: Some("constant: global_danger_color_100".into()),
+            after: Some("variable: t_global_color_status_danger_100".into()),
+            description: "renamed".into(),
+            migration_target: None,
+            removal_disposition: None,
+            renders_element: None,
+        };
+
+        let mut patterns = RenamePatterns::empty();
+        patterns.token_mappings.insert(
+            "global_danger_color_100".into(),
+            "chart_global_danger_Color_100".into(),
+        );
+        let member_renames = HashMap::new();
+        let strategy =
+            api_change_to_strategy(&change, &patterns, &member_renames, "some/file.d.ts");
+        let s = strategy.expect("should produce a strategy");
+        assert_eq!(s.strategy, "Rename");
+        assert_eq!(s.from.as_deref(), Some("global_danger_color_100"));
+        // User mapping wins over algorithmic extract_name_from_summary
+        assert_eq!(s.to.as_deref(), Some("chart_global_danger_Color_100"));
+    }
+
+    #[test]
+    fn test_token_mapping_not_present_falls_through_to_algorithm() {
+        // When no user mapping exists, the algorithm's result is used
+        let change = ApiChange {
+            symbol: "global_spacer_sm".into(),
+            kind: ApiChangeKind::Constant,
+            change: ApiChangeType::Renamed,
+            before: Some("constant: global_spacer_sm".into()),
+            after: Some("variable: t_global_spacer_sm".into()),
+            description: "renamed".into(),
+            migration_target: None,
+            removal_disposition: None,
+            renders_element: None,
+        };
+
+        // Patterns with some mappings, but not for this symbol
+        let mut patterns = RenamePatterns::empty();
+        patterns.token_mappings.insert(
+            "global_danger_color_100".into(),
+            "chart_global_danger_Color_100".into(),
+        );
+        let member_renames = HashMap::new();
+        let strategy =
+            api_change_to_strategy(&change, &patterns, &member_renames, "some/file.d.ts");
+        let s = strategy.expect("should produce a strategy");
+        assert_eq!(s.strategy, "Rename");
+        assert_eq!(s.from.as_deref(), Some("global_spacer_sm"));
+        // Falls through to extract_name_from_summary
+        assert_eq!(s.to.as_deref(), Some("t_global_spacer_sm"));
+    }
+
+    #[test]
+    fn test_token_mapping_yaml_deserialization() {
+        let yaml = r#"
+rename_patterns: []
+token_mappings:
+  global_success_color_100: t_global_color_status_success_100
+  global_danger_color_100: chart_global_danger_Color_100
+  global_Color_dark_100: t_global_icon_color_regular
+"#;
+        let file: RenamePatternsFile = serde_yaml::from_str(yaml).expect("should parse YAML");
+        assert_eq!(file.token_mappings.len(), 3);
+        assert_eq!(
+            file.token_mappings.get("global_success_color_100").unwrap(),
+            "t_global_color_status_success_100"
+        );
+        assert_eq!(
+            file.token_mappings.get("global_danger_color_100").unwrap(),
+            "chart_global_danger_Color_100"
+        );
+        assert_eq!(
+            file.token_mappings.get("global_Color_dark_100").unwrap(),
+            "t_global_icon_color_regular"
+        );
+    }
+
+    #[test]
+    fn test_token_mapping_empty_when_not_in_yaml() {
+        // Existing YAML without token_mappings should still work
+        let yaml = r#"
+rename_patterns:
+  - match: "^foo$"
+    replace: "bar"
+"#;
+        let file: RenamePatternsFile = serde_yaml::from_str(yaml).expect("should parse YAML");
+        assert!(file.token_mappings.is_empty());
+        assert_eq!(file.rename_patterns.len(), 1);
+    }
+
+    #[test]
+    fn test_get_token_mapping() {
+        let mut patterns = RenamePatterns::empty();
+        patterns.token_mappings.insert(
+            "global_Color_dark_100".into(),
+            "t_global_icon_color_regular".into(),
+        );
+
+        assert_eq!(
+            patterns.get_token_mapping("global_Color_dark_100"),
+            Some("t_global_icon_color_regular")
+        );
+        assert_eq!(patterns.get_token_mapping("nonexistent_token"), None);
     }
 }

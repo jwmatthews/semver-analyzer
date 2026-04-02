@@ -129,6 +129,11 @@ pub struct Symbol {
     /// React components with JSX render functions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rendered_components: Vec<String>,
+
+    /// CSS class tokens used by this component (e.g., `["inputGroup", "inputGroupItem"]`).
+    /// Extracted from `styles.xxx` references in component source files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub css: Vec<String>,
 }
 
 impl Symbol {
@@ -160,6 +165,7 @@ impl Symbol {
             accessor_kind: None,
             members: Vec::new(),
             rendered_components: Vec::new(),
+            css: Vec::new(),
         }
     }
 }

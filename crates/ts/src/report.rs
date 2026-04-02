@@ -197,6 +197,85 @@ fn build_report_inner(
         }
     }
 
+    // ── Reclassify ReplacedByMember with incompatible types ──────
+    //
+    // When a removed prop has ReplacedByMember disposition, check whether the
+    // old and new types are structurally compatible. If the types are
+    // fundamentally different (e.g., a named interface → an array), the change
+    // is a signature restructure, not a simple rename. Reclassify these from
+    // Removed → SignatureChanged so downstream generates LLM-assisted rules
+    // instead of a mechanical Rename codemod.
+    //
+    // Example: splitButtonOptions: SplitButtonOptions → splitButtonItems: ReactNode[]
+    // The codemod rename produces splitButtonItems={{ items: [...] }} which is wrong.
+    {
+        // First, build a lookup of replacement member types
+        let mut new_member_types: HashMap<String, String> = HashMap::new();
+        for changes in file_api_map.values() {
+            for change in changes {
+                if matches!(
+                    change.change,
+                    ApiChangeType::SignatureChanged | ApiChangeType::TypeChanged
+                ) {
+                    if let Some(ref after) = change.after {
+                        new_member_types.insert(change.symbol.clone(), after.clone());
+                    }
+                }
+            }
+        }
+
+        let mut reclassified = 0usize;
+        for changes in file_api_map.values_mut() {
+            for change in changes.iter_mut() {
+                if change.change != ApiChangeType::Removed {
+                    continue;
+                }
+                let new_member = match &change.removal_disposition {
+                    Some(RemovalDisposition::ReplacedByMember { new_member }) => new_member.clone(),
+                    _ => continue,
+                };
+
+                // Look up the replacement member's type
+                let parent = change.symbol.rsplit_once('.').map(|(p, _)| p);
+                let replacement_sym = parent
+                    .map(|p| format!("{}.{}", p, new_member))
+                    .unwrap_or_else(|| new_member.clone());
+
+                let new_type_sig = match new_member_types.get(&replacement_sym) {
+                    Some(sig) => sig.clone(),
+                    None => continue,
+                };
+
+                let old_type = extract_type_from_signature(change.before.as_deref().unwrap_or(""));
+                let new_type = extract_type_from_signature(&new_type_sig);
+
+                if let (Some(old_t), Some(new_t)) = (old_type, new_type) {
+                    if !types_structurally_compatible(old_t, new_t) {
+                        tracing::info!(
+                            symbol = %change.symbol,
+                            old_type = old_t,
+                            new_type = new_t,
+                            new_member = %new_member,
+                            "Reclassifying ReplacedByMember as SignatureChanged \
+                             (incompatible types)"
+                        );
+                        change.change = ApiChangeType::SignatureChanged;
+                        change.after = Some(new_type_sig.clone());
+                        change.removal_disposition = None;
+                        reclassified += 1;
+                    }
+                }
+            }
+        }
+        if reclassified > 0 {
+            tracing::info!(
+                count = reclassified,
+                "Reclassified ReplacedByMember props with incompatible types \
+                 as SignatureChanged"
+            );
+        }
+    }
+
     // ── Value rename detection for ReplacedByMember props ──────
     //
     // When a prop like `spaceItems` is removed and replaced by `gap`, the
@@ -262,14 +341,24 @@ fn build_report_inner(
                             new_values.iter().find(|v| v.to_lowercase() == candidate)
                         {
                             if old_val != new_val {
+                                let parent_component = parent.unwrap_or("");
                                 value_renames.push((
                                     file.clone(),
                                     ApiChange {
-                                        symbol: format!("{} (value)", old_val),
+                                        symbol: format!(
+                                            "{}.{} (value:{})",
+                                            parent_component, old_prop, old_val
+                                        ),
                                         kind: ApiChangeKind::Property,
                                         change: ApiChangeType::Renamed,
-                                        before: Some(old_val.clone()),
-                                        after: Some(new_val.clone()),
+                                        before: Some(format!(
+                                            "{}.{} = {}",
+                                            parent_component, old_prop, old_val
+                                        )),
+                                        after: Some(format!(
+                                            "{}.{} = {}",
+                                            parent_component, new_member, new_val
+                                        )),
                                         description: format!(
                                             "Prop value '{}' renamed to '{}' (prop '{}' → '{}')",
                                             old_val, new_val, old_prop, new_member
@@ -1679,6 +1768,102 @@ fn enrich_hierarchy_deltas(
     // Store deltas on the report
     report.hierarchy_deltas = deltas;
 
+    // ── BEM CSS fallback for expected_children ─────────────────────
+    //
+    // For components that still have empty expected_children after all
+    // other signals, use BEM CSS class analysis as a fallback.
+    //
+    // If component A uses `styles.fooBar` (BEM block) and component B
+    // uses `styles.fooBarItem` (BEM element = block + PascalCase suffix),
+    // B is structurally a child of A in the CSS layout.
+    //
+    // This catches cases like InputGroup/InputGroupItem where the types
+    // don't express the parent/child requirement but the CSS does.
+    {
+        // Build a map of css token → component name from all symbols
+        let mut token_to_component: HashMap<String, String> = HashMap::new();
+        for sym in &new_surface.symbols {
+            if sym.css.is_empty() {
+                continue;
+            }
+            // Use the first non-modifier token as the component's primary CSS token
+            for token in &sym.css {
+                token_to_component
+                    .entry(token.clone())
+                    .or_insert_with(|| sym.name.clone());
+            }
+        }
+
+        // For each component with empty expected_children, check if other
+        // components use BEM element tokens derived from this component's
+        // block token.
+        let mut bem_additions = 0usize;
+        for pkg in &mut report.packages {
+            for comp in &mut pkg.type_summaries {
+                if !comp.expected_children.is_empty() {
+                    continue;
+                }
+
+                // Find this component's primary CSS block token from the surface
+                let comp_sym = new_surface
+                    .symbols
+                    .iter()
+                    .find(|s| s.name == comp.name && !s.css.is_empty());
+                let block_token = match comp_sym {
+                    Some(sym) => {
+                        // The block token is the one that matches just the block
+                        // (no BEM element suffix). For InputGroup, that's "inputGroup".
+                        sym.css.first().cloned()
+                    }
+                    None => continue,
+                };
+                let block_token = match block_token {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                // Find other components whose CSS tokens start with this block
+                // token followed by an uppercase letter (BEM element convention).
+                // e.g., block="inputGroup" matches "inputGroupItem", "inputGroupText"
+                let mut children: Vec<ExpectedChild> = Vec::new();
+                for (token, child_name) in &token_to_component {
+                    if token == &block_token {
+                        continue; // same component
+                    }
+                    if child_name == &comp.name {
+                        continue; // same component, different token
+                    }
+                    if token.starts_with(&block_token)
+                        && token[block_token.len()..].starts_with(|c: char| c.is_ascii_uppercase())
+                    {
+                        // This is a BEM element of our block
+                        if !children.iter().any(|c| c.name == *child_name) {
+                            children.push(ExpectedChild::new(child_name, true));
+                        }
+                    }
+                }
+
+                if !children.is_empty() {
+                    tracing::debug!(
+                        parent = %comp.name,
+                        children = ?children.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                        block_token = %block_token,
+                        "BEM CSS fallback: inferred expected_children"
+                    );
+                    comp.expected_children = children;
+                    bem_additions += 1;
+                }
+            }
+        }
+
+        if bem_additions > 0 {
+            tracing::info!(
+                count = bem_additions,
+                "Inferred expected_children from BEM CSS class analysis"
+            );
+        }
+    }
+
     let total_migrated: usize = report
         .hierarchy_deltas
         .iter()
@@ -1820,6 +2005,59 @@ fn collect_added_files(repo: &Path, from_ref: &str, to_ref: &str) -> Vec<PathBuf
             Vec::new()
         }
     }
+}
+
+/// Extract the type portion from a property signature string.
+///
+/// Given `"property: splitButtonOptions: SplitButtonOptions"`, returns
+/// `Some("SplitButtonOptions")`.
+///
+/// Given `"property: gap: { default?: 'gapMd' | ... }"`, returns
+/// `Some("{ default?: 'gapMd' | ... }")`.
+fn extract_type_from_signature(sig: &str) -> Option<&str> {
+    // Format: "<kind>: <name>: <type>"
+    // Find past the first ": " (skips the kind prefix like "property"),
+    // then past the second ": " (skips the prop name).
+    let after_kind = sig.split_once(": ")?.1;
+    let type_part = after_kind.split_once(": ")?.1;
+    let trimmed = type_part.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Check whether two type strings are structurally compatible for a rename.
+///
+/// Returns `true` if the types have the same structure (both responsive
+/// breakpoint objects, both string unions, etc.) — meaning a prop rename
+/// codemod is valid. Returns `false` if the types are fundamentally
+/// different (e.g., a named interface vs. an array) — meaning the change
+/// requires LLM-assisted migration.
+fn types_structurally_compatible(old_type: &str, new_type: &str) -> bool {
+    // Both are responsive breakpoint objects: { default?: ...; md?: ...; }
+    let old_is_object = old_type.starts_with('{');
+    let new_is_object = new_type.starts_with('{');
+    if old_is_object && new_is_object {
+        return true;
+    }
+
+    // Both are string literal unions: 'foo' | 'bar'
+    let old_is_union = old_type.contains('|') && old_type.contains('\'');
+    let new_is_union = new_type.contains('|') && new_type.contains('\'');
+    if old_is_union && new_is_union {
+        return true;
+    }
+
+    // Identical types (e.g., both `boolean`, both `string`)
+    if old_type == new_type {
+        return true;
+    }
+
+    // Otherwise, structurally incompatible
+    // (e.g., named interface "SplitButtonOptions" vs array "ReactNode[]")
+    false
 }
 
 /// Convert an internal StructuralChange to a v2-format ApiChange.
@@ -2102,8 +2340,10 @@ mod tests {
                     accessor_kind: None,
                     members: vec![],
                     rendered_components: vec![],
+                    css: vec![],
                 }],
                 rendered_components: vec![],
+                css: vec![],
             }],
         };
 
@@ -2192,8 +2432,10 @@ mod tests {
                     accessor_kind: None,
                     members: vec![],
                     rendered_components: vec![],
+                    css: vec![],
                 }],
                 rendered_components: vec![],
+                css: vec![],
             }
         }
 
@@ -2289,6 +2531,7 @@ mod tests {
                 accessor_kind: None,
                 members: vec![],
                 rendered_components: vec![],
+                css: vec![],
             }
         }
 
@@ -2350,6 +2593,7 @@ mod tests {
                 accessor_kind: None,
                 members: vec![],
                 rendered_components: vec![],
+                css: vec![],
             }
         }
 
@@ -2407,6 +2651,7 @@ mod tests {
                 accessor_kind: None,
                 members: vec![],
                 rendered_components: vec![],
+                css: vec![],
             }
         }
 
@@ -2496,6 +2741,7 @@ mod tests {
                 accessor_kind: None,
                 members: vec![],
                 rendered_components: vec![],
+                css: vec![],
             }
         }
 
@@ -2697,8 +2943,10 @@ mod tests {
                     accessor_kind: None,
                     members: vec![],
                     rendered_components: vec![],
+                    css: vec![],
                 }],
                 rendered_components: vec![],
+                css: vec![],
             }],
         };
 
@@ -2723,6 +2971,7 @@ mod tests {
                 accessor_kind: None,
                 members: vec![],
                 rendered_components: vec![],
+                css: vec![],
             }],
         };
 
@@ -3161,6 +3410,7 @@ mod tests {
                     accessor_kind: None,
                     members: vec![],
                     rendered_components: vec![],
+                    css: vec![],
                 },
                 Symbol {
                     name: "children".to_string(),
@@ -3186,9 +3436,11 @@ mod tests {
                     accessor_kind: None,
                     members: vec![],
                     rendered_components: vec![],
+                    css: vec![],
                 },
             ],
             rendered_components: vec![],
+            css: vec![],
         };
 
         let new_surface = ApiSurface {
@@ -3298,8 +3550,10 @@ mod tests {
                 accessor_kind: None,
                 members: vec![],
                 rendered_components: vec![],
+                css: vec![],
             }],
             rendered_components: vec![],
+            css: vec![],
         };
 
         let new_surface = ApiSurface {
@@ -3386,8 +3640,10 @@ mod tests {
                 accessor_kind: None,
                 members: vec![],
                 rendered_components: vec![],
+                css: vec![],
             }],
             rendered_components: vec![],
+            css: vec![],
         };
 
         let new_surface = ApiSurface {
@@ -3478,8 +3734,10 @@ mod tests {
                 accessor_kind: None,
                 members: vec![],
                 rendered_components: vec![],
+                css: vec![],
             }],
             rendered_components: vec![],
+            css: vec![],
         };
 
         let new_surface = ApiSurface {
@@ -3586,8 +3844,10 @@ mod tests {
                 accessor_kind: None,
                 members: vec![],
                 rendered_components: vec![],
+                css: vec![],
             }],
             rendered_components: vec![],
+            css: vec![],
         };
 
         // Deprecated ModalProps (old API re-exported in v6) — HAS header/footer
@@ -3633,6 +3893,7 @@ mod tests {
                     accessor_kind: None,
                     members: vec![],
                     rendered_components: vec![],
+                    css: vec![],
                 },
                 Symbol {
                     name: "footer".to_string(),
@@ -3658,9 +3919,11 @@ mod tests {
                     accessor_kind: None,
                     members: vec![],
                     rendered_components: vec![],
+                    css: vec![],
                 },
             ],
             rendered_components: vec![],
+            css: vec![],
         };
 
         // new_surface contains BOTH — simulating what the real extraction produces
@@ -3712,5 +3975,84 @@ mod tests {
             .find(|c| c.name == "ModalBody")
             .unwrap();
         assert_eq!(modal_body.mechanism, "child");
+    }
+
+    // ── extract_type_from_signature tests ─────────────────────────────
+
+    #[test]
+    fn test_extract_type_named() {
+        assert_eq!(
+            extract_type_from_signature("property: splitButtonOptions: SplitButtonOptions"),
+            Some("SplitButtonOptions")
+        );
+    }
+
+    #[test]
+    fn test_extract_type_array() {
+        assert_eq!(
+            extract_type_from_signature("property: splitButtonItems: ReactNode[]"),
+            Some("ReactNode[]")
+        );
+    }
+
+    #[test]
+    fn test_extract_type_object() {
+        let sig = "property: gap: { default?: 'gapMd' | 'gapNone'; md?: 'gapMd' }";
+        let result = extract_type_from_signature(sig);
+        assert!(result.unwrap().starts_with("{ default?:"));
+    }
+
+    #[test]
+    fn test_extract_type_no_type() {
+        assert_eq!(extract_type_from_signature("property: foo"), None);
+    }
+
+    #[test]
+    fn test_extract_type_empty() {
+        assert_eq!(extract_type_from_signature(""), None);
+    }
+
+    // ── types_structurally_compatible tests ───────────────────────────
+
+    #[test]
+    fn test_compatible_identical_types() {
+        assert!(types_structurally_compatible("boolean", "boolean"));
+    }
+
+    #[test]
+    fn test_compatible_both_objects() {
+        assert!(types_structurally_compatible(
+            "{ default?: 'spaceItemsMd' | 'spaceItemsNone' }",
+            "{ default?: 'gapMd' | 'gapNone' }"
+        ));
+    }
+
+    #[test]
+    fn test_compatible_both_unions() {
+        assert!(types_structurally_compatible(
+            "'spaceItemsMd' | 'spaceItemsNone'",
+            "'gapMd' | 'gapNone'"
+        ));
+    }
+
+    #[test]
+    fn test_incompatible_interface_to_array() {
+        assert!(!types_structurally_compatible(
+            "SplitButtonOptions",
+            "ReactNode[]"
+        ));
+    }
+
+    #[test]
+    fn test_incompatible_object_to_array() {
+        assert!(!types_structurally_compatible(
+            "{ items: ReactNode[] }",
+            "ReactNode[]"
+        ));
+    }
+
+    #[test]
+    fn test_incompatible_different_identifiers() {
+        assert!(!types_structurally_compatible("FooType", "BarType"));
     }
 }

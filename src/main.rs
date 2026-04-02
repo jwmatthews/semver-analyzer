@@ -473,13 +473,10 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     );
     let raw_count = raw_rules.len();
 
-    // Suppress redundant rules
-    let filtered_rules = konveyor::suppress_redundant_token_rules(raw_rules, &covered_symbols);
-
     let rules = if common.no_consolidate {
-        filtered_rules
+        raw_rules
     } else {
-        let (consolidated, _id_mapping) = konveyor::consolidate_rules(filtered_rules);
+        let (consolidated, _id_mapping) = konveyor::consolidate_rules(raw_rules);
         info!(
             raw = raw_count,
             consolidated = consolidated.len(),
@@ -513,15 +510,17 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     let fix_dir = konveyor::write_fix_guidance_dir(&common.output_dir, &fix_guidance)?;
     konveyor::write_fix_strategies(&fix_dir, &strategies)?;
 
-    // Conformance rules are disabled for now — they add noise during
-    // the migration phase. Re-enable once migration rules are solid.
-    // let conformance_rules = konveyor::generate_conformance_rules(&report);
-    // if !conformance_rules.is_empty() {
-    //     let conformance_strategies = konveyor::extract_fix_strategies(&conformance_rules);
-    //     konveyor::write_conformance_rules(&common.output_dir, &conformance_rules)?;
-    //     strategies.extend(conformance_strategies);
-    //     konveyor::write_fix_strategies(&fix_dir, &strategies)?;
-    // }
+    // Conformance rules — targeted nesting-violation rules that fire
+    // when a component is used as a direct child of a parent but should
+    // be wrapped in an intermediate component (e.g., DropdownItem must
+    // be inside DropdownList, not directly in Dropdown).
+    let conformance_rules = konveyor::generate_conformance_rules(&report);
+    if !conformance_rules.is_empty() {
+        let conformance_strategies = konveyor::extract_fix_strategies(&conformance_rules);
+        konveyor::write_conformance_rules(&common.output_dir, &conformance_rules)?;
+        strategies.extend(conformance_strategies);
+        konveyor::write_fix_strategies(&fix_dir, &strategies)?;
+    }
     write_phase.finish("Output written");
 
     // Summary
