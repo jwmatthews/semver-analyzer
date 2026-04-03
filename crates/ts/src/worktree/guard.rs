@@ -50,6 +50,18 @@ impl WorktreeGuard {
         git_ref: &str,
         build_command: Option<&str>,
     ) -> Result<Self, WorktreeError> {
+        // Canonicalize repo path to avoid relative path mismatches between
+        // git (which resolves paths relative to its CWD) and Rust filesystem
+        // calls (which resolve relative to the process CWD).
+        let repo = repo.canonicalize().map_err(|e| {
+            WorktreeError::CommandFailed(format!(
+                "Failed to canonicalize repo path {}: {}",
+                repo.display(),
+                e
+            ))
+        })?;
+        let repo = repo.as_path();
+
         // Validate repo is a git repository
         validate_git_repo(repo)?;
 
@@ -139,6 +151,15 @@ impl WorktreeGuard {
     /// This is useful for testing the RAII cleanup behavior, and as a
     /// building block for `new()`.
     pub fn create_only(repo: &Path, git_ref: &str) -> Result<Self, WorktreeError> {
+        let repo = repo.canonicalize().map_err(|e| {
+            WorktreeError::CommandFailed(format!(
+                "Failed to canonicalize repo path {}: {}",
+                repo.display(),
+                e
+            ))
+        })?;
+        let repo = repo.as_path();
+
         validate_git_repo(repo)?;
         validate_git_ref(repo, git_ref)?;
 
@@ -592,5 +613,42 @@ mod tests {
         assert_eq!(guard2.path(), path1); // same path
 
         // Cleanup: let guard2 drop normally
+    }
+
+    #[test]
+    fn relative_repo_path_creates_worktree_at_correct_location() {
+        // Regression test: when repo is a relative path, the worktree must be
+        // created where PackageManager::detect() will look for it, not at a
+        // double-nested path caused by git resolving relative to its CWD.
+        let repo_dir = create_test_repo();
+        let repo_abs = repo_dir.path().to_path_buf();
+
+        // Build a relative path to the repo from a different working directory.
+        // We use the parent directory as the CWD and make repo a relative child.
+        let parent = repo_abs.parent().expect("repo should have a parent");
+        let repo_name = repo_abs.file_name().expect("repo should have a dir name");
+        let relative_repo = Path::new(".").join(repo_name);
+
+        // Change to the parent directory so the relative path resolves correctly
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(parent).unwrap();
+
+        let result = WorktreeGuard::create_only(&relative_repo, "v1.0.0");
+
+        // Restore CWD before any assertions (so cleanup works even on failure)
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        let guard = result.expect("create_only with relative path should succeed");
+
+        // The worktree path should exist and contain the repo's files
+        assert!(
+            guard.path().exists(),
+            "worktree should exist at the path returned by guard"
+        );
+        assert!(
+            guard.path().join("file.txt").exists(),
+            "worktree should contain repo files (file.txt), \
+             not be at a double-nested path"
+        );
     }
 }
