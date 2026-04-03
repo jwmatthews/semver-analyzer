@@ -198,6 +198,14 @@ impl WorktreeGuard {
     /// Looks in `<repo>/.semver-worktrees/` for any existing directories
     /// and attempts to clean them up via `git worktree remove`.
     pub fn cleanup_stale(repo: &Path) -> Result<usize, WorktreeError> {
+        let repo = repo.canonicalize().map_err(|e| {
+            WorktreeError::CommandFailed(format!(
+                "Failed to canonicalize repo path {}: {}",
+                repo.display(),
+                e
+            ))
+        })?;
+        let repo = repo.as_path();
         let worktree_dir = repo.join(WORKTREE_DIR_NAME);
         if !worktree_dir.exists() {
             return Ok(0);
