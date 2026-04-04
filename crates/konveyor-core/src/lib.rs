@@ -456,6 +456,8 @@ pub fn build_combined_constant_rule(
                 value: None,
                 from: from_pkg,
                 parent_from: None,
+                not_parent: None,
+                not_child: None,
             },
         },
         fix_strategy: strategy,
@@ -744,10 +746,10 @@ pub fn consolidation_key(rule: &KonveyorRule) -> String {
         return format!("{}-constant-type-changed", package);
     }
 
-    // Renamed constants with codemod data: keep as singleton.
-    // These rules carry per-token Rename mappings in their fix_strategy
-    // that would be lost if merged with other rules.
-    if change_type == "renamed" && kind == "constant" {
+    // Renamed properties with codemod data: keep as singleton.
+    // These rules carry per-prop Rename mappings in their fix_strategy
+    // that would be lost or mis-classified if merged.
+    if change_type == "renamed" && (kind == "property" || kind == "constant") {
         let has_codemod = rule.labels.iter().any(|l| l == "has-codemod=true");
         if has_codemod {
             return rule.rule_id.clone();
@@ -942,6 +944,8 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
                     value: None,
                     from: from_pkg,
                     parent_from: None,
+                    not_parent: None,
+                    not_child: None,
                 },
             }
         } else {
@@ -1209,6 +1213,20 @@ pub fn api_change_to_strategy(
             ))
         }
         ApiChangeType::TypeChanged | ApiChangeType::SignatureChanged => {
+            // Restructured prop: type-incompatible rename (e.g.,
+            // splitButtonOptions: SplitButtonOptions → splitButtonItems: ReactNode[]).
+            // Use LLM-assisted fixing since the value needs restructuring.
+            if let Some(RemovalDisposition::ReplacedByMember { ref new_member }) =
+                change.removal_disposition
+            {
+                let (component, prop) = extract_component_prop(&change.symbol);
+                let mut e = FixStrategyEntry::new("LlmAssisted");
+                e.component = component;
+                e.prop = prop;
+                e.replacement = Some(new_member.clone());
+                return Some(e);
+            }
+
             if let Some(ref before) = change.before {
                 if is_single_quoted_value(before) {
                     let value = &before[1..before.len() - 1];
@@ -1466,6 +1484,8 @@ pub fn build_frontend_condition(
                     value: Some(format!("^{}$", regex_escape(value))),
                     from: from.clone(),
                     parent_from: None,
+                    not_parent: None,
+                    not_child: None,
                 },
             }];
 
@@ -1481,6 +1501,8 @@ pub fn build_frontend_condition(
                             value: Some(format!("^{}$", regex_escape(value))),
                             from: from.clone(),
                             parent_from: None,
+                            not_parent: None,
+                            not_child: None,
                         },
                     });
                 }
@@ -1531,6 +1553,8 @@ pub fn build_frontend_condition(
                     value: None,
                     from: from.clone(),
                     parent_from: None,
+                    not_parent: None,
+                    not_child: None,
                 },
             }];
             if !is_subpath_scoped {
@@ -1545,6 +1569,8 @@ pub fn build_frontend_condition(
                             value: None,
                             from: from.clone(),
                             parent_from: None,
+                            not_parent: None,
+                            not_child: None,
                         },
                     },
                 );
@@ -1564,6 +1590,8 @@ pub fn build_frontend_condition(
                         value: None,
                         from: from.clone(),
                         parent_from: None,
+                        not_parent: None,
+                        not_child: None,
                     },
                 });
             }
@@ -1576,6 +1604,8 @@ pub fn build_frontend_condition(
                     value: None,
                     from: from.clone(),
                     parent_from: None,
+                    not_parent: None,
+                    not_child: None,
                 },
             });
             if let Some(component_name) = match_name.strip_suffix("Props") {
@@ -1590,6 +1620,8 @@ pub fn build_frontend_condition(
                             value: None,
                             from: from.clone(),
                             parent_from: None,
+                            not_parent: None,
+                            not_child: None,
                         },
                     });
                 }
@@ -1609,6 +1641,8 @@ pub fn build_frontend_condition(
                         value: None,
                         from,
                         parent_from: None,
+                        not_parent: None,
+                        not_child: None,
                     },
                 }
             } else {
@@ -1621,6 +1655,8 @@ pub fn build_frontend_condition(
                         value: value_filter,
                         from,
                         parent_from: None,
+                        not_parent: None,
+                        not_child: None,
                     },
                 }
             }
@@ -1637,6 +1673,8 @@ pub fn build_frontend_condition(
                 component: None,
                 parent: None,
                 parent_from: None,
+                not_parent: None,
+                not_child: None,
                 value: None,
                 from,
             },
@@ -1654,6 +1692,8 @@ pub fn build_frontend_condition(
                         value: None,
                         from: from.clone(),
                         parent_from: None,
+                        not_parent: None,
+                        not_child: None,
                     },
                 });
             }
@@ -1666,6 +1706,8 @@ pub fn build_frontend_condition(
                     value: None,
                     from,
                     parent_from: None,
+                    not_parent: None,
+                    not_child: None,
                 },
             });
             if conditions.len() == 1 {
@@ -1692,6 +1734,8 @@ pub fn build_frontend_condition(
                                 value: None,
                                 from: from.clone(),
                                 parent_from: None,
+                                not_parent: None,
+                                not_child: None,
                             },
                         },
                         KonveyorCondition::FrontendReferenced {
@@ -1703,6 +1747,8 @@ pub fn build_frontend_condition(
                                 value: None,
                                 from,
                                 parent_from: None,
+                                not_parent: None,
+                                not_child: None,
                             },
                         },
                     ],
@@ -1717,6 +1763,8 @@ pub fn build_frontend_condition(
                         value: None,
                         from,
                         parent_from: None,
+                        not_parent: None,
+                        not_child: None,
                     },
                 }
             }
@@ -1904,6 +1952,21 @@ pub fn build_api_message(change: &ApiChange, file_path: &str) -> String {
         msg.push_str(&format!("\nAfter: {}", after));
     }
 
+    // When a SignatureChanged prop still carries a ReplacedByMember
+    // disposition (type-incompatible rename), include migration guidance.
+    if change.change == ApiChangeType::SignatureChanged {
+        if let Some(RemovalDisposition::ReplacedByMember { ref new_member }) =
+            change.removal_disposition
+        {
+            msg.push_str(&format!(
+                "\n\nMigration: This property was replaced by '{}'. \
+                 The type has changed, so the value may need restructuring \
+                 when moving to the new property.",
+                new_member
+            ));
+        }
+    }
+
     msg
 }
 
@@ -1973,7 +2036,10 @@ pub fn extract_name_from_summary(summary: &str) -> &str {
 /// `symbol_summary` string.  Import paths start with `@` or are simple
 /// identifiers (no `": "` separator that symbol summaries always contain).
 fn looks_like_import_path(s: &str) -> bool {
-    s.starts_with('@') || !s.contains(": ")
+    // Import paths start with @ or contain / (e.g., "@patternfly/react-core",
+    // "@patternfly/react-charts/victory"). Simple prop names like "chips"
+    // or "deleteChip" are NOT import paths.
+    (s.starts_with('@') || s.contains('/')) && !s.contains(": ")
 }
 
 /// Extract the trailing PascalCase suffix from a snake_case token constant name.
@@ -2217,6 +2283,7 @@ mod tests {
     ) -> ApiChange {
         ApiChange {
             symbol: "Test.prop".into(),
+            qualified_name: String::new(),
             kind: ApiChangeKind::Property,
             change,
             before: before.map(|s| s.into()),
@@ -2398,6 +2465,8 @@ mod tests {
                         value: None,
                         from: Some("@patternfly/react-core".into()),
                         parent_from: None,
+                        not_parent: None,
+                        not_child: None,
                     },
                 },
                 fix_strategy: None,
@@ -2419,6 +2488,8 @@ mod tests {
                         value: None,
                         from: Some("@patternfly/react-core".into()),
                         parent_from: None,
+                        not_parent: None,
+                        not_child: None,
                     },
                 },
                 fix_strategy: None,
@@ -2448,6 +2519,8 @@ mod tests {
                         value: None,
                         from: Some("@patternfly/react-core".into()),
                         parent_from: None,
+                        not_parent: None,
+                        not_child: None,
                     },
                 },
                 fix_strategy: None,
@@ -2469,6 +2542,8 @@ mod tests {
                         value: None,
                         from: Some("@patternfly/react-core".into()),
                         parent_from: None,
+                        not_parent: None,
+                        not_child: None,
                     },
                 },
                 fix_strategy: None,
@@ -2547,6 +2622,7 @@ mod tests {
     fn test_token_rename_generates_rename_strategy() {
         let change = ApiChange {
             symbol: "global_success_color_100".into(),
+            qualified_name: String::new(),
             kind: ApiChangeKind::Constant,
             change: ApiChangeType::Renamed,
             before: Some(
@@ -2574,6 +2650,7 @@ mod tests {
         // Some token renames have no type in the after field
         let change = ApiChange {
             symbol: "global_warning_color_100".into(),
+            qualified_name: String::new(),
             kind: ApiChangeKind::Constant,
             change: ApiChangeType::Renamed,
             before: Some("variable: global_warning_color_100".into()),
@@ -2601,6 +2678,7 @@ mod tests {
         // after field, but the user-provided token_mapping should win.
         let change = ApiChange {
             symbol: "global_danger_color_100".into(),
+            qualified_name: String::new(),
             kind: ApiChangeKind::Constant,
             change: ApiChangeType::Renamed,
             before: Some("constant: global_danger_color_100".into()),
@@ -2631,6 +2709,7 @@ mod tests {
         // When no user mapping exists, the algorithm's result is used
         let change = ApiChange {
             symbol: "global_spacer_sm".into(),
+            qualified_name: String::new(),
             kind: ApiChangeKind::Constant,
             change: ApiChangeType::Renamed,
             before: Some("constant: global_spacer_sm".into()),

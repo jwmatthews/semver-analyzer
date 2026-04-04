@@ -268,9 +268,45 @@ pub fn diff_surfaces_with_semantics(
     // ── Phase 2: Rename detection ────────────────────────────────────
     // Match remaining removed+added pairs by type fingerprint + name similarity.
     // Relocated symbols are excluded.
+    //
+    // Also exclude removed symbols whose name exists in the NEW API surface
+    // with the SAME import path — these are migrations (e.g., SelectOptionProps
+    // moved from /deprecated/ to main where a same-named type already exists),
+    // not renames. They'll be handled by Phase 5 (migration detection).
+    //
+    // Symbols with the same name but DIFFERENT import paths (e.g., Chart
+    // moved from root to /victory) are kept — they need to pass through
+    // rename detection to emit Relocated changes.
+    let new_by_name: HashMap<&str, Vec<&Symbol>> = {
+        let mut map: HashMap<&str, Vec<&Symbol>> = HashMap::new();
+        for s in new_symbols.iter() {
+            map.entry(s.name.as_str()).or_default().push(s);
+        }
+        map
+    };
     let remaining_removed: Vec<&Symbol> = removed
         .iter()
         .filter(|s| !relocated_old.contains(s.qualified_name.as_str()))
+        .filter(|s| {
+            // Keep if no same-named symbol exists in new API
+            let Some(new_syms) = new_by_name.get(s.name.as_str()) else {
+                return true;
+            };
+            // Keep if the same-named symbol has a DIFFERENT import path
+            // (needs Relocated detection, not migration).
+            // Treat /deprecated and /next as equivalent to the base path —
+            // moving from @pkg/deprecated to @pkg is a migration, not a
+            // consumer-visible import change.
+            let old_import = s.import_path.as_ref().or(s.package.as_ref());
+            let old_base =
+                old_import.map(|p| p.trim_end_matches("/deprecated").trim_end_matches("/next"));
+            !new_syms.iter().any(|ns| {
+                let new_import = ns.import_path.as_ref().or(ns.package.as_ref());
+                let new_base =
+                    new_import.map(|p| p.trim_end_matches("/deprecated").trim_end_matches("/next"));
+                old_base == new_base
+            })
+        })
         .copied()
         .collect();
     let remaining_added: Vec<&Symbol> = added
@@ -575,34 +611,33 @@ pub fn diff_surfaces_with_semantics(
                     let base = change.description.trim_end_matches(" was removed");
 
                     // When removed and replacement have the same name but live
-                    // in different packages (e.g., SelectOptionProps moved from
-                    // deprecated to the main package), add explicit import
-                    // guidance so the LLM changes the import source rather than
-                    // creating a local replacement type.
+                    // in different packages or subpaths (e.g., SelectOptionProps
+                    // moved from /deprecated to the main package), add explicit
+                    // import guidance so the LLM changes the import source
+                    // rather than creating a local replacement type.
                     let import_hint = if mig.target.removed_symbol == mig.target.replacement_symbol
                         && mig.target.removed_qualified_name
                             != mig.target.replacement_qualified_name
                     {
-                        // Use package fields (set by the language's extractor) for import paths.
-                        // Falls back to qualified names if package is not set.
-                        let old_import = mig
-                            .target
-                            .removed_package
-                            .as_deref()
-                            .unwrap_or(&mig.target.removed_qualified_name);
-                        let new_import = mig
-                            .target
-                            .replacement_package
-                            .as_deref()
-                            .unwrap_or(&mig.target.replacement_qualified_name);
+                        // Derive import paths from qualified names to detect
+                        // subpath differences (e.g., /deprecated/) that the
+                        // package fields alone may not distinguish.
+                        let old_import = derive_import_subpath(
+                            mig.target.removed_package.as_deref(),
+                            &mig.target.removed_qualified_name,
+                        );
+                        let new_import = derive_import_subpath(
+                            mig.target.replacement_package.as_deref(),
+                            &mig.target.replacement_qualified_name,
+                        );
 
                         if old_import != new_import {
                             format!(
                                 "\n  Import change: {}",
                                 semantics.format_import_change(
                                     &mig.target.removed_symbol,
-                                    old_import,
-                                    new_import,
+                                    &old_import,
+                                    &new_import,
                                 ),
                             )
                         } else {
@@ -622,8 +657,22 @@ pub fn diff_surfaces_with_semantics(
                     );
                     if !removed_names.is_empty() {
                         desc.push_str(&format!(
-                            "\n  Removed props with no direct equivalent: {}",
+                            "\n  Removed props with no direct equivalent: {}\
+                             \n  NOTE: Only address removed props that your code actually uses. \
+                             If a removed prop is not referenced in the file, ignore it.",
                             removed_names.join(", "),
+                        ));
+                    }
+                    // When the base type (extends clause) changed, warn that
+                    // inherited members may no longer be available. The LLM
+                    // knows what members React.HTMLProps provides vs MenuItemProps.
+                    if mig.target.old_extends.is_some() || mig.target.new_extends.is_some() {
+                        let old_ext = mig.target.old_extends.as_deref().unwrap_or("(none)");
+                        let new_ext = mig.target.new_extends.as_deref().unwrap_or("(none)");
+                        desc.push_str(&format!(
+                            "\n  Base type changed: {} → {}. \
+                             Inherited members from the old base type are no longer available.",
+                            old_ext, new_ext,
                         ));
                     }
                     change.description = desc;
@@ -639,6 +688,28 @@ pub fn diff_surfaces_with_semantics(
     semantics.post_process(&mut changes);
 
     changes
+}
+
+/// Derive the import path from a package name and qualified name.
+///
+/// When the package field alone doesn't distinguish subpaths (e.g., both
+/// old and new are `@patternfly/react-core`), this function inspects the
+/// qualified name for known subpath segments like `/deprecated/` or `/next/`
+/// and appends them to the package name.
+///
+/// Example:
+///   package = "@patternfly/react-core"
+///   qualified = "packages/react-core/src/deprecated/components/Select/SelectOption.SelectOptionProps"
+///   → "@patternfly/react-core/deprecated"
+fn derive_import_subpath(package: Option<&str>, qualified_name: &str) -> String {
+    let base = package.unwrap_or("unknown");
+    if qualified_name.contains("/deprecated/") {
+        format!("{}/deprecated", base)
+    } else if qualified_name.contains("/next/") {
+        format!("{}/next", base)
+    } else {
+        base.to_string()
+    }
 }
 
 /// Compare two API surfaces using minimal semantics (no language-specific rules).

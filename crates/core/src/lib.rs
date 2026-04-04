@@ -142,6 +142,7 @@ pub(crate) mod test_support {
                 member_renames: HashMap::new(),
                 inferred_rename_patterns: None,
                 hierarchy_deltas: vec![],
+                sd_result: None,
                 metadata: AnalysisMetadata {
                     call_graph_analysis: String::new(),
                     tool_version: String::new(),

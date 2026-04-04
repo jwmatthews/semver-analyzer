@@ -20,6 +20,13 @@ pub mod report;
 pub mod test_analyzer;
 pub mod worktree;
 
+// ── v2 SD (Source-Level Diff) pipeline modules ──────────────────────────
+pub mod composition;
+pub mod css_profile;
+pub mod konveyor_v2;
+pub mod sd_pipeline;
+pub mod source_profile;
+
 // Re-export key types for convenience
 pub use extract::OxcExtractor;
 pub use language::{TsCategory, TsEvidence, TsManifestChangeType, TsReportData, TypeScript};

@@ -1776,3 +1776,173 @@ fn real_rename_is_detected() {
     assert_eq!(renames[0].before.as_deref(), Some("isFlat"));
     assert_eq!(renames[0].after.as_deref(), Some("isPlain"));
 }
+
+/// A symbol removed from /deprecated should NOT be falsely renamed to an
+/// unrelated symbol when a same-named symbol exists in the main package.
+///
+/// Reproduces: SelectOptionProps (deprecated) was falsely matched to
+/// TooltipOptionProps because both are Interface kind with empty return_type.
+/// The filter should recognize that SelectOptionProps exists in the new API
+/// (main package) and exclude it from rename candidates.
+#[test]
+fn deprecated_removal_not_falsely_renamed_when_same_name_exists_in_main() {
+    // Old: SelectOptionProps in deprecated
+    let mut old_select = sym("SelectOptionProps", SymbolKind::Interface);
+    old_select.qualified_name =
+        "packages/react-core/src/deprecated/components/Select/SelectOption.SelectOptionProps"
+            .to_string();
+    old_select.file =
+        "packages/react-core/src/deprecated/components/Select/SelectOption.d.ts".into();
+    old_select.package = Some("@patternfly/react-core".to_string());
+    old_select.import_path = Some("@patternfly/react-core/deprecated".to_string());
+
+    // New: SelectOptionProps still exists in main (not in changes because it
+    // existed before too — it's in new_symbols but not in the added list)
+    let mut new_select = sym("SelectOptionProps", SymbolKind::Interface);
+    new_select.qualified_name =
+        "packages/react-core/src/components/Select/SelectOption.SelectOptionProps".to_string();
+    new_select.file = "packages/react-core/src/components/Select/SelectOption.d.ts".into();
+    new_select.package = Some("@patternfly/react-core".to_string());
+    new_select.import_path = Some("@patternfly/react-core".to_string());
+
+    // New: TooltipOptionProps (unrelated, also Interface kind)
+    let mut new_tooltip = sym("TooltipOptionProps", SymbolKind::Interface);
+    new_tooltip.qualified_name =
+        "packages/react-core/src/components/Tooltip/Tooltip.TooltipOptionProps".to_string();
+    new_tooltip.file = "packages/react-core/src/components/Tooltip/Tooltip.d.ts".into();
+    new_tooltip.package = Some("@patternfly/react-core".to_string());
+    new_tooltip.import_path = Some("@patternfly/react-core".to_string());
+
+    // Old surface has SelectOptionProps + SelectOptionProps in main (both versions exist in v5)
+    let mut old_select_main = new_select.clone();
+    old_select_main.qualified_name =
+        "packages/react-core/src/components/Select/SelectOption.SelectOptionProps".to_string();
+
+    let old = surface(vec![old_select, old_select_main]);
+    let new = surface(vec![new_select, new_tooltip]);
+    let changes = diff_surfaces(&old, &new);
+
+    // SelectOptionProps should NOT be renamed to TooltipOptionProps
+    let renames: Vec<_> = changes
+        .iter()
+        .filter(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed {
+                    from: ChangeSubject::Symbol { .. },
+                    ..
+                }
+            ) && c.symbol == "SelectOptionProps"
+        })
+        .collect();
+    assert!(
+        renames.is_empty(),
+        "SelectOptionProps should NOT be renamed to TooltipOptionProps. Got: {:?}",
+        renames
+            .iter()
+            .map(|c| format!("{} → {}", c.symbol, c.after.as_deref().unwrap_or("?")))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Renames where the type structure changed (but shape is preserved) should
+/// still be detected via structural normalization.
+///
+/// Example: chips: (ToolbarChip | string)[] → labels: (ToolbarLabel | string)[]
+/// The types are structurally identical after normalizing type references.
+#[test]
+fn structural_rename_with_type_reference_change() {
+    let mut old_chips = sym("chips", SymbolKind::Property);
+    old_chips.qualified_name = "pkg/Toolbar.ToolbarFilterProps.chips".to_string();
+    old_chips.signature = Some(Signature {
+        return_type: Some("(ToolbarChip | string)[]".to_string()),
+        parameters: vec![],
+        type_parameters: Vec::new(),
+        is_async: false,
+    });
+
+    let mut new_labels = sym("labels", SymbolKind::Property);
+    new_labels.qualified_name = "pkg/Toolbar.ToolbarFilterProps.labels".to_string();
+    new_labels.signature = Some(Signature {
+        return_type: Some("(ToolbarLabel | string)[]".to_string()),
+        parameters: vec![],
+        type_parameters: Vec::new(),
+        is_async: false,
+    });
+
+    let old = surface(vec![old_chips]);
+    let new = surface(vec![new_labels]);
+    let changes = diff_surfaces(&old, &new);
+
+    let renames: Vec<_> = changes
+        .iter()
+        .filter(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed {
+                    from: ChangeSubject::Symbol { .. },
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        !renames.is_empty(),
+        "chips → labels should be detected as rename via structural normalization"
+    );
+    assert_eq!(renames[0].before.as_deref(), Some("chips"));
+    assert_eq!(renames[0].after.as_deref(), Some("labels"));
+}
+
+/// Renames where enum values also changed should be detected via deep
+/// structural normalization.
+///
+/// Example: spacer: { default?: 'spacerNone' | 'spacerSm' } →
+///          gap: { default?: 'gapNone' | 'gapSm' | 'gapXl' }
+#[test]
+fn deep_structural_rename_with_enum_value_change() {
+    let mut old_spacer = sym("spacer", SymbolKind::Property);
+    old_spacer.qualified_name = "pkg/Toolbar.ToolbarGroupProps.spacer".to_string();
+    old_spacer.signature = Some(Signature {
+        return_type: Some(
+            "{ default?: 'spacerNone' | 'spacerSm' | 'spacerMd' | 'spacerLg' }".to_string(),
+        ),
+        parameters: vec![],
+        type_parameters: Vec::new(),
+        is_async: false,
+    });
+
+    let mut new_gap = sym("gap", SymbolKind::Property);
+    new_gap.qualified_name = "pkg/Toolbar.ToolbarGroupProps.gap".to_string();
+    new_gap.signature = Some(Signature {
+        return_type: Some(
+            "{ default?: 'gapNone' | 'gapSm' | 'gapMd' | 'gapLg' | 'gapXl' }".to_string(),
+        ),
+        parameters: vec![],
+        type_parameters: Vec::new(),
+        is_async: false,
+    });
+
+    let old = surface(vec![old_spacer]);
+    let new = surface(vec![new_gap]);
+    let changes = diff_surfaces(&old, &new);
+
+    let renames: Vec<_> = changes
+        .iter()
+        .filter(|c| {
+            matches!(
+                &c.change_type,
+                StructuralChangeType::Renamed {
+                    from: ChangeSubject::Symbol { .. },
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        !renames.is_empty(),
+        "spacer → gap should be detected as rename via deep structural normalization"
+    );
+    assert_eq!(renames[0].before.as_deref(), Some("spacer"));
+    assert_eq!(renames[0].after.as_deref(), Some("gap"));
+}

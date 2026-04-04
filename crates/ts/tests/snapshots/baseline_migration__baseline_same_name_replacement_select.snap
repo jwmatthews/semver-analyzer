@@ -1,5 +1,6 @@
 ---
 source: crates/ts/tests/baseline_migration.rs
+assertion_line: 136
 expression: "diff(&old, &new)"
 ---
 - symbol: SelectProps
@@ -7,7 +8,7 @@ expression: "diff(&old, &new)"
   kind: Interface
   change_type: "Removed(Symbol { kind: Interface })"
   is_breaking: true
-  description: "Exported interface `SelectProps` was removed — migrate to `SelectProps`.\n  Import change: replace `import { SelectProps } from 'deprecated/components/Select/Select.d.ts.SelectProps'` with `import { SelectProps } from 'components/Select/Select.d.ts.SelectProps'`\n  Matching props (use on `SelectProps` instead): children, className, direction, isOpen, isPlain, onSelect, position, toggleRef, variant, width, zIndex\n  Removed props with no direct equivalent: isCreatable, isDisabled, isGrouped, onToggle, selections"
+  description: "Exported interface `SelectProps` was removed — migrate to `SelectProps`.\n  Matching props (use on `SelectProps` instead): children, className, direction, isOpen, isPlain, onSelect, position, toggleRef, variant, width, zIndex\n  Removed props with no direct equivalent: isCreatable, isDisabled, isGrouped, onToggle, selections\n  NOTE: Only address removed props that your code actually uses. If a removed prop is not referenced in the file, ignore it."
   before: "interface: SelectProps"
   after: ~
   has_migration_target: true

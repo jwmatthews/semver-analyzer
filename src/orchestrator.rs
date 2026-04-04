@@ -300,6 +300,322 @@ impl<L: Language> Analyzer<L> {
             container_changes,
             hierarchy_deltas,
             new_hierarchies,
+            sd_result: None,
+        })
+    }
+    /// Run the v2 concurrent TD+SD analysis pipeline.
+    ///
+    /// Replaces the BU pipeline with the deterministic SD (Source-Level Diff)
+    /// pipeline. TD runs for structural changes; SD runs for source-level
+    /// change facts. Both run concurrently via `tokio::join!`.
+    ///
+    /// Optionally runs rename inference (LLM) after TD completes, but skips
+    /// BU entirely — no test-delta analysis, no LLM file analysis.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_v2(
+        &self,
+        repo: &Path,
+        from_ref: &str,
+        to_ref: &str,
+        no_llm: bool,
+        llm_command: Option<&str>,
+        build_command: Option<&str>,
+        dep_css_dir: Option<&Path>,
+        dep_from: Option<&str>,
+        dep_to: Option<&str>,
+        dep_build_command: Option<&str>,
+        progress: &ProgressReporter,
+    ) -> Result<AnalysisResult<L>> {
+        let _span = info_span!("analyze_pipeline_v2", %from_ref, %to_ref).entered();
+        let shared = Arc::new(SharedFindings::<L>::new());
+
+        // ── Owned clones for TD's spawn_blocking ────────────────────
+        let lang_td = self.lang.clone();
+        let repo_td = repo.to_path_buf();
+        let from_td = from_ref.to_string();
+        let to_td = to_ref.to_string();
+        let build_cmd = build_command.map(|s| s.to_string());
+        let shared_td = shared.clone();
+        let progress_td = progress.clone();
+
+        // ── Owned clones for SD's spawn_blocking ────────────────────
+        let lang_sd = self.lang.clone();
+        let repo_sd = repo.to_path_buf();
+        let from_sd = from_ref.to_string();
+        let to_sd = to_ref.to_string();
+        let dep_css_dir_sd = dep_css_dir.map(|p| p.to_path_buf());
+        let dep_from_sd = dep_from.map(|s| s.to_string());
+        let dep_to_sd = dep_to.map(|s| s.to_string());
+        let dep_build_cmd_sd = dep_build_command.map(|s| s.to_string());
+        let progress_sd = progress.clone();
+
+        // ── Owned clones for rename inference ────────────────────────
+        // Note: hierarchy inference is skipped in v2 — the SD pipeline
+        // derives composition trees deterministically from BEM, DOM
+        // nesting, context, and name-prefix signals.
+        let lang_rename = self.lang.clone();
+        let from_rename_ref = from_ref.to_string();
+        let to_rename_ref = to_ref.to_string();
+        let llm_cmd_default = llm_command.unwrap_or("goose run --no-session -q -t");
+        let llm_cmd_rename = llm_cmd_default.to_string();
+        let progress_rename = progress.clone();
+        let shared_inference = shared.clone();
+
+        // ── Run TD + SD concurrently ────────────────────────────────
+        let (td_inference_result, sd_result) = tokio::join!(
+            // TD branch: structural diff → rename inference → hierarchy inference
+            async move {
+                // TD: blocking (extract surfaces, structural diff)
+                let td = tokio::task::spawn_blocking(move || {
+                    Self::run_td(
+                        lang_td.as_ref(),
+                        &repo_td,
+                        &from_td,
+                        &to_td,
+                        build_cmd.as_deref(),
+                        &shared_td,
+                        &progress_td,
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("TD task panicked: {}", e))?
+                .context("TD pipeline failed")?;
+
+                // TD done — extract surfaces for inference phases
+                let default_surface = Arc::new(ApiSurface::default());
+                let old_surface = shared_inference
+                    .try_get_old_surface()
+                    .cloned()
+                    .unwrap_or_else(|| default_surface.clone());
+                let new_surface = shared_inference
+                    .try_get_new_surface()
+                    .cloned()
+                    .unwrap_or_else(|| default_surface.clone());
+
+                // Run rename inference (if LLM enabled).
+                // Hierarchy inference is skipped in v2 — the SD pipeline
+                // derives composition trees deterministically.
+                let inferred_rename_patterns = if !no_llm {
+                    let changes_rename = td.structural_changes.clone();
+                    let old_surf_rename = old_surface.clone();
+                    let new_surf_rename = new_surface.clone();
+                    let from_rename = from_rename_ref.clone();
+                    let to_rename = to_rename_ref.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        let _span = info_span!("rename_inference").entered();
+                        let rename_phase =
+                            progress_rename.start_phase("Inferring rename patterns");
+                        let result = Self::infer_rename_patterns(
+                            lang_rename.as_ref(),
+                            &changes_rename,
+                            &old_surf_rename,
+                            &new_surf_rename,
+                            &llm_cmd_rename,
+                            &from_rename,
+                            &to_rename,
+                        );
+                        rename_phase.finish("Rename inference complete");
+                        result
+                    })
+                    .await
+                    .unwrap_or(None)
+                } else {
+                    None
+                };
+                let hierarchy_deltas = Vec::new();
+                let new_hierarchies = HashMap::new();
+
+                Ok::<_, anyhow::Error>((
+                    td,
+                    old_surface,
+                    new_surface,
+                    inferred_rename_patterns,
+                    hierarchy_deltas,
+                    new_hierarchies,
+                ))
+            },
+            // SD branch: source-level analysis (independent of TD)
+            async move {
+                let sd_phase = progress_sd.start_phase("[SD] Source-level analysis ...");
+                let result = tokio::task::spawn_blocking(move || {
+                    // If a dep CSS repo is provided with a ref and build command,
+                    // create a worktree, build it, and use the built path for CSS
+                    // profile extraction. Otherwise fall back to the raw dir path.
+                    let dep_worktree_guard = if let (Some(dep_dir), Some(dep_to)) =
+                        (&dep_css_dir_sd, &dep_to_sd)
+                    {
+                        use semver_analyzer_ts::WorktreeGuard;
+                        match WorktreeGuard::new(
+                            dep_dir,
+                            dep_to,
+                            dep_build_cmd_sd.as_deref(),
+                        ) {
+                            Ok(guard) => {
+                                tracing::info!(
+                                    dep_repo = %dep_dir.display(),
+                                    dep_ref = %dep_to,
+                                    worktree = %guard.path().display(),
+                                    "Created dep repo worktree for CSS extraction"
+                                );
+                                Some(guard)
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "Failed to create dep repo worktree, using raw dir");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Use worktree path if available, otherwise fall back to raw dir
+                    let css_dir = dep_worktree_guard
+                        .as_ref()
+                        .map(|g| g.path().to_path_buf())
+                        .or(dep_css_dir_sd);
+
+                    lang_sd.run_source_diff(
+                        &repo_sd,
+                        &from_sd,
+                        &to_sd,
+                        css_dir.as_deref(),
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("SD task panicked: {}", e))?;
+
+                match &result {
+                    Ok(r) => {
+                        sd_phase.finish_with_detail(
+                            "[SD] Source-level analysis complete",
+                            &format!(
+                                "{} changes, {} trees, {} conformance",
+                                r.source_level_changes.len(),
+                                r.composition_trees.len(),
+                                r.conformance_checks.len(),
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        warn!(%e, "SD pipeline failed");
+                        sd_phase.finish("[SD] Source-level analysis failed");
+                    }
+                }
+
+                result
+            },
+        );
+
+        // ── Unwrap results ──────────────────────────────────────────
+        let (
+            td,
+            old_surface,
+            new_surface,
+            inferred_rename_patterns,
+            hierarchy_deltas,
+            new_hierarchies,
+        ) = td_inference_result?;
+
+        let mut sd = match sd_result {
+            Ok(sd) => sd,
+            Err(e) => {
+                warn!(%e, "SD pipeline failed, continuing with empty results");
+                semver_analyzer_core::SdPipelineResult::default()
+            }
+        };
+
+        // Capture dependency repo package info (e.g., @patternfly/patternfly CSS package)
+        // so rule generation can create dep-update rules for packages outside the main monorepo.
+        if let Some(dep_dir) = dep_css_dir {
+            let dep_pkg_json = dep_dir.join("package.json");
+            if dep_pkg_json.exists() {
+                if let Ok(content) = std::fs::read_to_string(&dep_pkg_json) {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let (Some(name), Some(version)) = (
+                            parsed.get("name").and_then(|v| v.as_str()),
+                            parsed.get("version").and_then(|v| v.as_str()),
+                        ) {
+                            // Some repos use "0.0.0-development" in source and set
+                            // the real version during CI. Fall back to the git tag
+                            // (e.g., "v6.4.0" → "6.4.0") if the version looks like
+                            // a placeholder.
+                            let effective_version =
+                                if version.starts_with("0.0.0") || version == "0.0.0-development" {
+                                    // Use `git tag -l` with version sort to find the
+                                    // latest release tag (e.g., "v6.4.0"), skipping
+                                    // prerelease tags like "prerelease-v6.4.0-...".
+                                    let tag_version = std::process::Command::new("git")
+                                        .args([
+                                            "tag", "-l", "v[0-9]*",
+                                            "--sort=-v:refname",
+                                        ])
+                                        .current_dir(dep_dir)
+                                        .output()
+                                        .ok()
+                                        .and_then(|o| {
+                                            if o.status.success() {
+                                                let output = String::from_utf8_lossy(&o.stdout);
+                                                output
+                                                    .lines()
+                                                    .next()
+                                                    .map(|tag| {
+                                                        tag.trim()
+                                                            .trim_start_matches('v')
+                                                            .to_string()
+                                                    })
+                                                    .filter(|t| !t.is_empty())
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                    tag_version.unwrap_or_else(|| version.to_string())
+                                } else {
+                                    version.to_string()
+                                };
+                            info!(name, version = %effective_version, "Captured dep-repo package info");
+                            sd.dep_repo_packages
+                                .insert(name.to_string(), effective_version);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Summary logging ─────────────────────────────────────────
+        progress.println(&format!(
+            "  [SD] {} source-level changes, {} composition trees, {} conformance checks",
+            sd.source_level_changes.len(),
+            sd.composition_trees.len(),
+            sd.conformance_checks.len(),
+        ));
+        if !sd.composition_changes.is_empty() {
+            progress.println(&format!(
+                "  [SD] {} composition changes detected",
+                sd.composition_changes.len(),
+            ));
+        }
+
+        info!(
+            source_level_changes = sd.source_level_changes.len(),
+            composition_trees = sd.composition_trees.len(),
+            composition_changes = sd.composition_changes.len(),
+            conformance_checks = sd.conformance_checks.len(),
+            "SD pipeline summary"
+        );
+
+        Ok(AnalysisResult {
+            structural_changes: td.structural_changes,
+            behavioral_changes: vec![], // No BU in v2
+            manifest_changes: td.manifest_changes,
+            llm_api_changes: vec![], // No LLM file analysis in v2
+            old_surface,
+            new_surface,
+            inferred_rename_patterns,
+            container_changes: vec![], // No BU container changes in v2
+            hierarchy_deltas,
+            new_hierarchies,
+            sd_result: Some(sd),
         })
     }
 } // end impl Analyzer<L> (public API)

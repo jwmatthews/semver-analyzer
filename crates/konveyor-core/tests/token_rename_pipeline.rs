@@ -50,6 +50,7 @@ fn test_every_token_rename_produces_rename_strategy() {
     for entry in &entries {
         let change = ApiChange {
             symbol: entry.symbol.clone(),
+            qualified_name: String::new(),
             kind: ApiChangeKind::Constant,
             change: ApiChangeType::Renamed,
             before: Some(entry.before.clone()),
@@ -129,6 +130,7 @@ fn test_consolidated_token_strategies_have_clean_mappings() {
         .map(|(i, entry)| {
             let change = ApiChange {
                 symbol: entry.symbol.clone(),
+                qualified_name: String::new(),
                 kind: ApiChangeKind::Constant,
                 change: ApiChangeType::Renamed,
                 before: Some(entry.before.clone()),
@@ -259,6 +261,7 @@ fn test_every_token_findable_in_consolidated_mappings() {
         .map(|(i, entry)| {
             let change = ApiChange {
                 symbol: entry.symbol.clone(),
+                qualified_name: String::new(),
                 kind: ApiChangeKind::Constant,
                 change: ApiChangeType::Renamed,
                 before: Some(entry.before.clone()),

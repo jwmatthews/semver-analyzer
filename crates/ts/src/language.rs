@@ -13,7 +13,8 @@ use semver_analyzer_core::{
     AnalysisReport, AnalysisResult, ApiSurface, BehavioralChangeKind, BodyAnalysisResult,
     BodyAnalysisSemantics, Caller, ChangedFunction, EvidenceType, HierarchySemantics, Language,
     LanguageSemantics, ManifestChange, MessageFormatter, Reference, RenameSemantics,
-    StructuralChange, StructuralChangeType, Symbol, SymbolKind, TestDiff, TestFile, Visibility,
+    SdPipelineResult, StructuralChange, StructuralChangeType, Symbol, SymbolKind, TestDiff,
+    TestFile, Visibility,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
@@ -379,6 +380,25 @@ impl Language for TypeScript {
         || path_str.contains("__tests__")
         || path_str.contains("/dist/")
         || path_str.starts_with("dist/")
+    }
+
+    fn run_source_diff(
+        &self,
+        repo: &Path,
+        from_ref: &str,
+        to_ref: &str,
+        dep_css_dir: Option<&Path>,
+    ) -> Result<SdPipelineResult> {
+        let css_profiles = dep_css_dir.and_then(|dir| {
+            crate::css_profile::extract_css_profiles_from_dir(dir)
+                .map_err(|e| {
+                    tracing::warn!(%e, "failed to extract CSS profiles from dependency");
+                    e
+                })
+                .ok()
+        });
+
+        crate::sd_pipeline::run_sd(repo, from_ref, to_ref, css_profiles.as_ref())
     }
 }
 

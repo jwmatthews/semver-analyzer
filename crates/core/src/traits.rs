@@ -12,8 +12,8 @@
 
 use crate::types::{
     ApiSurface, BehavioralChangeKind, BodyAnalysisResult, BreakingVerdict, Caller, ChangeSubject,
-    ChangedFunction, EvidenceType, ExpectedChild, FunctionSpec, Reference, StructuralChange,
-    StructuralChangeType, Symbol, SymbolKind, TestDiff, TestFile, Visibility,
+    ChangedFunction, EvidenceType, ExpectedChild, FunctionSpec, Reference, SdPipelineResult,
+    StructuralChange, StructuralChangeType, Symbol, SymbolKind, TestDiff, TestFile, Visibility,
 };
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Serialize};
@@ -905,6 +905,25 @@ pub trait Language: LanguageSemantics + MessageFormatter + Send + Sync + 'static
     /// Default: return the qualified name as-is
     fn display_name(&self, qualified_name: &str) -> String {
         qualified_name.to_string()
+    }
+
+    // ── v2 SD (Source-Level Diff) pipeline ───────────────────────────
+
+    /// Run the SD pipeline for this language.
+    ///
+    /// Reads component source files at both refs, extracts structured
+    /// profiles, diffs them, and optionally builds composition trees.
+    ///
+    /// Default implementation returns empty results (SD not supported).
+    /// TypeScript overrides this to provide full SD analysis.
+    fn run_source_diff(
+        &self,
+        _repo: &Path,
+        _from_ref: &str,
+        _to_ref: &str,
+        _dep_css_dir: Option<&Path>,
+    ) -> Result<SdPipelineResult> {
+        Ok(SdPipelineResult::default())
     }
 }
 

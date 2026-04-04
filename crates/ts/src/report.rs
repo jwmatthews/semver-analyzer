@@ -79,6 +79,9 @@ pub(crate) fn build_report(
         );
     }
 
+    // Pass through SD pipeline results when present (v2 pipeline).
+    report.sd_result = results.sd_result.clone();
+
     report
 }
 
@@ -131,6 +134,7 @@ fn build_report_inner(
 
         let api_change = ApiChange {
             symbol: entry.symbol.clone(),
+            qualified_name: String::new(),
             kind,
             change: change_type,
             before: None,
@@ -261,7 +265,12 @@ fn build_report_inner(
                         );
                         change.change = ApiChangeType::SignatureChanged;
                         change.after = Some(new_type_sig.clone());
-                        change.removal_disposition = None;
+                        // Keep the ReplacedByMember disposition so downstream
+                        // rule generation can include migration guidance
+                        // pointing to the replacement prop. The change type is
+                        // SignatureChanged (not Removed), so the fix engine
+                        // will use LLM-assisted fixing instead of a mechanical
+                        // rename codemod.
                         reclassified += 1;
                     }
                 }
@@ -349,6 +358,7 @@ fn build_report_inner(
                                             "{}.{} (value:{})",
                                             parent_component, old_prop, old_val
                                         ),
+                                        qualified_name: String::new(),
                                         kind: ApiChangeKind::Property,
                                         change: ApiChangeType::Renamed,
                                         before: Some(format!(
@@ -490,6 +500,7 @@ fn build_report_inner(
         member_renames: HashMap::new(),
         inferred_rename_patterns,
         hierarchy_deltas: Vec::new(),
+        sd_result: None,
         metadata: AnalysisMetadata {
             call_graph_analysis: call_graph_info.to_string(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -762,6 +773,8 @@ fn build_package_summaries(
                             matching_members: props_target.matching_members.clone(),
                             removed_only_members: props_target.removed_only_members.clone(),
                             overlap_ratio: props_target.overlap_ratio,
+                            old_extends: props_target.old_extends.clone(),
+                            new_extends: props_target.new_extends.clone(),
                         })
                     } else {
                         None
@@ -2068,6 +2081,7 @@ fn structural_to_api_change(sc: &StructuralChange) -> ApiChange {
 
     ApiChange {
         symbol,
+        qualified_name: sc.qualified_name.clone(),
         kind,
         change,
         before: sc.before.clone(),
@@ -2197,6 +2211,7 @@ mod tests {
             container_changes: vec![],
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
+            sd_result: None,
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v1.0.0", "v2.0.0");
         assert_eq!(report.summary.total_breaking_changes, 0);
@@ -2258,6 +2273,7 @@ mod tests {
             container_changes: vec![],
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
+            sd_result: None,
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v1", "v2");
         assert_eq!(report.summary.breaking_api_changes, 1);
@@ -2293,6 +2309,7 @@ mod tests {
             container_changes: vec![],
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
+            sd_result: None,
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v1", "v2");
         assert_eq!(report.summary.breaking_api_changes, 0);
@@ -2376,6 +2393,7 @@ mod tests {
             container_changes: vec![],
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
+            sd_result: None,
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v5", "v6");
 
@@ -2490,6 +2508,7 @@ mod tests {
             container_changes: vec![],
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
+            sd_result: None,
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v5", "v6");
 
@@ -3041,6 +3060,7 @@ mod tests {
             member_renames: HashMap::new(),
             inferred_rename_patterns: None,
             hierarchy_deltas: vec![],
+            sd_result: None,
             metadata: semver_analyzer_core::AnalysisMetadata {
                 call_graph_analysis: "none".to_string(),
                 tool_version: "test".to_string(),
@@ -3089,6 +3109,8 @@ mod tests {
                     ],
                     removed_only_members: vec!["dropdownItems".to_string()],
                     overlap_ratio: 0.43,
+                    old_extends: None,
+                    new_extends: None,
                 }),
                 behavioral_changes: vec![],
                 child_components: vec![],
@@ -3105,6 +3127,7 @@ mod tests {
                 breaking_api_changes: vec![
                     ApiChange {
                         symbol: "DropdownToggle".to_string(),
+                        qualified_name: String::new(),
                         kind: ApiChangeKind::Constant,
                         change: ApiChangeType::Removed,
                         before: None,
@@ -3116,6 +3139,7 @@ mod tests {
                     },
                     ApiChange {
                         symbol: "KebabToggle".to_string(),
+                        qualified_name: String::new(),
                         kind: ApiChangeKind::Constant,
                         change: ApiChangeType::Removed,
                         before: None,
@@ -3236,6 +3260,8 @@ mod tests {
                     ],
                     removed_only_members: vec!["dropdownItems".to_string()],
                     overlap_ratio: 0.5,
+                    old_extends: None,
+                    new_extends: None,
                 }),
                 behavioral_changes: vec![],
                 child_components: vec![],

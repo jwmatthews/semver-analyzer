@@ -1,5 +1,23 @@
 ---
 source: crates/ts/tests/baseline_diff.rs
+assertion_line: 850
 expression: "diff(&old, &new)"
 ---
-[]
+- symbol: Chart
+  qualified_name: packages/react-charts/src/components/Chart/Chart.Chart
+  kind: Variable
+  change_type: "Removed(Symbol { kind: Variable })"
+  is_breaking: true
+  description: "Exported variable `Chart` was removed"
+  before: "variable: Chart"
+  after: ~
+  has_migration_target: false
+- symbol: Chart
+  qualified_name: packages/react-charts/src/victory/components/Chart/Chart.Chart
+  kind: Variable
+  change_type: "Added(Symbol { kind: Variable })"
+  is_breaking: false
+  description: "Exported variable `Chart` was added"
+  before: ~
+  after: "variable: Chart"
+  has_migration_target: false

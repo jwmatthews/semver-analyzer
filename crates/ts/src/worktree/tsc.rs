@@ -257,10 +257,17 @@ pub fn run_project_build(
 
     tracing::info!(command = %cmd, args = %args.join(" "), "Running project build");
 
-    let output = Command::new(&cmd)
-        .args(&args)
-        .current_dir(worktree_dir)
-        .env("NODE_ENV", "production")
+    let mut command = Command::new(&cmd);
+    command.args(&args).current_dir(worktree_dir);
+
+    // Only set NODE_ENV=production for auto-detected build commands.
+    // User-provided build commands may need devDependencies (e.g., gulp,
+    // sass) which NODE_ENV=production can cause package managers to skip.
+    if build_command.is_none() {
+        command.env("NODE_ENV", "production");
+    }
+
+    let output = command
         .output()
         .map_err(|e| WorktreeError::CommandFailed(format!("Failed to run {cmd}: {e}")))?;
 

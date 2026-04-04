@@ -45,3 +45,6 @@ indicatif = "0.17"
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
+
+[patch.crates-io]
+konveyor-core = { path = "../konveyor-core" }

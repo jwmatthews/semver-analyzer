@@ -281,6 +281,7 @@ mod tests {
                 member_renames: std::collections::HashMap::new(),
                 inferred_rename_patterns: None,
                 hierarchy_deltas: vec![],
+                sd_result: None,
                 metadata: crate::types::AnalysisMetadata {
                     call_graph_analysis: String::new(),
                     tool_version: String::new(),

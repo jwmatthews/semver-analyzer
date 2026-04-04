@@ -77,6 +77,11 @@ pub struct AnalysisReport<L: Language> {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hierarchy_deltas: Vec<HierarchyDelta>,
 
+    /// v2 SD (Source-Level Diff) pipeline results.
+    /// Populated when `--pipeline-v2` is used; None otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sd_result: Option<super::sd::SdPipelineResult>,
+
     /// Metadata about the analysis run.
     pub metadata: AnalysisMetadata,
 }
@@ -148,6 +153,11 @@ pub struct ApiChange {
     /// Symbol name: `ComponentName` for component-level, `ComponentName.propName`
     /// for prop-level changes.
     pub symbol: String,
+
+    /// Fully qualified name including module path.
+    /// e.g., `packages/react-core/src/components/Select/SelectOption.SelectOptionProps`
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub qualified_name: String,
 
     /// The kind of symbol.
     pub kind: ApiChangeKind,
@@ -775,6 +785,14 @@ pub struct MigrationTarget {
     pub removed_only_members: Vec<String>,
     /// The ratio of overlap: |matching| / |removed.members|.
     pub overlap_ratio: f64,
+    /// Base type of the removed interface (e.g., "Omit<React.HTMLProps<HTMLElement>, 'type' | 'ref'>").
+    /// Present when the old interface had an `extends` clause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_extends: Option<String>,
+    /// Base type of the replacement interface (e.g., "Omit<MenuItemProps, 'ref'>").
+    /// Present when the new interface has an `extends` clause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_extends: Option<String>,
 }
 
 /// Impact analysis: what code depends on a broken symbol.
@@ -942,4 +960,9 @@ pub struct AnalysisResult<L: Language> {
     pub container_changes: Vec<(String, Vec<ContainerChange>)>,
     pub hierarchy_deltas: Vec<HierarchyDelta>,
     pub new_hierarchies: HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
+
+    // ── v2 SD pipeline results (populated only with --pipeline-v2) ──
+    /// Source-level changes from the SD pipeline.
+    /// Empty when running the v1 (BU) pipeline.
+    pub sd_result: Option<super::sd::SdPipelineResult>,
 }

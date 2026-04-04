@@ -36,6 +36,167 @@ impl MemberFingerprint {
             param_count,
         }
     }
+
+    /// Create a fingerprint with normalized types for structural comparison.
+    ///
+    /// Replaces PascalCase type references (e.g., `ToolbarChip`) and
+    /// parameter names with placeholders so that structurally equivalent
+    /// types match even when reference names changed.
+    ///
+    /// Example: `(ToolbarChip | string)[]` → `(_T_ | string)[]`
+    fn from_symbol_normalized(sym: &Symbol) -> Self {
+        let (return_type, is_optional, param_count) = match &sym.signature {
+            Some(sig) => (
+                sig.return_type
+                    .as_ref()
+                    .map(|t| normalize_type_structure(t)),
+                sig.parameters.first().map(|p| p.optional).unwrap_or(false),
+                sig.parameters.len(),
+            ),
+            None => (None, false, 0),
+        };
+        Self {
+            kind: sym.kind,
+            return_type,
+            is_optional,
+            param_count,
+        }
+    }
+
+    /// Create a fingerprint with deep normalization that also replaces
+    /// string literal values with placeholders. This catches renames where
+    /// the enum values also changed (e.g., spacer → gap where
+    /// `'spacerNone'` → `'gapNone'`).
+    fn from_symbol_deep_normalized(sym: &Symbol) -> Self {
+        let (return_type, is_optional, param_count) = match &sym.signature {
+            Some(sig) => (
+                sig.return_type
+                    .as_ref()
+                    .map(|t| normalize_type_structure_deep(t)),
+                sig.parameters.first().map(|p| p.optional).unwrap_or(false),
+                sig.parameters.len(),
+            ),
+            None => (None, false, 0),
+        };
+        Self {
+            kind: sym.kind,
+            return_type,
+            is_optional,
+            param_count,
+        }
+    }
+}
+
+/// Normalize a type string for structural comparison by replacing
+/// PascalCase type references and parameter names with placeholders.
+///
+/// This allows matching types that are structurally identical but
+/// reference different (renamed) types:
+///   `(ToolbarChip | string)[]` → `(_T_ | string)[]`
+///   `(category: ToolbarChipGroup | string, chip: ToolbarChip | string) => void`
+///   → `(_p_: _T_ | string, _p_: _T_ | string) => void`
+fn normalize_type_structure(type_str: &str) -> String {
+    // Replace PascalCase identifiers (type references) with _T_
+    let result = regex_replace_all_pascal_case(type_str, "_T_");
+    // Replace parameter names (lowercase word before colon) with _p_
+    regex_replace_all_param_names(&result, "_p_")
+}
+
+/// Replace all PascalCase identifiers (starting with uppercase, containing
+/// at least one lowercase) with the given placeholder.
+fn regex_replace_all_pascal_case(s: &str, placeholder: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i].is_ascii_uppercase() {
+            // Check if this is a PascalCase identifier
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &s[start..i];
+            // Must contain at least one lowercase letter to be PascalCase
+            if word.chars().any(|c| c.is_ascii_lowercase()) {
+                result.push_str(placeholder);
+            } else {
+                result.push_str(word);
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
+}
+
+/// Replace parameter names (lowercase word followed by `:`) with placeholder.
+fn regex_replace_all_param_names(s: &str, placeholder: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i].is_ascii_lowercase() {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            // Check if followed by optional whitespace and colon
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == ':' {
+                result.push_str(placeholder);
+                // Keep everything from the end of the word (whitespace + colon)
+                for k in i..=j {
+                    result.push(chars[k]);
+                }
+                i = j + 1;
+            } else {
+                result.push_str(&s[start..i]);
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+/// Normalize a type string for deep structural comparison by additionally
+/// replacing string literal values with `_V_`.
+///
+/// This catches cases like `spacer: { default?: 'spacerNone' | 'spacerSm' }`
+/// vs `gap: { default?: 'gapNone' | 'gapSm' | 'gapXl' }` — the object
+/// key structure is the same, just the enum values differ.
+fn normalize_type_structure_deep(type_str: &str) -> String {
+    let step1 = normalize_type_structure(type_str);
+    // Replace quoted string literals: 'someValue' → '_V_'
+    let mut result = String::with_capacity(step1.len());
+    let mut in_quote = false;
+    for ch in step1.chars() {
+        if ch == '\'' {
+            if !in_quote {
+                in_quote = true;
+                result.push_str("'_V_'");
+            } else {
+                in_quote = false;
+                // Already pushed the closing quote placeholder
+            }
+        } else if !in_quote {
+            result.push(ch);
+        }
+        // Characters inside quotes are consumed
+    }
+    // Collapse repeated `'_V_' | '_V_'` sequences into a single `'_V_'`
+    while result.contains("'_V_' | '_V_'") {
+        result = result.replace("'_V_' | '_V_'", "'_V_'");
+    }
+    result
 }
 
 /// A detected rename: old name → new name, with the matched symbols.
@@ -93,6 +254,140 @@ pub(super) fn detect_renames<'a>(
             for (ai, asym) in added_syms {
                 let sim = name_similarity(&rsym.name, &asym.name);
                 candidates.push((ri, *ai, sim));
+            }
+        }
+    }
+
+    // ── Pass 2: Structural type fingerprint ────────────────────────────
+    //
+    // When a prop is renamed AND its type changes (e.g., chips: ToolbarChip[]
+    // → labels: ToolbarLabel[]), the exact fingerprint won't match because
+    // the return_type differs. But the type STRUCTURE is identical — only
+    // the type reference names changed (ToolbarChip → ToolbarLabel).
+    //
+    // Normalize types by replacing PascalCase identifiers and parameter
+    // names with placeholders, then fingerprint on the normalized shape.
+    // This matches `(ToolbarChip | string)[]` with `(ToolbarLabel | string)[]`
+    // but rejects `boolean` vs `number` or `SplitButtonOptions` vs `ReactNode[]`.
+    let mut structural_fp: HashMap<MemberFingerprint, Vec<(usize, &Symbol)>> = HashMap::new();
+    for (ai, sym) in added.iter().enumerate() {
+        let fp = MemberFingerprint::from_symbol_normalized(sym);
+        structural_fp.entry(fp).or_default().push((ai, sym));
+    }
+
+    for (ri, rsym) in removed.iter().enumerate() {
+        let fp = MemberFingerprint::from_symbol_normalized(rsym);
+
+        if let Some(added_syms) = structural_fp.get(&fp) {
+            if added_syms.len() > MAX_GROUP_SIZE {
+                continue;
+            }
+            for (ai, asym) in added_syms {
+                let already = candidates.iter().any(|(r, a, _)| *r == ri && *a == *ai);
+                if already {
+                    continue;
+                }
+                let sim = name_similarity(&rsym.name, &asym.name);
+                if sim >= MIN_SIMILARITY {
+                    candidates.push((ri, *ai, sim));
+                }
+            }
+        }
+    }
+
+    // ── Pass 3: Deep structural fingerprint (string literals normalized) ──
+    //
+    // Catches renames where the enum values also changed alongside the prop
+    // name. E.g., spacer: { default?: 'spacerNone' | 'spacerSm' } →
+    // gap: { default?: 'gapNone' | 'gapSm' | 'gapXl' }. After deep
+    // normalization, both become { _p_: '_V_'; _p_: '_V_'; ... }.
+    let mut deep_fp: HashMap<MemberFingerprint, Vec<(usize, &Symbol)>> = HashMap::new();
+    for (ai, sym) in added.iter().enumerate() {
+        let fp = MemberFingerprint::from_symbol_deep_normalized(sym);
+        deep_fp.entry(fp).or_default().push((ai, sym));
+    }
+
+    for (ri, rsym) in removed.iter().enumerate() {
+        let fp = MemberFingerprint::from_symbol_deep_normalized(rsym);
+
+        if let Some(added_syms) = deep_fp.get(&fp) {
+            if added_syms.len() > MAX_GROUP_SIZE {
+                continue;
+            }
+            for (ai, asym) in added_syms {
+                let already = candidates.iter().any(|(r, a, _)| *r == ri && *a == *ai);
+                if already {
+                    continue;
+                }
+                let sim = name_similarity(&rsym.name, &asym.name);
+                if sim >= MIN_SIMILARITY {
+                    candidates.push((ri, *ai, sim));
+                }
+            }
+        }
+    }
+
+    // ── Pass 4: Name-similarity fallback for same-interface properties ──
+    //
+    // When a prop is renamed AND its type fundamentally changes (e.g.,
+    // splitButtonOptions: SplitButtonOptions → splitButtonItems: ReactNode[]),
+    // all fingerprint passes fail because the types are structurally different.
+    // But the names share a long common prefix ("splitButton"), strongly
+    // suggesting they're related.
+    //
+    // For properties on the same parent interface, match by name similarity
+    // alone with a higher threshold (≥0.6) to compensate for the lack of
+    // type signal. Only considers Property symbols to avoid false matches
+    // on methods/functions.
+    {
+        const NAME_ONLY_SIMILARITY: f64 = 0.6;
+
+        // Group removed and added by parent qualified name
+        let mut removed_by_parent: HashMap<&str, Vec<(usize, &Symbol)>> = HashMap::new();
+        let mut added_by_parent: HashMap<&str, Vec<(usize, &Symbol)>> = HashMap::new();
+
+        for (ri, rsym) in removed.iter().enumerate() {
+            if rsym.kind != SymbolKind::Property {
+                continue;
+            }
+            if let Some((parent, _)) = rsym.qualified_name.rsplit_once('.') {
+                removed_by_parent
+                    .entry(parent)
+                    .or_default()
+                    .push((ri, rsym));
+            }
+        }
+        for (ai, asym) in added.iter().enumerate() {
+            if asym.kind != SymbolKind::Property {
+                continue;
+            }
+            if let Some((parent, _)) = asym.qualified_name.rsplit_once('.') {
+                added_by_parent.entry(parent).or_default().push((ai, asym));
+            }
+        }
+
+        for (parent, removed_props) in &removed_by_parent {
+            let added_props = match added_by_parent.get(parent) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // Cap to avoid O(n*m) on large interfaces
+            if removed_props.len() > MAX_GROUP_SIZE || added_props.len() > MAX_GROUP_SIZE {
+                continue;
+            }
+
+            for (ri, rsym) in removed_props {
+                for (ai, asym) in added_props {
+                    let already = candidates.iter().any(|(r, a, _)| *r == *ri && *a == *ai);
+                    if already {
+                        continue;
+                    }
+                    let sim = name_similarity(&rsym.name, &asym.name);
+                    if sim >= NAME_ONLY_SIMILARITY {
+                        candidates.push((*ri, *ai, sim));
+                    }
+                }
             }
         }
     }
@@ -1018,6 +1313,99 @@ mod token_tests {
             // Some critical tokens may not match in this pool — that's OK,
             // the value-based fallback depends on type annotations.
         }
+    }
+
+    fn make_prop(name: &str, parent: &str, return_type: &str) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            qualified_name: format!("{}.{}", parent, name),
+            kind: SymbolKind::Property,
+            visibility: Visibility::Public,
+            file: PathBuf::from("test.d.ts"),
+            package: Some("@test/pkg".to_string()),
+            import_path: None,
+            line: 1,
+            signature: Some(Signature {
+                return_type: Some(return_type.to_string()),
+                parameters: vec![],
+                is_async: false,
+                type_parameters: vec![],
+            }),
+            extends: None,
+            implements: vec![],
+            is_abstract: false,
+            type_dependencies: vec![],
+            is_readonly: false,
+            is_static: false,
+            accessor_kind: None,
+            members: vec![],
+            rendered_components: vec![],
+            css: vec![],
+        }
+    }
+
+    #[test]
+    fn test_pass4_name_similarity_same_interface() {
+        // Pass 4: different types on same interface, matched by name similarity
+        let removed = vec![make_prop(
+            "splitButtonOptions",
+            "MenuToggle.MenuToggleProps",
+            "SplitButtonOptions",
+        )];
+        let added = vec![make_prop(
+            "splitButtonItems",
+            "MenuToggle.MenuToggleProps",
+            "ReactNode[]",
+        )];
+
+        let removed_refs: Vec<&Symbol> = removed.iter().collect();
+        let added_refs: Vec<&Symbol> = added.iter().collect();
+        let matches = detect_renames(&removed_refs, &added_refs);
+
+        assert_eq!(matches.len(), 1, "Should match via Pass 4 name similarity");
+        assert_eq!(matches[0].old.name, "splitButtonOptions");
+        assert_eq!(matches[0].new.name, "splitButtonItems");
+    }
+
+    #[test]
+    fn test_pass4_rejects_low_similarity() {
+        // Names are too different — should NOT match
+        let removed = vec![make_prop("isOpen", "Dropdown.DropdownProps", "boolean")];
+        let added = vec![make_prop("isDisabled", "Dropdown.DropdownProps", "string")];
+
+        let removed_refs: Vec<&Symbol> = removed.iter().collect();
+        let added_refs: Vec<&Symbol> = added.iter().collect();
+        let matches = detect_renames(&removed_refs, &added_refs);
+
+        // similarity("isOpen", "isDisabled") ≈ 0.4 — below 0.6 threshold
+        assert!(
+            matches.is_empty(),
+            "Should not match props with low name similarity"
+        );
+    }
+
+    #[test]
+    fn test_pass4_different_interfaces_no_match() {
+        // Same name pattern but different parent interfaces — should NOT match
+        let removed = vec![make_prop(
+            "splitButtonOptions",
+            "MenuToggle.MenuToggleProps",
+            "SplitButtonOptions",
+        )];
+        let added = vec![make_prop(
+            "splitButtonItems",
+            "Button.ButtonProps",
+            "ReactNode[]",
+        )];
+
+        let removed_refs: Vec<&Symbol> = removed.iter().collect();
+        let added_refs: Vec<&Symbol> = added.iter().collect();
+        let matches = detect_renames(&removed_refs, &added_refs);
+
+        assert!(
+            matches.is_empty(),
+            "Should not match props from different interfaces"
+        );
     }
 }
 
