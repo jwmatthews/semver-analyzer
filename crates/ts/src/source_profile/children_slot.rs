@@ -391,6 +391,11 @@ fn find_children_in_statement<'a>(
                 }
             }
         }
+        Statement::ClassDeclaration(class) => {
+            if find_children_in_class_body(&class.body, source, path, aliases) {
+                return true;
+            }
+        }
         _ => {}
     }
     false
@@ -421,7 +426,41 @@ fn find_children_in_declaration<'a>(
                 }
             }
         }
+        Declaration::ClassDeclaration(class) => {
+            if find_children_in_class_body(&class.body, source, path, aliases) {
+                return true;
+            }
+        }
         _ => {}
+    }
+    false
+}
+
+/// Walk a class body looking for a `render()` method and trace its return
+/// for `{children}` or `{this.props.children}`.
+fn find_children_in_class_body<'a>(
+    body: &'a ClassBody<'a>,
+    source: &str,
+    path: &mut Vec<String>,
+    aliases: &HashMap<String, String>,
+) -> bool {
+    for element in &body.body {
+        if let ClassElement::MethodDefinition(method) = element {
+            // Match render() method by name
+            let is_render = match &method.key {
+                PropertyKey::StaticIdentifier(id) => id.name == "render",
+                _ => false,
+            };
+            if is_render {
+                if let Some(body) = &method.value.body {
+                    for stmt in &body.statements {
+                        if find_children_in_statement(stmt, source, path, aliases) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
     }
     false
 }
@@ -610,8 +649,19 @@ fn is_children_expr_inner(expr: &Expression) -> bool {
     match expr {
         Expression::Identifier(id) => id.name == "children",
         Expression::StaticMemberExpression(member) => {
-            member.property.name == "children"
-                && matches!(&member.object, Expression::Identifier(id) if id.name == "props")
+            if member.property.name != "children" {
+                return false;
+            }
+            // Match props.children
+            if matches!(&member.object, Expression::Identifier(id) if id.name == "props") {
+                return true;
+            }
+            // Match this.props.children (class components)
+            if let Expression::StaticMemberExpression(inner) = &member.object {
+                return inner.property.name == "props"
+                    && matches!(&inner.object, Expression::ThisExpression(_));
+            }
+            false
         }
         // Handle {mergedChildren || children}, {x ?? children}, {x && children}
         Expression::LogicalExpression(logical) => {

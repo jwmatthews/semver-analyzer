@@ -555,6 +555,127 @@ fn infer_dom_nesting(
     }
 
     tree.edges.extend(new_edges);
+
+    // ── Flow container fallback ─────────────────────────────────────
+    //
+    // Last-resort: for components still only connected to the root,
+    // check if a sibling renders a flow content container (<section>,
+    // <div>, etc.) wrapping {children}. If so, a <ul>/<ol>-rendering
+    // component likely goes inside it (e.g., MenuGroup <section> wraps
+    // MenuList <ul>).
+    //
+    // Only applies when:
+    //   - The child is NOT the family root (prevents DataList root edge)
+    //   - The child is still a direct child of root (no other parent)
+    //   - The child renders <ul> or <ol> as its root element
+    //   - The parent renders a flow container wrapping {children}
+    //   - No existing edge from parent to child
+    let flow_containers = [
+        "section", "div", "article", "aside", "main", "nav", "header", "footer",
+    ];
+    let list_tags = ["ul", "ol"];
+
+    let root_children: Vec<String> = tree
+        .edges
+        .iter()
+        .filter(|e| e.parent == tree.root)
+        .map(|e| e.child.clone())
+        .collect();
+
+    let mut flow_edges = Vec::new();
+    for child_name in &root_children {
+        if child_name == &tree.root {
+            continue;
+        }
+        // Only consider children that have no other parent (still root-level)
+        let has_other_parent = tree
+            .edges
+            .iter()
+            .any(|e| e.child == *child_name && e.parent != tree.root);
+        if has_other_parent {
+            continue;
+        }
+
+        let child_profile = match profiles.get(child_name) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Check if this child renders <ul> or <ol>
+        let child_root = child_profile
+            .children_slot_path
+            .first()
+            .filter(|e| e.starts_with(|c: char| c.is_lowercase()))
+            .cloned()
+            .or_else(|| infer_root_element(child_profile));
+
+        let is_list = child_root
+            .as_ref()
+            .map_or(false, |r| list_tags.contains(&r.as_str()));
+        if !is_list {
+            continue;
+        }
+
+        // Find a flow container sibling that could wrap this child
+        for parent_name in family_exports {
+            if parent_name == child_name || parent_name == &tree.root {
+                continue;
+            }
+            let existing_edge = tree
+                .edges
+                .iter()
+                .any(|e| e.parent == *parent_name && e.child == *child_name);
+            if existing_edge {
+                continue;
+            }
+
+            let parent_profile = match profiles.get(parent_name) {
+                Some(p) => p,
+                None => continue,
+            };
+            if !parent_profile.has_children_prop {
+                continue;
+            }
+
+            let parent_slot = parent_profile
+                .children_slot_path
+                .iter()
+                .rev()
+                .find(|e| e.starts_with(|c: char| c.is_lowercase()));
+
+            let is_flow = parent_slot.map_or(false, |s| flow_containers.contains(&s.as_str()));
+            if !is_flow {
+                continue;
+            }
+
+            // Verify this parent is itself a root-level child (not deeply nested)
+            let parent_is_root_child = tree
+                .edges
+                .iter()
+                .any(|e| e.parent == tree.root && e.child == *parent_name);
+            if !parent_is_root_child {
+                continue;
+            }
+
+            flow_edges.push((parent_name.clone(), child_name.clone()));
+            break; // Only assign to first matching flow container
+        }
+    }
+
+    for (parent, child) in flow_edges {
+        tree.edges
+            .retain(|e| !(e.parent == tree.root && e.child == child));
+        tree.edges.push(CompositionEdge {
+            parent: parent.clone(),
+            child: child.clone(),
+            relationship: ChildRelationship::DirectChild,
+            required: false,
+            bem_evidence: Some(format!(
+                "Flow container nesting: {} renders <ul>/<ol>, {} wraps {{children}} in flow container",
+                child, parent
+            )),
+        });
+    }
 }
 
 /// Infer parent→child edges from React Context provider→consumer relationships.

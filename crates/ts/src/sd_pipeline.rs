@@ -872,112 +872,130 @@ fn enrich_trees_with_css(
         // A non-grid item must be inside SOME flex/grid container that IS a
         // grid item or promoted_grid item. Among the containers, pick the one
         // that is itself a flex container (display: flex).
-        let unassigned: Vec<&str> = non_grid
-            .iter()
-            .filter(|member| {
-                !tree
-                    .edges
-                    .iter()
-                    .any(|e| e.child == **member && e.parent != tree.root)
-            })
-            .copied()
-            .collect();
-
-        if !unassigned.is_empty() {
-            // For each unassigned non-grid item, find which flex container
-            // it belongs to. Prefer the promoted_grid container (e.g., brand
-            // is a flex container inside main) over stable_grid containers
-            // (e.g., content is a flex container at root level).
-            //
-            // Heuristic: a non-grid item likely belongs in a flex container
-            // whose BEM element name is a prefix of the non-grid item's
-            // element name (e.g., "logo" could go in "brand" or "content",
-            // but if we can't determine, pick the most specific container).
-            let all_flex_containers: Vec<(&str, &str)> = member_to_element
+        //
+        // GUARD: Only run this heuristic when there IS a grid context (at
+        // least one element has grid-column). Without grid signals, the
+        // layout is not grid-based and BEM siblings should stay as direct
+        // children of root. The flex-container heuristic was designed for
+        // Masthead-style CSS grid layouts; applying it to pure-flex families
+        // like Card, EmptyState, or Toolbar incorrectly nests siblings.
+        if stable_grid.is_empty() && promoted_grid.is_empty() {
+            debug!(
+                family = %tree.root,
+                non_grid = ?non_grid,
+                "Skipping flex-container fallback — no grid context"
+            );
+            // Fall through to CSS descendant nesting below
+        } else {
+            let unassigned: Vec<&str> = non_grid
                 .iter()
-                .filter(|(member, element)| {
-                    **member != tree.root
-                        && mode_switcher.map_or(true, |s| s != **member)
-                        && lookup_css_el(element)
-                            .map_or(false, |info| info.display_values.contains("flex"))
-                })
-                .map(|(member, element)| (*member, element.as_str()))
-                .collect();
-
-            for &member in &unassigned {
-                let member_element = &member_to_element[member];
-
-                // Try to find a container whose variable_child_refs include this element
-                let via_var_ref = all_flex_containers.iter().find(|(_, el)| {
-                    lookup_css_el(el).map_or(false, |info| {
-                        info.variable_child_refs.contains(member_element.as_str())
-                    })
-                });
-
-                let container = if let Some((c, _)) = via_var_ref {
-                    Some(*c)
-                } else if all_flex_containers.len() == 1 {
-                    Some(all_flex_containers[0].0)
-                } else {
-                    // Multiple flex containers — use sizing heuristic:
-                    // A sized non-grid element (width/max-height) goes in
-                    // the rigid flex container (flex-shrink: 0), not in
-                    // the wrapping one (flex-wrap: wrap).
-                    let child_has_sizing =
-                        lookup_css_el(member_element).map_or(false, |info| info.has_sizing);
-
-                    if child_has_sizing {
-                        // Find the rigid (non-wrapping) flex container
-                        all_flex_containers
-                            .iter()
-                            .find(|(_, el)| {
-                                lookup_css_el(el)
-                                    .map_or(false, |info| info.flex_shrink_zero && !info.flex_wrap)
-                            })
-                            .map(|(c, _)| *c)
-                    } else {
-                        // Non-sized element → prefer the wrapping container
-                        all_flex_containers
-                            .iter()
-                            .find(|(_, el)| lookup_css_el(el).map_or(false, |info| info.flex_wrap))
-                            .map(|(c, _)| *c)
-                    }
-                };
-
-                if let Some(container) = container {
-                    // Guard: skip self-referential edges
-                    if container == member {
-                        continue;
-                    }
-                    // Guard: skip if CSS proves they are siblings
-                    if are_css_siblings(container, member) {
-                        debug!(
-                            family = %tree.root,
-                            parent = %container,
-                            child = %member,
-                            "CSS siblings — skipping flex container nesting"
-                        );
-                        continue;
-                    }
-                    // Guard: skip if :has() proves child is root-level
-                    if is_root_level_child(member) {
-                        debug!(
-                            family = %tree.root,
-                            parent = %container,
-                            child = %member,
-                            "CSS :has() proves root-level child — skipping flex container nesting"
-                        );
-                        continue;
-                    }
-                    tree.edges
-                        .retain(|e| !(e.parent == tree.root && e.child == member));
-                    if !tree
+                .filter(|member| {
+                    !tree
                         .edges
                         .iter()
-                        .any(|e| e.parent == container && e.child == member)
-                    {
+                        .any(|e| e.child == **member && e.parent != tree.root)
+                })
+                .copied()
+                .collect();
+
+            if !unassigned.is_empty() {
+                // For each unassigned non-grid item, find which flex container
+                // it belongs to. Prefer the promoted_grid container (e.g., brand
+                // is a flex container inside main) over stable_grid containers
+                // (e.g., content is a flex container at root level).
+                //
+                // Heuristic: a non-grid item likely belongs in a flex container
+                // whose BEM element name is a prefix of the non-grid item's
+                // element name (e.g., "logo" could go in "brand" or "content",
+                // but if we can't determine, pick the most specific container).
+                let all_flex_containers: Vec<(&str, &str)> = member_to_element
+                    .iter()
+                    .filter(|(member, element)| {
+                        **member != tree.root
+                            && mode_switcher.map_or(true, |s| s != **member)
+                            && lookup_css_el(element)
+                                .map_or(false, |info| info.display_values.contains("flex"))
+                    })
+                    .map(|(member, element)| (*member, element.as_str()))
+                    .collect();
+
+                for &member in &unassigned {
+                    let member_element = &member_to_element[member];
+
+                    // Try to find a container whose variable_child_refs include this element
+                    let via_var_ref = all_flex_containers.iter().find(|(_, el)| {
+                        lookup_css_el(el).map_or(false, |info| {
+                            info.variable_child_refs.contains(member_element.as_str())
+                        })
+                    });
+
+                    let container = if let Some((c, _)) = via_var_ref {
+                        Some(*c)
+                    } else if all_flex_containers.len() == 1 {
+                        Some(all_flex_containers[0].0)
+                    } else {
+                        // Multiple flex containers — use sizing heuristic:
+                        // A sized non-grid element (width/max-height) goes in
+                        // the rigid flex container (flex-shrink: 0), not in
+                        // the wrapping one (flex-wrap: wrap).
+                        let child_has_sizing =
+                            lookup_css_el(member_element).map_or(false, |info| info.has_sizing);
+
+                        if child_has_sizing {
+                            // Find the rigid (non-wrapping) flex container
+                            all_flex_containers
+                                .iter()
+                                .find(|(_, el)| {
+                                    lookup_css_el(el).map_or(false, |info| {
+                                        info.flex_shrink_zero && !info.flex_wrap
+                                    })
+                                })
+                                .map(|(c, _)| *c)
+                        } else {
+                            // Non-sized element → prefer the wrapping container
+                            all_flex_containers
+                                .iter()
+                                .find(|(_, el)| {
+                                    lookup_css_el(el).map_or(false, |info| info.flex_wrap)
+                                })
+                                .map(|(c, _)| *c)
+                        }
+                    };
+
+                    if let Some(container) = container {
+                        // Guard: skip self-referential edges
+                        if container == member {
+                            continue;
+                        }
+                        // Guard: skip if CSS proves they are siblings
+                        if are_css_siblings(container, member) {
+                            debug!(
+                                family = %tree.root,
+                                parent = %container,
+                                child = %member,
+                                "CSS siblings — skipping flex container nesting"
+                            );
+                            continue;
+                        }
+                        // Guard: skip if :has() proves child is root-level
+                        if is_root_level_child(member) {
+                            debug!(
+                                family = %tree.root,
+                                parent = %container,
+                                child = %member,
+                                "CSS :has() proves root-level child — skipping flex container nesting"
+                            );
+                            continue;
+                        }
                         tree.edges
-                            .push(semver_analyzer_core::types::sd::CompositionEdge {
+                            .retain(|e| !(e.parent == tree.root && e.child == member));
+                        if !tree
+                            .edges
+                            .iter()
+                            .any(|e| e.parent == container && e.child == member)
+                        {
+                            tree.edges
+                                .push(semver_analyzer_core::types::sd::CompositionEdge {
                                 parent: container.to_string(),
                                 child: member.to_string(),
                                 relationship:
@@ -988,10 +1006,11 @@ fn enrich_trees_with_css(
                                 member, container
                             )),
                             });
+                        }
                     }
                 }
             }
-        }
+        } // end else: has grid context
 
         // ── CSS descendant nesting ──────────────────────────────────────
         //
