@@ -756,6 +756,49 @@ fn enrich_trees_with_css(
             "CSS grid classification"
         );
 
+        // Build a set of sibling pairs from CSS `+` / `~` selectors.
+        // If two elements have a sibling relationship in CSS, they must NOT
+        // be nested — the flex-container heuristic must not create a
+        // parent→child edge between them.
+        let css_siblings: HashSet<(String, String)> = css_prof
+            .sibling_relationships
+            .iter()
+            .flat_map(|(a, b)| {
+                let a_norm = a.replace('-', "");
+                let b_norm = b.replace('-', "");
+                vec![(a_norm.clone(), b_norm.clone()), (b_norm, a_norm)]
+            })
+            .collect();
+
+        // Build a set of elements that :has() selectors prove are direct
+        // children of the block root (parent == ""). When :has(> .child)
+        // appears on the block root, the child is root-level and must NOT
+        // be nested inside a sibling element.
+        let root_level_children: HashSet<String> = css_prof
+            .has_containment
+            .iter()
+            .filter(|(parent, _)| parent.is_empty())
+            .map(|(_, child)| child.replace('-', ""))
+            .collect();
+
+        // Helper: check if two elements are CSS siblings
+        let are_css_siblings = |parent_member: &str, child_member: &str| -> bool {
+            let parent_el = member_to_element.get(parent_member);
+            let child_el = member_to_element.get(child_member);
+            if let (Some(p), Some(c)) = (parent_el, child_el) {
+                css_siblings.contains(&(p.clone(), c.clone()))
+            } else {
+                false
+            }
+        };
+
+        // Helper: check if a member is proven to be a root-level child via :has()
+        let is_root_level_child = |member: &str| -> bool {
+            member_to_element
+                .get(member)
+                .map_or(false, |el| root_level_children.contains(el))
+        };
+
         // Move promoted_grid items under the mode-switcher (skip self)
         if let Some(switcher) = mode_switcher {
             for &member in &promoted_grid {
@@ -902,6 +945,30 @@ fn enrich_trees_with_css(
                 };
 
                 if let Some(container) = container {
+                    // Guard: skip self-referential edges
+                    if container == member {
+                        continue;
+                    }
+                    // Guard: skip if CSS proves they are siblings
+                    if are_css_siblings(container, member) {
+                        debug!(
+                            family = %tree.root,
+                            parent = %container,
+                            child = %member,
+                            "CSS siblings — skipping flex container nesting"
+                        );
+                        continue;
+                    }
+                    // Guard: skip if :has() proves child is root-level
+                    if is_root_level_child(member) {
+                        debug!(
+                            family = %tree.root,
+                            parent = %container,
+                            child = %member,
+                            "CSS :has() proves root-level child — skipping flex container nesting"
+                        );
+                        continue;
+                    }
                     tree.edges
                         .retain(|e| !(e.parent == tree.root && e.child == member));
                     if !tree
@@ -962,6 +1029,10 @@ fn enrich_trees_with_css(
                 .copied();
 
             if let (Some(parent), Some(child)) = (parent_member, child_member) {
+                // Skip self-referential edges
+                if parent == child {
+                    continue;
+                }
                 // Skip if this edge already exists
                 if tree
                     .edges
@@ -1727,5 +1798,366 @@ export { DropdownList } from './DropdownList';
         assert_eq!(files[0].component_name, "Modal");
         assert_eq!(files[1].component_name, "ModalHeader");
         assert_eq!(files[0].family, Some("Modal".to_string()));
+    }
+
+    // ── CSS enrichment guard tests ──────────────────────────────────
+
+    use crate::css_profile::{CssBlockProfile, CssElementInfo};
+    use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree};
+    use std::collections::BTreeMap;
+
+    fn make_css_element(display: &str, is_flex: bool) -> CssElementInfo {
+        let mut info = CssElementInfo::default();
+        info.display_values.insert(display.to_string());
+        if is_flex {
+            info.display_values.insert("flex".to_string());
+        }
+        info
+    }
+
+    fn make_source_profile(name: &str) -> ComponentSourceProfile {
+        ComponentSourceProfile {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn make_source_profile_with_block(name: &str, block: &str) -> ComponentSourceProfile {
+        ComponentSourceProfile {
+            name: name.to_string(),
+            bem_block: Some(block.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Real PatternFly case: PageSidebar has a self-referential edge
+    /// (PageSidebar → PageSidebar) from the CSS enrichment because
+    /// the sidebar element is a flex container and also appears as a
+    /// non-grid element. The self-referential guard must block this.
+    #[test]
+    fn test_self_referential_edge_blocked_page_sidebar() {
+        // Simulate the Page family: PageSidebar and PageSidebarBody
+        let mut trees = vec![CompositionTree {
+            root: "Page".into(),
+            family_members: vec![
+                "Page".into(),
+                "PageSidebar".into(),
+                "PageSidebarBody".into(),
+            ],
+            edges: vec![
+                CompositionEdge {
+                    parent: "Page".into(),
+                    child: "PageSidebar".into(),
+                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("BEM element".into()),
+                },
+                CompositionEdge {
+                    parent: "Page".into(),
+                    child: "PageSidebarBody".into(),
+                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("BEM element".into()),
+                },
+            ],
+        }];
+
+        // CSS profile: sidebar is a flex container, sidebar-body has no grid-column
+        let mut elements = BTreeMap::new();
+        elements.insert("sidebar".to_string(), {
+            let mut info = CssElementInfo::default();
+            info.display_values.insert("flex".to_string());
+            info
+        });
+        elements.insert("sidebar-body".to_string(), CssElementInfo::default());
+
+        let css_profile = CssBlockProfile {
+            block: "page".into(),
+            elements,
+            has_containment: vec![],
+            descendant_nesting: vec![],
+            sibling_relationships: vec![],
+        };
+
+        let mut css_profiles = HashMap::new();
+        css_profiles.insert("page".to_string(), css_profile);
+
+        let mut react_profiles = HashMap::new();
+        react_profiles.insert(
+            "Page".to_string(),
+            make_source_profile_with_block("Page", "page"),
+        );
+        react_profiles.insert(
+            "PageSidebar".to_string(),
+            make_source_profile("PageSidebar"),
+        );
+        react_profiles.insert(
+            "PageSidebarBody".to_string(),
+            make_source_profile("PageSidebarBody"),
+        );
+
+        enrich_trees_with_css(&mut trees, &css_profiles, &react_profiles);
+
+        // There must NOT be a PageSidebar → PageSidebar edge
+        let self_edges: Vec<_> = trees[0]
+            .edges
+            .iter()
+            .filter(|e| e.parent == e.child)
+            .collect();
+        assert!(
+            self_edges.is_empty(),
+            "Self-referential edges must be blocked. Found: {:?}",
+            self_edges
+        );
+    }
+
+    /// Real PatternFly case: TextInputGroupMain and TextInputGroupUtilities
+    /// are siblings under TextInputGroup. CSS has
+    /// `.pf-v6-c-text-input-group:has(> .pf-v6-c-text-input-group__utilities)`
+    /// proving utilities is a root-level direct child, NOT inside main.
+    #[test]
+    fn test_has_containment_prevents_sibling_nesting_textinputgroup() {
+        let mut trees = vec![CompositionTree {
+            root: "TextInputGroup".into(),
+            family_members: vec![
+                "TextInputGroup".into(),
+                "TextInputGroupMain".into(),
+                "TextInputGroupUtilities".into(),
+            ],
+            edges: vec![
+                CompositionEdge {
+                    parent: "TextInputGroup".into(),
+                    child: "TextInputGroupMain".into(),
+                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("BEM element".into()),
+                },
+                CompositionEdge {
+                    parent: "TextInputGroup".into(),
+                    child: "TextInputGroupUtilities".into(),
+                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("BEM element".into()),
+                },
+            ],
+        }];
+
+        let mut elements = BTreeMap::new();
+        elements.insert("main".to_string(), {
+            let mut info = CssElementInfo::default();
+            info.display_values.insert("flex".to_string());
+            info
+        });
+        elements.insert("utilities".to_string(), {
+            let mut info = CssElementInfo::default();
+            info.display_values.insert("flex".to_string());
+            info
+        });
+
+        let css_profile = CssBlockProfile {
+            block: "text-input-group".into(),
+            elements,
+            has_containment: vec![("".to_string(), "utilities".to_string())],
+            descendant_nesting: vec![],
+            sibling_relationships: vec![],
+        };
+
+        let mut css_profiles = HashMap::new();
+        css_profiles.insert("text-input-group".to_string(), css_profile);
+
+        let mut react_profiles = HashMap::new();
+        react_profiles.insert(
+            "TextInputGroup".into(),
+            make_source_profile_with_block("TextInputGroup", "text-input-group"),
+        );
+        react_profiles.insert(
+            "TextInputGroupMain".into(),
+            make_source_profile("TextInputGroupMain"),
+        );
+        react_profiles.insert(
+            "TextInputGroupUtilities".into(),
+            make_source_profile("TextInputGroupUtilities"),
+        );
+
+        enrich_trees_with_css(&mut trees, &css_profiles, &react_profiles);
+
+        let bad_nesting: Vec<_> = trees[0]
+            .edges
+            .iter()
+            .filter(|e| e.parent == "TextInputGroupMain" && e.child == "TextInputGroupUtilities")
+            .collect();
+        assert!(
+            bad_nesting.is_empty(),
+            "TextInputGroupUtilities must NOT be nested inside TextInputGroupMain. Found: {:?}",
+            bad_nesting
+        );
+
+        let root_edges: Vec<_> = trees[0]
+            .edges
+            .iter()
+            .filter(|e| e.parent == "TextInputGroup" && e.child == "TextInputGroupUtilities")
+            .collect();
+        assert!(
+            !root_edges.is_empty(),
+            "TextInputGroupUtilities should remain as a child of TextInputGroup"
+        );
+    }
+
+    /// Real PatternFly case: Card header contains title (proven by CSS
+    /// `.pf-v6-c-card__header .pf-v6-c-card__title`). Valid nesting.
+    #[test]
+    fn test_css_descendant_nesting_card_header_title() {
+        let mut trees = vec![CompositionTree {
+            root: "Card".into(),
+            family_members: vec![
+                "Card".into(),
+                "CardHeader".into(),
+                "CardTitle".into(),
+                "CardBody".into(),
+            ],
+            edges: vec![
+                CompositionEdge {
+                    parent: "Card".into(),
+                    child: "CardHeader".into(),
+                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("BEM element".into()),
+                },
+                CompositionEdge {
+                    parent: "Card".into(),
+                    child: "CardTitle".into(),
+                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("BEM element".into()),
+                },
+                CompositionEdge {
+                    parent: "Card".into(),
+                    child: "CardBody".into(),
+                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("BEM element".into()),
+                },
+            ],
+        }];
+
+        let mut elements = BTreeMap::new();
+        elements.insert("header".to_string(), {
+            let mut info = CssElementInfo::default();
+            info.display_values.insert("flex".to_string());
+            info
+        });
+        elements.insert("title".to_string(), CssElementInfo::default());
+        elements.insert("body".to_string(), CssElementInfo::default());
+
+        let css_profile = CssBlockProfile {
+            block: "card".into(),
+            elements,
+            has_containment: vec![],
+            descendant_nesting: vec![("header".to_string(), "title".to_string())],
+            sibling_relationships: vec![],
+        };
+
+        let mut css_profiles = HashMap::new();
+        css_profiles.insert("card".to_string(), css_profile);
+
+        let mut react_profiles = HashMap::new();
+        react_profiles.insert(
+            "Card".into(),
+            make_source_profile_with_block("Card", "card"),
+        );
+        react_profiles.insert("CardHeader".into(), make_source_profile("CardHeader"));
+        react_profiles.insert("CardTitle".into(), make_source_profile("CardTitle"));
+        react_profiles.insert("CardBody".into(), make_source_profile("CardBody"));
+
+        enrich_trees_with_css(&mut trees, &css_profiles, &react_profiles);
+
+        let header_title: Vec<_> = trees[0]
+            .edges
+            .iter()
+            .filter(|e| e.parent == "CardHeader" && e.child == "CardTitle")
+            .collect();
+        assert!(
+            !header_title.is_empty(),
+            "CardHeader → CardTitle should be created from CSS descendant selector"
+        );
+
+        let root_title: Vec<_> = trees[0]
+            .edges
+            .iter()
+            .filter(|e| e.parent == "Card" && e.child == "CardTitle")
+            .collect();
+        assert!(
+            root_title.is_empty(),
+            "Card → CardTitle root edge should be removed (subsumed by CardHeader → CardTitle)"
+        );
+    }
+
+    /// CSS sibling selectors prevent nesting.
+    #[test]
+    fn test_css_sibling_selector_prevents_nesting() {
+        let mut trees = vec![CompositionTree {
+            root: "Page".into(),
+            family_members: vec![
+                "Page".into(),
+                "PageSidebar".into(),
+                "PageMainContainer".into(),
+            ],
+            edges: vec![
+                CompositionEdge {
+                    parent: "Page".into(),
+                    child: "PageSidebar".into(),
+                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("BEM element".into()),
+                },
+                CompositionEdge {
+                    parent: "Page".into(),
+                    child: "PageMainContainer".into(),
+                    relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("BEM element".into()),
+                },
+            ],
+        }];
+
+        let mut elements = BTreeMap::new();
+        elements.insert("sidebar".to_string(), {
+            let mut info = CssElementInfo::default();
+            info.display_values.insert("flex".to_string());
+            info
+        });
+        elements.insert("main-container".to_string(), CssElementInfo::default());
+
+        let css_profile = CssBlockProfile {
+            block: "page".into(),
+            elements,
+            has_containment: vec![],
+            descendant_nesting: vec![],
+            sibling_relationships: vec![("sidebar".to_string(), "main-container".to_string())],
+        };
+
+        let mut css_profiles = HashMap::new();
+        css_profiles.insert("page".to_string(), css_profile);
+
+        let mut react_profiles = HashMap::new();
+        react_profiles.insert(
+            "Page".into(),
+            make_source_profile_with_block("Page", "page"),
+        );
+        react_profiles.insert("PageSidebar".into(), make_source_profile("PageSidebar"));
+        react_profiles.insert(
+            "PageMainContainer".into(),
+            make_source_profile("PageMainContainer"),
+        );
+
+        enrich_trees_with_css(&mut trees, &css_profiles, &react_profiles);
+
+        let bad_nesting: Vec<_> = trees[0]
+            .edges
+            .iter()
+            .filter(|e| e.parent == "PageSidebar" && e.child == "PageMainContainer")
+            .collect();
+        assert!(bad_nesting.is_empty(),
+            "CSS sibling selector proves PageMainContainer is a sibling of PageSidebar. Found: {:?}", bad_nesting);
     }
 }

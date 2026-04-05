@@ -621,6 +621,7 @@ pub fn generate_rules(
                     // Don't filter on the matched component's import source —
                     // we want to catch app-level icons too (e.g., ContextIcon).
                     from: None,
+                    file_pattern: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
@@ -866,6 +867,7 @@ pub fn generate_rules(
                             parent: None,
                             value: None,
                             from: Some(pkg.name.clone()),
+                            file_pattern: None,
                             parent_from: None,
                             not_parent: None,
                             not_child: None,
@@ -1260,6 +1262,7 @@ pub fn generate_rules(
                                         parent: None,
                                         value: None,
                                         from: Some(format!("{}/deprecated", pkg.name)),
+                                        file_pattern: None,
                                         parent_from: None,
                                         not_parent: None,
                                         not_child: None,
@@ -1273,6 +1276,7 @@ pub fn generate_rules(
                                         parent: None,
                                         value: None,
                                         from: Some(pkg.name.clone()),
+                                        file_pattern: None,
                                         parent_from: None,
                                         not_parent: None,
                                         not_child: None,
@@ -1289,6 +1293,7 @@ pub fn generate_rules(
                                 parent: None,
                                 value: None,
                                 from: Some(pkg.name.clone()),
+                                file_pattern: None,
                                 parent_from: None,
                                 not_parent: None,
                                 not_child: None,
@@ -1545,6 +1550,7 @@ pub fn generate_rules(
                     parent: Some(entry.parent.clone()),
                     value: None,
                     from: entry.package.clone(),
+                    file_pattern: None,
                     parent_from: None,
                     not_parent: None,
                     not_child: None,
@@ -1588,6 +1594,7 @@ pub fn generate_rules(
                     parent: None,
                     value: None,
                     from: entry.package.clone(),
+                    file_pattern: None,
                     parent_from: None,
                     not_parent: None,
                     not_child: None,
@@ -1626,6 +1633,7 @@ pub fn generate_rules(
                     parent: None,
                     value: Some(entry.value.clone()),
                     from: entry.package.clone(),
+                    file_pattern: None,
                     parent_from: None,
                     not_parent: None,
                     not_child: None,
@@ -1660,6 +1668,7 @@ pub fn generate_rules(
                     parent: None,
                     value: None,
                     from: entry.package.clone(),
+                    file_pattern: None,
                     parent_from: None,
                     not_parent: None,
                     not_child: None,
@@ -1853,6 +1862,7 @@ pub fn generate_rules(
                                     parent: None,
                                     value: None,
                                     from: Some(pkg.name.clone()),
+                                    file_pattern: None,
                                     parent_from: None,
                                     not_parent: None,
                                     not_child: None,
@@ -2003,6 +2013,7 @@ pub fn generate_rules(
                                     parent: None,
                                     value: None,
                                     from: from_pkg,
+                                    file_pattern: None,
                                     parent_from: None,
                                     not_parent: None,
                                     not_child: None,
@@ -3002,6 +3013,7 @@ fn api_change_to_rules(
                             parent: None,
                             value: Some(format!("^{}$", regex_escape(value))),
                             from: from.clone(),
+                            file_pattern: None,
                             parent_from: None,
                             not_parent: None,
                             not_child: None,
@@ -3093,6 +3105,7 @@ fn behavioral_change_to_rule(
                 not_child: None,
                 value: None,
                 from,
+                file_pattern: None,
             },
         }
     } else {
@@ -4766,6 +4779,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        file_pattern: None,
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
@@ -4793,6 +4807,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        file_pattern: None,
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
@@ -4824,6 +4839,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        file_pattern: None,
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
@@ -4855,6 +4871,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: None,
+                        file_pattern: None,
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
@@ -5495,6 +5512,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        file_pattern: None,
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
@@ -5525,6 +5543,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        file_pattern: None,
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
@@ -5576,6 +5595,7 @@ mod tests {
                     parent: None,
                     value: None,
                     from: None,
+                    file_pattern: None,
                     parent_from: None,
                     not_parent: None,
                     not_child: None,
@@ -5837,6 +5857,7 @@ mod tests {
                         parent: None,
                         value: None,
                         from: Some("@patternfly/react-core".to_string()),
+                        file_pattern: None,
                         parent_from: None,
                         not_parent: None,
                         not_child: None,
@@ -7542,6 +7563,7 @@ mod tests {
                             parent: None,
                             value: Some("^cyan$".to_string()),
                             from: Some("@patternfly/react-core".to_string()),
+                            file_pattern: None,
                             parent_from: None,
                             not_parent: None,
                             not_child: None,
@@ -7555,6 +7577,7 @@ mod tests {
                             parent: None,
                             value: Some("^gold$".to_string()),
                             from: Some("@patternfly/react-core".to_string()),
+                            file_pattern: None,
                             parent_from: None,
                             not_parent: None,
                             not_child: None,
@@ -7586,6 +7609,7 @@ mod tests {
                             parent: None,
                             value: Some("^cyan$".to_string()),
                             from: Some("@patternfly/react-core".to_string()),
+                            file_pattern: None,
                             parent_from: None,
                             not_parent: None,
                             not_child: None,
@@ -7599,6 +7623,7 @@ mod tests {
                             parent: None,
                             value: Some("^gold$".to_string()),
                             from: Some("@patternfly/react-core".to_string()),
+                            file_pattern: None,
                             parent_from: None,
                             not_parent: None,
                             not_child: None,
@@ -7629,6 +7654,7 @@ mod tests {
                     parent: None,
                     value: None,
                     from: Some("@patternfly/react-core".to_string()),
+                    file_pattern: None,
                     parent_from: None,
                     not_parent: None,
                     not_child: None,
@@ -7919,9 +7945,6 @@ mod tests {
             other => panic!("Expected FrontendReferenced, got {:?}", other),
         }
     }
-
-
-
 
     #[test]
     fn test_children_to_prop_deduplicates_across_files() {
@@ -8299,9 +8322,6 @@ mod tests {
 
     // ── Hierarchy delta rule generation tests ────────────────────────
 
-
-
-
     // NOTE: v1 conformance rule tests removed — conformance is now
     // generated by the v2 SD pipeline (konveyor_v2::generate_conformance_rules).
 
@@ -8460,10 +8480,6 @@ mod tests {
     }
 
     // ── Hierarchy rule message: classification & dedup ─────────────────
-
-
-
-
 
     // ── CSS prefix detection tests ──────────────────────────────────
 

@@ -86,6 +86,12 @@ pub fn generate_sd_rules(
     // ── Required prop added rules ───────────────────────────────────
     rules.extend(generate_required_prop_added_rules(sd, &component_packages));
 
+    // ── Test impact rules ───────────────────────────────────────────
+    rules.extend(generate_test_impact_rules(
+        &sd.source_level_changes,
+        &component_packages,
+    ));
+
     rules
 }
 
@@ -246,6 +252,7 @@ fn generate_composition_change_rules(
                             not_child: None,
                             value: None,
                             from: Some(pkg.clone()),
+                            file_pattern: None,
                         },
                     },
                     fix_strategy: Some(FixStrategyEntry {
@@ -292,6 +299,7 @@ fn generate_composition_change_rules(
                             not_child: None,
                             value: None,
                             from: Some(pkg.to_string()),
+                            file_pattern: None,
                         },
                     },
                     fix_strategy: None,
@@ -333,6 +341,7 @@ fn generate_composition_change_rules(
                             not_child: None,
                             value: None,
                             from: Some(pkg.to_string()),
+                            file_pattern: None,
                         },
                     },
                     fix_strategy: Some(FixStrategyEntry {
@@ -428,6 +437,7 @@ fn generate_conformance_rules(
                                 not_child: None,
                                 value: None,
                                 from: Some(pkg.to_string()),
+                                file_pattern: None,
                             },
                         },
                         fix_strategy: Some(FixStrategyEntry {
@@ -477,6 +487,7 @@ fn generate_conformance_rules(
                         parent_from: None,
                         value: None,
                         from: Some(pkg.to_string()),
+                        file_pattern: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -541,6 +552,7 @@ fn generate_conformance_rules(
                         parent_from: None,
                         value: None,
                         from: Some(pkg.to_string()),
+                        file_pattern: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -626,6 +638,7 @@ fn generate_context_rules(
                     not_child: None,
                     value: None,
                     from: Some(pkg.to_string()),
+                    file_pattern: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry {
@@ -820,6 +833,7 @@ fn generate_prop_child_migration_rules(
                                 not_child: None,
                                 value: None,
                                 from: Some(pkg.to_string()),
+                                file_pattern: None,
                             },
                         },
                         fix_strategy: Some(FixStrategyEntry {
@@ -902,6 +916,7 @@ fn generate_prop_child_migration_rules(
                                         parent_from: None,
                                         value: None,
                                         from: Some(pkg.to_string()),
+                                        file_pattern: None,
                                     },
                                 },
                                 fix_strategy: Some(FixStrategyEntry {
@@ -1060,6 +1075,7 @@ fn generate_prop_child_migration_rules(
                                 not_child: None,
                                 value: None,
                                 from: Some(pkg.clone()),
+                                file_pattern: None,
                             },
                         },
                         fix_strategy: Some(FixStrategyEntry {
@@ -1287,6 +1303,7 @@ fn generate_cross_family_child_to_prop_rules(
                             not_child: None,
                             value: None,
                             from: Some(comp_pkg),
+                            file_pattern: None,
                         },
                     },
                     fix_strategy: Some(FixStrategyEntry {
@@ -1414,6 +1431,7 @@ fn generate_deprecated_migration_rules(
                             not_child: None,
                             value: None,
                             from: Some(old_pkg.clone()),
+                            file_pattern: None,
                         },
                     },
                     fix_strategy: Some(FixStrategyEntry {
@@ -1478,6 +1496,7 @@ fn generate_deprecated_migration_rules(
                         not_child: None,
                         value: None,
                         from: Some(deprecated_pkg.clone()),
+                        file_pattern: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -1678,6 +1697,7 @@ fn generate_prop_value_conformance_rules(
                             parent_from: None,
                             value: Some(format!("^{}$", regex::escape(value))),
                             from: Some(pkg.to_string()),
+                            file_pattern: None,
                         },
                     },
                     fix_strategy: Some(FixStrategyEntry {
@@ -1824,6 +1844,7 @@ fn generate_prop_value_conformance_rules(
                                 parent_from: None,
                                 value: Some(format!("^{}$", regex::escape(value))),
                                 from: Some(pkg.to_string()),
+                                file_pattern: None,
                             },
                         },
                         fix_strategy: Some(FixStrategyEntry {
@@ -1957,6 +1978,7 @@ fn generate_required_prop_added_rules(
                         parent_from: None,
                         value: None,
                         from: Some(pkg.to_string()),
+                        file_pattern: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry {
@@ -1966,6 +1988,314 @@ fn generate_required_prop_added_rules(
                     ..Default::default()
                 }),
             });
+        }
+    }
+
+    rules
+}
+
+// ── Test impact rules ───────────────────────────────────────────────────
+//
+// Generate rules that match testing-library function calls in test files
+// when a component's rendered ARIA roles, aria-label values, or DOM
+// structure has changed between versions.
+
+/// Testing Library query function pattern (all variants).
+const ROLE_QUERY_PATTERN: &str =
+    "^(getByRole|queryByRole|findByRole|getAllByRole|queryAllByRole|findAllByRole)$";
+const LABEL_QUERY_PATTERN: &str =
+    "^(getByLabelText|queryByLabelText|findByLabelText|getAllByLabelText|queryAllByLabelText|findAllByLabelText)$";
+const TEST_FILE_PATTERN: &str = ".*\\.(test|spec)\\.(ts|tsx|js|jsx)$";
+
+/// Map HTML element names to their implicit ARIA roles.
+fn implicit_aria_role(element: &str) -> Option<&'static str> {
+    match element {
+        "button" => Some("button"),
+        "input" => Some("textbox"),
+        "a" => Some("link"),
+        "img" => Some("img"),
+        "select" => Some("combobox"),
+        "textarea" => Some("textbox"),
+        "table" => Some("table"),
+        "tr" => Some("row"),
+        "td" => Some("cell"),
+        "th" => Some("columnheader"),
+        "ul" | "ol" => Some("list"),
+        "li" => Some("listitem"),
+        "nav" => Some("navigation"),
+        "main" => Some("main"),
+        "header" => Some("banner"),
+        "footer" => Some("contentinfo"),
+        "form" => Some("form"),
+        "dialog" => Some("dialog"),
+        "article" => Some("article"),
+        "section" => Some("region"),
+        "aside" => Some("complementary"),
+        "progress" => Some("progressbar"),
+        _ => None,
+    }
+}
+
+/// Check if a value is a concrete string literal (not a JSX expression).
+fn is_concrete_value(value: &str) -> bool {
+    !value.starts_with('{') && value != "true" && value != "false"
+}
+
+fn generate_test_impact_rules(
+    changes: &[SourceLevelChange],
+    component_packages: &HashMap<String, String>,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+
+    for change in changes {
+        if !change.has_test_implications {
+            continue;
+        }
+
+        let pkg = pkg_for(&change.component, component_packages);
+
+        match change.category {
+            // ── Role changes: match getByRole('oldValue') ───────────
+            SourceLevelCategory::RoleChange => {
+                // Role removed — tests using getByRole('X') will break
+                if let Some(ref old_val) = change.old_value {
+                    if !is_concrete_value(old_val) {
+                        continue;
+                    }
+
+                    let rule_id = format!(
+                        "sd-test-{}-role-{}-{}",
+                        sanitize(&change.component),
+                        sanitize(old_val),
+                        if change.new_value.is_some() {
+                            "changed"
+                        } else {
+                            "removed"
+                        },
+                    );
+
+                    let message = if let Some(ref new_val) = change.new_value {
+                        if is_concrete_value(new_val) {
+                            format!(
+                                "{} role changed from '{}' to '{}'.\n\n\
+                                 Update test queries:\n  \
+                                 getByRole('{}') → getByRole('{}')",
+                                change.component, old_val, new_val, old_val, new_val
+                            )
+                        } else {
+                            format!(
+                                "{} role '{}' changed to a dynamic value.\n\n\
+                                 Tests using getByRole('{}') may need updating.\n\n\
+                                 {}",
+                                change.component, old_val, old_val, change.description
+                            )
+                        }
+                    } else {
+                        format!(
+                            "{} no longer has role='{}'.\n\n\
+                             Tests using getByRole('{}') to find this component will fail.\n\n\
+                             {}",
+                            change.component, old_val, old_val, change.description
+                        )
+                    };
+
+                    rules.push(KonveyorRule {
+                        rule_id,
+                        labels: vec![
+                            "source=semver-analyzer".into(),
+                            "change-type=test-impact".into(),
+                            "impact=frontend-testing".into(),
+                            format!("package={}", pkg),
+                        ],
+                        effort: 1,
+                        category: "optional".into(),
+                        description: format!(
+                            "Test impact: {} role '{}' {}",
+                            change.component,
+                            old_val,
+                            if change.new_value.is_some() {
+                                "changed"
+                            } else {
+                                "removed"
+                            }
+                        ),
+                        message,
+                        links: vec![],
+                        when: KonveyorCondition::FrontendReferenced {
+                            referenced: FrontendReferencedFields {
+                                pattern: ROLE_QUERY_PATTERN.into(),
+                                location: "FUNCTION_CALL".into(),
+                                component: None,
+                                parent: None,
+                                not_parent: None,
+                                not_child: None,
+                                parent_from: None,
+                                value: Some(format!("^{}$", old_val)),
+                                from: None,
+                                file_pattern: Some(TEST_FILE_PATTERN.into()),
+                            },
+                        },
+                        fix_strategy: None,
+                    });
+                }
+            }
+
+            // ── ARIA label changes: match getByLabelText('oldValue') ─
+            SourceLevelCategory::AriaChange => {
+                // Only generate rules for aria-label changes (not aria-hidden, etc.)
+                if !change.description.contains("aria-label") {
+                    continue;
+                }
+
+                if let Some(ref old_val) = change.old_value {
+                    if !is_concrete_value(old_val) {
+                        continue;
+                    }
+
+                    let rule_id = format!(
+                        "sd-test-{}-aria-label-{}-{}",
+                        sanitize(&change.component),
+                        sanitize(old_val),
+                        if change.new_value.is_some() {
+                            "changed"
+                        } else {
+                            "removed"
+                        },
+                    );
+
+                    let message = if let Some(ref new_val) = change.new_value {
+                        if is_concrete_value(new_val) {
+                            format!(
+                                "{} aria-label changed from '{}' to '{}'.\n\n\
+                                 Update test queries:\n  \
+                                 getByLabelText('{}') → getByLabelText('{}')",
+                                change.component, old_val, new_val, old_val, new_val
+                            )
+                        } else {
+                            format!(
+                                "{} aria-label '{}' changed to a dynamic value.\n\n\
+                                 Tests using getByLabelText('{}') may need updating.\n\n\
+                                 {}",
+                                change.component, old_val, old_val, change.description
+                            )
+                        }
+                    } else {
+                        format!(
+                            "{} no longer has aria-label='{}'.\n\n\
+                             Tests using getByLabelText('{}') to find this component will fail.\n\n\
+                             {}",
+                            change.component, old_val, old_val, change.description
+                        )
+                    };
+
+                    rules.push(KonveyorRule {
+                        rule_id,
+                        labels: vec![
+                            "source=semver-analyzer".into(),
+                            "change-type=test-impact".into(),
+                            "impact=frontend-testing".into(),
+                            format!("package={}", pkg),
+                        ],
+                        effort: 1,
+                        category: "optional".into(),
+                        description: format!(
+                            "Test impact: {} aria-label '{}' {}",
+                            change.component,
+                            old_val,
+                            if change.new_value.is_some() {
+                                "changed"
+                            } else {
+                                "removed"
+                            }
+                        ),
+                        message,
+                        links: vec![],
+                        when: KonveyorCondition::FrontendReferenced {
+                            referenced: FrontendReferencedFields {
+                                pattern: LABEL_QUERY_PATTERN.into(),
+                                location: "FUNCTION_CALL".into(),
+                                component: None,
+                                parent: None,
+                                not_parent: None,
+                                not_child: None,
+                                parent_from: None,
+                                value: Some(format!("^{}$", old_val)),
+                                from: None,
+                                file_pattern: Some(TEST_FILE_PATTERN.into()),
+                            },
+                        },
+                        fix_strategy: None,
+                    });
+                }
+            }
+
+            // ── DOM structure changes: match getByRole(implicit_role) ─
+            SourceLevelCategory::DomStructure => {
+                // Element removed — tests using getByRole for its implicit
+                // role may break (e.g., <button> removed → getByRole('button'))
+                if let Some(ref old_val) = change.old_value {
+                    // Extract element name from values like "<button>" or "<button> (×2)"
+                    let element = old_val
+                        .trim_start_matches('<')
+                        .split('>')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+
+                    if let Some(role) = implicit_aria_role(element) {
+                        let rule_id = format!(
+                            "sd-test-{}-dom-{}-removed",
+                            sanitize(&change.component),
+                            sanitize(element),
+                        );
+
+                        rules.push(KonveyorRule {
+                            rule_id,
+                            labels: vec![
+                                "source=semver-analyzer".into(),
+                                "change-type=test-impact".into(),
+                                "impact=frontend-testing".into(),
+                                format!("package={}", pkg),
+                            ],
+                            effort: 1,
+                            category: "optional".into(),
+                            description: format!(
+                                "Test impact: {} no longer renders <{}>",
+                                change.component, element
+                            ),
+                            message: format!(
+                                "{} no longer renders a <{}> element (implicit role='{}').\n\n\
+                                 Tests using getByRole('{}') inside {} may fail.\n\n\
+                                 {}",
+                                change.component,
+                                element,
+                                role,
+                                role,
+                                change.component,
+                                change.description,
+                            ),
+                            links: vec![],
+                            when: KonveyorCondition::FrontendReferenced {
+                                referenced: FrontendReferencedFields {
+                                    pattern: ROLE_QUERY_PATTERN.into(),
+                                    location: "FUNCTION_CALL".into(),
+                                    component: None,
+                                    parent: None,
+                                    not_parent: None,
+                                    not_child: None,
+                                    parent_from: None,
+                                    value: Some(format!("^{}$", role)),
+                                    from: None,
+                                    file_pattern: Some(TEST_FILE_PATTERN.into()),
+                                },
+                            },
+                            fix_strategy: None,
+                        });
+                    }
+                }
+            }
+
+            _ => {}
         }
     }
 
