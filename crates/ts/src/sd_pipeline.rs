@@ -1516,14 +1516,20 @@ fn generate_conformance_checks(
         }
     }
 
-    // ExclusiveWrapper: detect parent components where all children must be
-    // wrapped in a specific component. Heuristic:
-    //   - Parent has exactly one direct_child with BEM evidence containing "element"
-    //   - That child is a generic wrapper (has_children_prop, renders div/span)
-    //   - The parent uses flex/grid layout (has_children_prop itself)
+    // ExclusiveWrapper: detect parent components where all direct children
+    // must be one of the family's BEM element children.
     //
-    // Also collect any other family members that self-wrap in the wrapper
-    // (e.g., InputGroupText internally renders InputGroupItem).
+    // Heuristic: find all BEM element direct children of the root. If at
+    // least one is a generic wrapper (has_children_prop, renders div/span),
+    // then the root uses a wrapper pattern — ALL BEM direct children form
+    // the allowed set, and any non-family component placed directly inside
+    // the root is a violation.
+    //
+    // Examples:
+    //   InputGroup  → allowed: {InputGroupItem, InputGroupText}
+    //   ActionList  → allowed: {ActionListGroup}
+    //   Card        → NOT detected (CardHeader/CardBody/CardFooter are content
+    //                 components, none is a generic div/span wrapper)
     let root = &tree.root;
     let direct_child_edges: Vec<_> = tree
         .edges
@@ -1534,62 +1540,71 @@ fn generate_conformance_checks(
         })
         .collect();
 
-    // Find BEM element children of the root (wrapper candidates)
-    let bem_wrapper_children: Vec<_> = direct_child_edges
+    // Find all BEM element children of the root
+    let bem_children: Vec<&str> = direct_child_edges
         .iter()
         .filter(|e| {
             e.bem_evidence
                 .as_ref()
                 .map_or(false, |ev| ev.contains("BEM element"))
         })
+        .map(|e| e.child.as_str())
         .collect();
 
-    // If there's exactly one BEM element child that's a generic wrapper,
-    // all direct children of the root should be that wrapper (or other
-    // family members that internally wrap themselves).
-    if bem_wrapper_children.len() == 1 {
-        let wrapper_name = &bem_wrapper_children[0].child;
-
-        // Check if the wrapper is a generic container (has children prop,
-        // renders a plain element like div/span)
-        let is_generic_wrapper = profiles.get(wrapper_name).map_or(false, |p| {
+    // Check if at least one BEM child is a generic wrapper (div/span with children)
+    let has_generic_wrapper = bem_children.iter().any(|name| {
+        profiles.get(*name).map_or(false, |p| {
             p.has_children_prop
                 && p.children_slot_path
                     .first()
                     .map_or(false, |tag| matches!(tag.as_str(), "div" | "span"))
-        });
+        })
+    });
 
-        if is_generic_wrapper {
-            // Collect family members that self-wrap in the wrapper
-            // (internal edges where parent renders wrapper internally)
-            let mut allowed = vec![wrapper_name.clone()];
-            for edge in &tree.edges {
-                if edge.child == *wrapper_name
-                    && edge.relationship
-                        == semver_analyzer_core::types::sd::ChildRelationship::Internal
-                {
-                    // The parent of this internal edge self-wraps
-                    allowed.push(edge.parent.clone());
-                }
+    if has_generic_wrapper && !bem_children.is_empty() {
+        // The allowed set starts with all BEM direct children
+        let mut allowed: Vec<String> = bem_children.iter().map(|s| s.to_string()).collect();
+
+        // Also add family members that self-wrap in one of the BEM children
+        // (internal edges, e.g., InputGroupText internally renders InputGroupItem)
+        for edge in &tree.edges {
+            if edge.relationship == semver_analyzer_core::types::sd::ChildRelationship::Internal
+                && bem_children.contains(&edge.child.as_str())
+                && !allowed.contains(&edge.parent)
+            {
+                allowed.push(edge.parent.clone());
             }
-
-            let allowed_list = allowed.join(", ");
-            checks.push(ConformanceCheck {
-                family: family.to_string(),
-                check_type: ConformanceCheckType::ExclusiveWrapper {
-                    parent: root.clone(),
-                    allowed_children: allowed.clone(),
-                },
-                description: format!(
-                    "All children of {} must be wrapped in {}",
-                    root, allowed_list
-                ),
-                correct_example: Some(format!(
-                    "<{}>\n  <{}>\n    {{/* your content */}}\n  </{}>\n</{}>",
-                    root, wrapper_name, wrapper_name, root
-                )),
-            });
         }
+
+        // Find the primary wrapper (the generic one) for the example
+        let primary_wrapper = bem_children
+            .iter()
+            .find(|name| {
+                profiles.get(**name).map_or(false, |p| {
+                    p.has_children_prop
+                        && p.children_slot_path
+                            .first()
+                            .map_or(false, |tag| matches!(tag.as_str(), "div" | "span"))
+                })
+            })
+            .unwrap_or(&bem_children[0]);
+
+        let allowed_list = allowed.join(", ");
+        checks.push(ConformanceCheck {
+            family: family.to_string(),
+            check_type: ConformanceCheckType::ExclusiveWrapper {
+                parent: root.clone(),
+                allowed_children: allowed.clone(),
+            },
+            description: format!(
+                "All children of {} must be wrapped in {}",
+                root, allowed_list
+            ),
+            correct_example: Some(format!(
+                "<{}>\n  <{}>\n    {{/* your content */}}\n  </{}>\n</{}>",
+                root, primary_wrapper, primary_wrapper, root
+            )),
+        });
     }
 
     checks
