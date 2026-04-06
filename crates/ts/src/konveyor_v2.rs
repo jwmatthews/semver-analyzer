@@ -93,6 +93,13 @@ pub fn generate_sd_rules(
         &component_packages,
     ));
 
+    // ── Prop attribute override rules ──────────────────────────────
+    rules.extend(generate_prop_attribute_override_rules(
+        &sd.source_level_changes,
+        sd,
+        &component_packages,
+    ));
+
     // ── CSS class removal rules ─────────────────────────────────────
     rules.extend(generate_css_class_removal_rules(&sd.removed_css_blocks));
 
@@ -2311,6 +2318,122 @@ fn generate_test_impact_rules(
 // When entire CSS component blocks are removed between PF versions (e.g.,
 // Select CSS removed because Select now uses Menu's CSS), generate rules
 // that flag consumer CSS files referencing the removed class prefixes.
+
+// ── Prop attribute override rules ───────────────────────────────────────
+// When a component extracts a prop, transforms it via a helper, and spreads
+// the result after rest props — overriding any consumer-provided HTML attribute.
+
+fn generate_prop_attribute_override_rules(
+    changes: &[SourceLevelChange],
+    _sd: &SdPipelineResult,
+    component_packages: &HashMap<String, String>,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+
+    for change in changes {
+        if change.category != SourceLevelCategory::PropAttributeOverride {
+            continue;
+        }
+
+        // Only generate rules for "new managed attribute" (not "removed")
+        if change.old_value.is_some() && change.new_value.is_none() {
+            continue;
+        }
+
+        let pkg = pkg_for(&change.component, component_packages);
+
+        // Parse the new_value to extract overridden attribute names.
+        // Format is "propName → attr1, attr2, attr3"
+        let (prop_name, overridden_attrs) = match &change.new_value {
+            Some(val) => {
+                let parts: Vec<&str> = val.splitn(2, " → ").collect();
+                if parts.len() == 2 {
+                    let attrs: Vec<String> =
+                        parts[1].split(", ").map(|s| s.trim().to_string()).collect();
+                    (parts[0].to_string(), attrs)
+                } else {
+                    continue;
+                }
+            }
+            None => continue,
+        };
+
+        // Generate one rule per overridden attribute
+        for attr in &overridden_attrs {
+            let rule_id = format!(
+                "sd-prop-override-{}-{}",
+                sanitize(&change.component),
+                sanitize(attr),
+            );
+
+            let message = format!(
+                "The <{component}> component internally generates the `{attr}` HTML \
+                 attribute from the `{prop}` prop via its internal helper. If you pass \
+                 `{attr}` as an HTML attribute, it will be silently overridden.\n\n\
+                 Use the `{prop}` prop instead:\n\n\
+                 Before: <{component} {attr}=\"value\" />\n\
+                 After:  <{component} {prop}=\"value\" />",
+                component = change.component,
+                attr = attr,
+                prop = prop_name,
+            );
+
+            rules.push(KonveyorRule {
+                rule_id,
+                labels: vec![
+                    "source=semver-analyzer".into(),
+                    "change-type=prop-attribute-override".into(),
+                    "has-codemod=false".into(),
+                    format!("package={}", pkg),
+                ],
+                effort: 3,
+                category: "mandatory".into(),
+                description: format!(
+                    "{} manages `{}` internally via the `{}` prop",
+                    change.component, attr, prop_name,
+                ),
+                message,
+                links: vec![],
+                when: KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: format!("^{}$", regex_escape(attr)),
+                        location: "JSX_PROP".into(),
+                        component: Some(format!("^{}$", regex_escape(&change.component))),
+                        parent: None,
+                        not_parent: None,
+                        not_child: None,
+                        parent_from: None,
+                        value: None,
+                        from: if pkg != "unknown" {
+                            Some(pkg.clone())
+                        } else {
+                            None
+                        },
+                        file_pattern: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),
+            });
+        }
+    }
+
+    rules
+}
+
+/// Escape special regex characters in a string.
+fn regex_escape(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '\\' | '^' | '$' | '|' => {
+                result.push('\\');
+                result.push(c);
+            }
+            _ => result.push(c),
+        }
+    }
+    result
+}
 
 const CSS_FILE_PATTERN: &str = ".*\\.css$";
 

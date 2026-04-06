@@ -13,12 +13,14 @@
 pub mod bem;
 pub mod children_slot;
 pub mod diff;
+pub mod managed_attrs;
 pub mod prop_defaults;
 pub mod prop_style;
 pub mod react_api;
 
 use bem::{extract_style_tokens, parse_bem_structure, StyleToken};
 use children_slot::{has_children_prop, trace_children_slot};
+use managed_attrs::extract_managed_attributes;
 use prop_defaults::extract_prop_defaults;
 use prop_style::extract_prop_style_bindings;
 use react_api::detect_react_api_usage;
@@ -123,6 +125,10 @@ pub fn extract_profile(name: &str, file: &str, source: &str) -> ComponentSourceP
         .iter()
         .filter_map(|rc| rc.strip_suffix(".Provider").map(|s| s.to_string()))
         .collect();
+
+    // 9. Managed attribute bindings — detect prop-overrides-attribute patterns
+    profile.managed_attributes =
+        extract_managed_attributes(source, name, &profile.all_props, &profile.data_attributes);
 
     profile
 }

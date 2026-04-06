@@ -145,6 +145,46 @@ pub struct ComponentSourceProfile {
     /// e.g., { "icon": "ReactNode", "variant": "'primary' | 'secondary'" }
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prop_types: BTreeMap<String, String>,
+
+    // ── Managed attribute bindings ─────────────────────────────────────
+    /// Props that the component extracts from rest, transforms via a helper
+    /// function, and spreads back onto a JSX element after rest — overriding
+    /// any consumer-provided HTML attribute that the helper generates.
+    ///
+    /// e.g., `ouiaId` is destructured, passed to `getOUIAProps()`, and the
+    /// result `{...ouiaProps}` is spread after `{...otherProps}` on `<button>`.
+    /// Any consumer passing `data-ouia-component-id` directly will be overridden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_attributes: Vec<ManagedAttributeBinding>,
+}
+
+/// A prop-to-HTML-attribute override binding.
+///
+/// Represents a pattern where a component destructures a prop out of the
+/// rest parameter, passes it through a helper function, and spreads the
+/// result onto a JSX element after the rest props. This means any
+/// consumer-provided HTML attribute with the same name as the generated
+/// attributes will be silently overridden.
+///
+/// Detected via AST dataflow analysis of the component's function body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAttributeBinding {
+    /// The React prop name that the component extracts and manages.
+    /// e.g., "ouiaId"
+    pub prop_name: String,
+
+    /// The helper function that transforms the prop into HTML attributes.
+    /// e.g., "getOUIAProps"
+    pub generator_function: String,
+
+    /// The JSX element tag where the managed spread is applied.
+    /// e.g., "button"
+    pub target_element: String,
+
+    /// HTML attributes on the target element that are likely overridden
+    /// by the managed spread. Correlated from the data_attributes map.
+    /// e.g., ["data-ouia-component-id", "data-ouia-component-type"]
+    pub overridden_attributes: Vec<String>,
 }
 
 // ── Source Level Change (diff between two profiles) ─────────────────────
@@ -215,6 +255,11 @@ pub enum SourceLevelCategory {
     Memo,
     /// Rendered child component added or removed.
     RenderedComponent,
+    /// Component prop overrides a consumer-provided HTML attribute.
+    /// Detected when a destructured prop is transformed via a helper function
+    /// and the result is spread onto a JSX element after the rest props,
+    /// silently overriding any matching HTML attribute the consumer passes.
+    PropAttributeOverride,
 }
 
 // ── Composition Tree ────────────────────────────────────────────────────

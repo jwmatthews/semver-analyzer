@@ -31,6 +31,7 @@ pub fn diff_profiles(
     diff_data_attributes(old, new, component, &mut changes);
     diff_css_tokens(old, new, component, &mut changes);
     diff_prop_style_bindings(old, new, component, &mut changes);
+    diff_managed_attributes(old, new, component, &mut changes);
     diff_children_slot(old, new, component, &mut changes);
 
     changes
@@ -661,6 +662,92 @@ fn diff_prop_style_bindings(
     }
 }
 
+// ── Managed attributes (prop overrides HTML attribute) ───────────────────
+
+fn diff_managed_attributes(
+    old: &ComponentSourceProfile,
+    new: &ComponentSourceProfile,
+    component: &str,
+    changes: &mut Vec<SourceLevelChange>,
+) {
+    // Build lookup maps keyed by (prop_name, generator_function) for efficient diff
+    let old_bindings: std::collections::HashSet<_> = old
+        .managed_attributes
+        .iter()
+        .map(|b| (&b.prop_name, &b.generator_function))
+        .collect();
+    let new_bindings: std::collections::HashSet<_> = new
+        .managed_attributes
+        .iter()
+        .map(|b| (&b.prop_name, &b.generator_function))
+        .collect();
+
+    // New managed attributes — component now overrides consumer-provided HTML attrs
+    for binding in &new.managed_attributes {
+        let key = (&binding.prop_name, &binding.generator_function);
+        if !old_bindings.contains(&key) {
+            let attrs_list = if binding.overridden_attributes.is_empty() {
+                "HTML attributes".to_string()
+            } else {
+                binding.overridden_attributes.join(", ")
+            };
+
+            changes.push(SourceLevelChange {
+                component: component.to_string(),
+                category: SourceLevelCategory::PropAttributeOverride,
+                description: format!(
+                    "{component}'s `{prop}` prop overrides {attrs} via {func}(). \
+                     Use the `{prop}` prop instead of setting these HTML attributes directly.",
+                    prop = binding.prop_name,
+                    attrs = attrs_list,
+                    func = binding.generator_function,
+                ),
+                old_value: None,
+                new_value: Some(format!(
+                    "{} → {}",
+                    binding.prop_name,
+                    binding.overridden_attributes.join(", ")
+                )),
+                has_test_implications: true,
+                test_description: Some(format!(
+                    "DOM queries using {} will still work, but consumer code should \
+                     use the `{}` prop for correct lifecycle management",
+                    binding
+                        .overridden_attributes
+                        .first()
+                        .unwrap_or(&"the managed attribute".to_string()),
+                    binding.prop_name,
+                )),
+            });
+        }
+    }
+
+    // Removed managed attributes — component no longer overrides
+    for binding in &old.managed_attributes {
+        let key = (&binding.prop_name, &binding.generator_function);
+        if !new_bindings.contains(&key) {
+            changes.push(SourceLevelChange {
+                component: component.to_string(),
+                category: SourceLevelCategory::PropAttributeOverride,
+                description: format!(
+                    "{component} no longer manages `{prop}` via {func}(). \
+                     HTML attributes previously overridden by this prop can now be set directly.",
+                    prop = binding.prop_name,
+                    func = binding.generator_function,
+                ),
+                old_value: Some(format!(
+                    "{} → {}",
+                    binding.prop_name,
+                    binding.overridden_attributes.join(", ")
+                )),
+                new_value: None,
+                has_test_implications: false,
+                test_description: None,
+            });
+        }
+    }
+}
+
 // ── Children slot ───────────────────────────────────────────────────────
 
 fn diff_children_slot(
@@ -1013,6 +1100,86 @@ mod tests {
         assert!(
             binding_changes.is_empty(),
             "No binding changes expected for identical profiles"
+        );
+    }
+
+    // ── Managed attribute diff tests ────────────────────────────────────
+
+    #[test]
+    fn test_diff_managed_attribute_added() {
+        use semver_analyzer_core::types::sd::ManagedAttributeBinding;
+
+        let old = make_profile("MenuToggle");
+        let mut new = make_profile("MenuToggle");
+        new.managed_attributes.push(ManagedAttributeBinding {
+            prop_name: "ouiaId".into(),
+            generator_function: "getOUIAProps".into(),
+            target_element: "button".into(),
+            overridden_attributes: vec![
+                "data-ouia-component-id".into(),
+                "data-ouia-component-type".into(),
+            ],
+        });
+
+        let changes = diff_profiles(&old, &new);
+        let managed: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::PropAttributeOverride)
+            .collect();
+        assert_eq!(
+            managed.len(),
+            1,
+            "Expected one PropAttributeOverride change"
+        );
+        assert!(managed[0].description.contains("ouiaId"));
+        assert!(managed[0].description.contains("getOUIAProps"));
+        assert!(managed[0].has_test_implications);
+    }
+
+    #[test]
+    fn test_diff_managed_attribute_removed() {
+        use semver_analyzer_core::types::sd::ManagedAttributeBinding;
+
+        let mut old = make_profile("MenuToggle");
+        old.managed_attributes.push(ManagedAttributeBinding {
+            prop_name: "ouiaId".into(),
+            generator_function: "getOUIAProps".into(),
+            target_element: "button".into(),
+            overridden_attributes: vec!["data-ouia-component-id".into()],
+        });
+        let new = make_profile("MenuToggle");
+
+        let changes = diff_profiles(&old, &new);
+        let managed: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::PropAttributeOverride)
+            .collect();
+        assert_eq!(managed.len(), 1);
+        assert!(managed[0].description.contains("no longer manages"));
+    }
+
+    #[test]
+    fn test_diff_managed_attribute_no_change() {
+        use semver_analyzer_core::types::sd::ManagedAttributeBinding;
+
+        let binding = ManagedAttributeBinding {
+            prop_name: "ouiaId".into(),
+            generator_function: "getOUIAProps".into(),
+            target_element: "button".into(),
+            overridden_attributes: vec!["data-ouia-component-id".into()],
+        };
+
+        let mut profile = make_profile("MenuToggle");
+        profile.managed_attributes.push(binding);
+
+        let changes = diff_profiles(&profile, &profile);
+        let managed: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::PropAttributeOverride)
+            .collect();
+        assert!(
+            managed.is_empty(),
+            "Expected no changes for identical managed attributes"
         );
     }
 }
