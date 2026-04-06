@@ -770,7 +770,7 @@ fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> 
 ///
 /// `packages/react-core/dist/esm/components/EmptyState/EmptyStateHeader.d.ts`
 /// → `packages/react-core/dist/esm/components/EmptyState`
-fn canonical_component_dir(file_path: &str) -> String {
+pub(crate) fn canonical_component_dir(file_path: &str) -> String {
     let canonical = file_path
         .replace("/deprecated/", "/")
         .replace("/next/", "/");

@@ -216,6 +216,7 @@ pub(super) struct RenameMatch<'a> {
 pub(super) fn detect_renames<'a>(
     removed: &[&'a Symbol],
     added: &[&'a Symbol],
+    same_family: impl Fn(&Symbol, &Symbol) -> bool,
 ) -> Vec<RenameMatch<'a>> {
     if removed.is_empty() || added.is_empty() {
         return Vec::new();
@@ -253,7 +254,14 @@ pub(super) fn detect_renames<'a>(
             }
             for (ai, asym) in added_syms {
                 let sim = name_similarity(&rsym.name, &asym.name);
-                candidates.push((ri, *ai, sim));
+                let threshold = if same_family(rsym, asym) {
+                    MIN_SIMILARITY
+                } else {
+                    CROSS_FAMILY_MIN_SIMILARITY
+                };
+                if sim >= threshold {
+                    candidates.push((ri, *ai, sim));
+                }
             }
         }
     }
@@ -288,7 +296,12 @@ pub(super) fn detect_renames<'a>(
                     continue;
                 }
                 let sim = name_similarity(&rsym.name, &asym.name);
-                if sim >= MIN_SIMILARITY {
+                let threshold = if same_family(rsym, asym) {
+                    MIN_SIMILARITY
+                } else {
+                    CROSS_FAMILY_MIN_SIMILARITY
+                };
+                if sim >= threshold {
                     candidates.push((ri, *ai, sim));
                 }
             }
@@ -320,7 +333,12 @@ pub(super) fn detect_renames<'a>(
                     continue;
                 }
                 let sim = name_similarity(&rsym.name, &asym.name);
-                if sim >= MIN_SIMILARITY {
+                let threshold = if same_family(rsym, asym) {
+                    MIN_SIMILARITY
+                } else {
+                    CROSS_FAMILY_MIN_SIMILARITY
+                };
+                if sim >= threshold {
                     candidates.push((ri, *ai, sim));
                 }
             }
@@ -400,11 +418,21 @@ pub(super) fn detect_renames<'a>(
     let mut used_added = vec![false; added.len()];
     let mut matches = Vec::new();
 
-    // Minimum similarity threshold: require at least some name overlap.
-    // 0.15 catches cases like "isActive" → "isClicked" (share "is" prefix),
-    // "chipGroupContentRef" → "labelGroupContentRef" (share "GroupContentRef").
+    // Minimum similarity thresholds for rename candidates.
+    //
+    // Same-family (0.15): Catches cases like "isActive" → "isClicked" (share
+    // "is" prefix), "chipGroupContentRef" → "labelGroupContentRef".
     // Exact type match is the primary signal; name similarity is tiebreaker.
+    //
+    // Cross-family (0.50): Higher bar when symbols come from different component
+    // directories. Prevents false renames like "DropdownSeparator" →
+    // "DrawerPanelDescription" (0.36, Dropdown/ vs Drawer/) while preserving
+    // legitimate cross-family renames like "TextVariants" → "ContentVariants"
+    // (0.67, Text/ vs Content/).
+    //
+    // See design/rename-detector-verification.md for threshold analysis.
     const MIN_SIMILARITY: f64 = 0.15;
+    const CROSS_FAMILY_MIN_SIMILARITY: f64 = 0.50;
 
     for (ri, ai, sim) in candidates {
         if sim < MIN_SIMILARITY {
@@ -1315,6 +1343,39 @@ mod token_tests {
         }
     }
 
+    fn make_sym(name: &str, kind: SymbolKind, return_type: &str) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            kind,
+            visibility: Visibility::Public,
+            file: PathBuf::from("test.d.ts"),
+            package: Some("@test/pkg".to_string()),
+            import_path: None,
+            line: 1,
+            signature: if return_type.is_empty() {
+                None
+            } else {
+                Some(Signature {
+                    return_type: Some(return_type.to_string()),
+                    parameters: vec![],
+                    is_async: false,
+                    type_parameters: vec![],
+                })
+            },
+            extends: None,
+            implements: vec![],
+            is_abstract: false,
+            type_dependencies: vec![],
+            is_readonly: false,
+            is_static: false,
+            accessor_kind: None,
+            members: vec![],
+            rendered_components: vec![],
+            css: vec![],
+        }
+    }
+
     fn make_prop(name: &str, parent: &str, return_type: &str) -> Symbol {
         Symbol {
             name: name.to_string(),
@@ -1360,7 +1421,7 @@ mod token_tests {
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
-        let matches = detect_renames(&removed_refs, &added_refs);
+        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
 
         assert_eq!(matches.len(), 1, "Should match via Pass 4 name similarity");
         assert_eq!(matches[0].old.name, "splitButtonOptions");
@@ -1375,7 +1436,7 @@ mod token_tests {
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
-        let matches = detect_renames(&removed_refs, &added_refs);
+        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
 
         // similarity("isOpen", "isDisabled") ≈ 0.4 — below 0.6 threshold
         assert!(
@@ -1400,12 +1461,68 @@ mod token_tests {
 
         let removed_refs: Vec<&Symbol> = removed.iter().collect();
         let added_refs: Vec<&Symbol> = added.iter().collect();
-        let matches = detect_renames(&removed_refs, &added_refs);
+        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
 
         assert!(
             matches.is_empty(),
             "Should not match props from different interfaces"
         );
+    }
+
+    #[test]
+    fn test_cross_family_threshold_rejects_false_renames() {
+        // DropdownSeparator → DrawerPanelDescription (similarity 0.36)
+        // Different families (Dropdown/ vs Drawer/) — should be rejected
+        // by the 0.50 cross-family threshold.
+        let removed = vec![make_sym(
+            "DropdownSeparator",
+            SymbolKind::Constant,
+            "FunctionComponent<SeparatorProps>",
+        )];
+        let added = vec![make_sym(
+            "DrawerPanelDescription",
+            SymbolKind::Constant,
+            "FunctionComponent<DrawerPanelDescriptionProps>",
+        )];
+
+        let removed_refs: Vec<&Symbol> = removed.iter().collect();
+        let added_refs: Vec<&Symbol> = added.iter().collect();
+
+        // With same_family = false, should be rejected (0.36 < 0.50)
+        let matches = detect_renames(&removed_refs, &added_refs, |_, _| false);
+        assert!(
+            matches.is_empty(),
+            "Cross-family rename with similarity 0.36 should be rejected"
+        );
+
+        // With same_family = true, should be accepted (0.36 >= 0.15)
+        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
+        assert_eq!(
+            matches.len(),
+            1,
+            "Same-family rename with similarity 0.36 should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_cross_family_threshold_preserves_true_renames() {
+        // TextVariants → ContentVariants (similarity 0.667)
+        // Different families (Text/ vs Content/) — should PASS the 0.50
+        // cross-family threshold.
+        let removed = vec![make_sym("TextVariants", SymbolKind::TypeAlias, "")];
+        let added = vec![make_sym("ContentVariants", SymbolKind::TypeAlias, "")];
+
+        let removed_refs: Vec<&Symbol> = removed.iter().collect();
+        let added_refs: Vec<&Symbol> = added.iter().collect();
+
+        let matches = detect_renames(&removed_refs, &added_refs, |_, _| false);
+        assert_eq!(
+            matches.len(),
+            1,
+            "Cross-family rename with similarity 0.667 should be accepted"
+        );
+        assert_eq!(matches[0].old.name, "TextVariants");
+        assert_eq!(matches[0].new.name, "ContentVariants");
     }
 }
 

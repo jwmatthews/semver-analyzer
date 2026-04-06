@@ -657,9 +657,11 @@ pub(super) fn diff_members(
         .collect();
 
     // Detect renames (skip for enums — enum member renames are rare and
-    // would be confusing since values matter more than names)
+    // would be confusing since values matter more than names).
+    // Member-level renames are within the same parent interface, so
+    // cross-family distinction is not meaningful — always same-family.
     let renames = if old.kind != SymbolKind::Enum {
-        detect_renames(&removed, &added)
+        detect_renames(&removed, &added, |_, _| true)
     } else {
         Vec::new()
     };

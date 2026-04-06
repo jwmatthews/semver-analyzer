@@ -125,6 +125,61 @@ fn extract_prop_name_from_signature(sig: &str) -> Option<&str> {
     }
 }
 
+/// Look for a sibling component in the same file directory that was renamed.
+///
+/// When a component like `Text` is removed and has no migration target, we
+/// check if any other symbol from the same source directory was renamed in the
+/// structural changes. For example, if `TextContent` (from `Text/TextContent.d.ts`)
+/// was renamed to `Content`, we return `Some("Content")` as the sibling
+/// replacement for `Text` (from `Text/Text.d.ts`).
+///
+/// This handles the many-to-one merge pattern where multiple old components
+/// map to the same new component but the 1:1 rename detector only catches one.
+fn find_sibling_replacement_in_report(
+    comp: &ComponentSummary<TypeScript>,
+    report: &AnalysisReport<TypeScript>,
+) -> Option<String> {
+    use crate::language::canonical_component_dir;
+
+    // Get the canonical directory for the removed component
+    let comp_dir = comp.source_files.iter().find_map(|f| {
+        let f_str = f.to_string_lossy();
+        let dir = canonical_component_dir(&f_str);
+        if dir.is_empty() {
+            None
+        } else {
+            Some(dir)
+        }
+    })?;
+
+    // Search all structural changes for renames from the same directory
+    for fc in &report.changes {
+        for api_change in &fc.breaking_api_changes {
+            if api_change.change != ApiChangeType::Renamed {
+                continue;
+            }
+
+            // Check if this rename is from the same canonical directory
+            let file_str = fc.file.to_string_lossy();
+            let rename_dir = canonical_component_dir(&file_str);
+
+            if rename_dir == comp_dir {
+                // Found a sibling rename — extract the "after" name.
+                // Strip "Props" suffix to get the component name.
+                if let Some(ref after) = api_change.after {
+                    let replacement = after.strip_suffix("Props").unwrap_or(after);
+                    // Don't suggest the same component or the Props variant
+                    if replacement != comp.name && replacement != comp.definition_name {
+                        return Some(replacement.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn build_migration_message_v2(comp: &ComponentSummary<TypeScript>) -> String {
     let component_name = &comp.name;
     let removal_count = comp.member_summary.removed;
@@ -1198,6 +1253,35 @@ pub fn generate_rules(
                     let rule_id = unique_id(base_id, &mut id_counts);
                     let mut message = build_migration_message_v2(comp);
 
+                    // ── Sibling replacement lookup ──────────────────────────
+                    // When a component is removed with no migration target,
+                    // check if a sibling in the same file directory was renamed.
+                    // E.g., Text/ contains both Text and TextContent. If
+                    // TextContent was renamed to Content, then Text should also
+                    // suggest Content as a replacement.
+                    if comp.migration_target.is_none()
+                        && (comp.status == ComponentStatus::Removed
+                            || comp.member_summary.total <= 2)
+                    {
+                        let sibling_replacement = find_sibling_replacement_in_report(comp, report);
+                        if let Some(ref replacement) = sibling_replacement {
+                            // Replace the generic "no detected direct
+                            // replacement" text with specific guidance.
+                            let old_text = format!(
+                                "This component has no detected direct replacement.\n\
+                                 Replace all <{}> usages with the recommended alternative.",
+                                component_name,
+                            );
+                            let new_text = format!(
+                                "Use <{replacement}> instead.\n\
+                                 A sibling component in the same family was renamed to \
+                                 <{replacement}>. Replace all <{component_name}> usages \
+                                 with <{replacement}>.",
+                            );
+                            message = message.replace(&old_text, &new_text);
+                        }
+                    }
+
                     // For removed types from deprecated directories with no
                     // migration target, enrich the message with the new API
                     // structure from the composition tree.
@@ -1446,6 +1530,59 @@ pub fn generate_rules(
                 new_var_prefix,
             )),
         });
+    }
+
+    // ── Explicit CSS variable renames from user-provided mappings ──────
+    //
+    // Global tokens were entirely restructured in PF v6 — both the prefix
+    // AND the variable name changed (e.g., --pf-v5-global--BackgroundColor--100
+    // → --pf-t--global--background--color--100). The broad CssVariablePrefix
+    // rule above only handles the prefix swap, producing wrong results for
+    // these tokens.
+    //
+    // These specific rules sort alphabetically before the broad
+    // "semver-consumer-css-stale-var-" rule (because "rename" < "stale"),
+    // ensuring they are applied first by the fix engine. Once the specific
+    // rule replaces the full variable name, the broad rule's substring
+    // match no longer finds --pf-v5- on that line and is skipped.
+    if !rename_patterns.css_var_renames.is_empty() {
+        tracing::info!(
+            count = rename_patterns.css_var_renames.len(),
+            "Generating CSS variable rename rules from explicit mappings"
+        );
+        for entry in &rename_patterns.css_var_renames {
+            rules.push(KonveyorRule {
+                rule_id: format!(
+                    "semver-consumer-css-rename-var-{}",
+                    sanitize_id(&entry.from)
+                ),
+                labels: vec![
+                    "source=semver-analyzer".to_string(),
+                    "change-type=css-variable".to_string(),
+                    "has-codemod=true".to_string(),
+                ],
+                effort: 1,
+                category: "mandatory".to_string(),
+                description: format!("CSS variable '{}' renamed to '{}'", entry.from, entry.to),
+                message: format!(
+                    "MIGRATION: CSS custom property '{}' has been renamed to '{}'. \
+                     Update all references in style props, SCSS files, and CSS-in-JS.",
+                    entry.from, entry.to
+                ),
+                links: Vec::new(),
+                when: KonveyorCondition::FrontendCssVar {
+                    cssvar: FrontendPatternFields {
+                        pattern: entry.from.clone(),
+                        file_pattern: None,
+                    },
+                },
+                fix_strategy: Some(FixStrategyEntry::with_from_to(
+                    "CssVariablePrefix",
+                    &entry.from,
+                    &entry.to,
+                )),
+            });
+        }
     }
 
     // ── CSS logical property suffix renames ────────────────────────────

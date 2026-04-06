@@ -315,7 +315,9 @@ pub fn diff_surfaces_with_semantics(
         .copied()
         .collect();
 
-    let renames = detect_renames(&remaining_removed, &remaining_added);
+    let renames = detect_renames(&remaining_removed, &remaining_added, |a, b| {
+        semantics.same_family(a, b)
+    });
 
     // Separate type-compatible renames from type-incompatible ones.
     // Type-incompatible renames (e.g., splitButtonOptions: SplitButtonOptions →
