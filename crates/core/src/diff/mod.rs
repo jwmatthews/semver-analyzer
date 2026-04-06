@@ -338,9 +338,7 @@ pub fn diff_surfaces_with_semantics(
             .and_then(|s| s.return_type.as_deref());
 
         let types_match = match (old_rt, new_rt) {
-            (Some(o), Some(n)) => {
-                rename::normalize_type_structure(o) == rename::normalize_type_structure(n)
-            }
+            (Some(o), Some(n)) => compare::types_structurally_similar(o, n),
             _ => true, // No type info → assume compatible
         };
 

@@ -664,13 +664,51 @@ pub(super) fn diff_members(
         Vec::new()
     };
 
-    let renamed_old: std::collections::HashSet<&str> =
-        renames.iter().map(|r| r.old.name.as_str()).collect();
-    let renamed_new: std::collections::HashSet<&str> =
-        renames.iter().map(|r| r.new.name.as_str()).collect();
-
-    // Emit rename changes
+    // Separate type-compatible from type-incompatible member renames.
+    // Incompatible renames (e.g., splitButtonOptions: SplitButtonOptions →
+    // splitButtonItems: ReactNode[]) should stay as Removed + Added so the
+    // rule generator produces LLM-assisted fixing, not a mechanical codemod.
+    let mut compatible_renames = Vec::new();
     for rm in &renames {
+        let old_rt = rm
+            .old
+            .signature
+            .as_ref()
+            .and_then(|s| s.return_type.as_deref());
+        let new_rt = rm
+            .new
+            .signature
+            .as_ref()
+            .and_then(|s| s.return_type.as_deref());
+        let types_match = match (old_rt, new_rt) {
+            (Some(o), Some(n)) => types_structurally_similar(o, n),
+            _ => true,
+        };
+        if types_match {
+            compatible_renames.push(rm);
+        } else {
+            tracing::info!(
+                parent = %old.name,
+                old = %rm.old.name,
+                new = %rm.new.name,
+                old_type = old_rt.unwrap_or("?"),
+                new_type = new_rt.unwrap_or("?"),
+                "Type-incompatible member rename — keeping as Removed + Added"
+            );
+        }
+    }
+
+    let renamed_old: std::collections::HashSet<&str> = compatible_renames
+        .iter()
+        .map(|r| r.old.name.as_str())
+        .collect();
+    let renamed_new: std::collections::HashSet<&str> = compatible_renames
+        .iter()
+        .map(|r| r.new.name.as_str())
+        .collect();
+
+    // Emit rename changes (type-compatible only)
+    for rm in &compatible_renames {
         changes.push(StructuralChange {
             symbol: rm.old.name.clone(),
             qualified_name: format!("{}.{}", old.qualified_name, rm.old.name),
@@ -902,4 +940,75 @@ fn diff_enum_member_value(
             true,
         ));
     }
+}
+
+/// Check if two type strings have the same structural shape.
+///
+/// This is a coarse check that distinguishes fundamentally different types
+/// (object vs array, type-reference vs primitive) while treating types with
+/// the same shape but different values/members as similar.
+///
+/// Examples:
+///   - `SplitButtonOptions` vs `ReactNode[]` → false (reference vs array)
+///   - `{ default?: 'spacerNone' | ... }` vs `{ default?: 'gapNone' | ... }` → true (both objects)
+///   - `boolean` vs `string` → true (both primitives — rename is valid)
+///   - `(e: Event) => void` vs `string` → false (function vs primitive)
+pub(crate) fn types_structurally_similar(old: &str, new: &str) -> bool {
+    let old_cat = type_category(old);
+    let new_cat = type_category(new);
+    old_cat == new_cat
+}
+
+#[derive(Debug, PartialEq)]
+enum TypeCategory {
+    Array,
+    Object,
+    Function,
+    Tuple,
+    Primitive,
+    Reference,
+}
+
+fn type_category(t: &str) -> TypeCategory {
+    let trimmed = t.trim();
+
+    // Array: ends with [] or is Array<...>
+    if trimmed.ends_with("[]") || trimmed.starts_with("Array<") {
+        return TypeCategory::Array;
+    }
+
+    // Object: starts with {
+    if trimmed.starts_with('{') {
+        return TypeCategory::Object;
+    }
+
+    // Function: contains =>
+    if trimmed.contains("=>") {
+        return TypeCategory::Function;
+    }
+
+    // Tuple: starts with [
+    if trimmed.starts_with('[') {
+        return TypeCategory::Tuple;
+    }
+
+    // Primitive: known primitive types
+    let lower = trimmed.to_lowercase();
+    if matches!(
+        lower.as_str(),
+        "string"
+            | "number"
+            | "boolean"
+            | "void"
+            | "null"
+            | "undefined"
+            | "never"
+            | "any"
+            | "unknown"
+    ) {
+        return TypeCategory::Primitive;
+    }
+
+    // Everything else is a type reference (PascalCase, qualified names, etc.)
+    TypeCategory::Reference
 }
