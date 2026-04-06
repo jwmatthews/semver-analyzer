@@ -321,116 +321,21 @@ pub fn diff_surfaces_with_semantics(
         semantics.same_family(a, b)
     });
 
-    // Separate type-compatible renames from type-incompatible ones.
-    // Type-incompatible renames (e.g., splitButtonOptions: SplitButtonOptions →
-    // splitButtonItems: ReactNode[]) should NOT be emitted as Renamed — they
-    // need Removed + Added so the rule generator produces an LLM-assisted fix
-    // instead of a mechanical codemod.
-    let mut compatible_renames = Vec::new();
-    let mut incompatible_renames = Vec::new();
-
-    for rm in &renames {
-        let old_rt = rm
-            .old
-            .signature
-            .as_ref()
-            .and_then(|s| s.return_type.as_deref());
-        let new_rt = rm
-            .new
-            .signature
-            .as_ref()
-            .and_then(|s| s.return_type.as_deref());
-
-        let types_match = match (old_rt, new_rt) {
-            (Some(o), Some(n)) => compare::types_structurally_similar(o, n),
-            _ => true, // No type info → assume compatible
-        };
-
-        if types_match {
-            compatible_renames.push(rm);
-        } else {
-            tracing::info!(
-                old = %rm.old.name,
-                new = %rm.new.name,
-                old_type = old_rt.unwrap_or("?"),
-                new_type = new_rt.unwrap_or("?"),
-                "Type-incompatible rename — emitting as Removed + Added instead of Renamed"
-            );
-            incompatible_renames.push(rm);
-        }
-    }
-
-    // ── Cross-family type_alias guard ─────────────────────────────────
+    // ── Rename validation ──────────────────────────────────────────────
     //
-    // For cross-family type_alias renames that pass the 0.50 threshold,
-    // require a validation signal: at least one other rename exists between
-    // the same two component families. Without a sibling rename, a high-
-    // similarity cross-family type_alias match is likely false (e.g.,
-    // TextListItemVariants → HelperTextItemVariant, sim 0.714, Text/ vs
-    // HelperText/ — no other Text/ → HelperText/ renames exist).
+    // All rename quality checks are consolidated here. Each rename candidate
+    // is either accepted or rejected. Rejected pairs become Removed + Added
+    // in the final output (for LLM-assisted fixing instead of mechanical
+    // codemod).
     //
-    // The true cross-family rename (TextVariants → ContentVariants, sim
-    // 0.667, Text/ → Content/) passes because it has the sibling rename
-    // TextContent → Content between the same families.
-    let validated_renames: Vec<_> = compatible_renames
-        .into_iter()
-        .filter(|rm| {
-            // Only apply the guard to cross-family type_alias symbols
-            if rm.old.kind != SymbolKind::TypeAlias || semantics.same_family(rm.old, rm.new) {
-                return true; // same-family or non-type_alias → keep
-            }
+    // Checks applied in order:
+    // 1. Type compatibility — reject structurally incompatible renames
+    // 2. Cross-family type_alias/enum guard — require sibling validation
+    //
+    // See design/rename-detector-verification.md for the full dataset.
+    let (validated_renames, _rejected_renames) = validate_renames(&renames, semantics);
 
-            // Check for a sibling rename between the same two families
-            let old_dir = rm
-                .old
-                .file
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let new_dir = rm
-                .new
-                .file
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let has_sibling = renames.iter().any(|other| {
-                // Must be a different rename (not itself)
-                if other.old.qualified_name == rm.old.qualified_name {
-                    return false;
-                }
-                let other_old_dir = other
-                    .old
-                    .file
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let other_new_dir = other
-                    .new
-                    .file
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                // Same source and target directories (canonicalized)
-                old_dir == other_old_dir && new_dir == other_new_dir
-            });
-
-            if !has_sibling {
-                tracing::info!(
-                    old = %rm.old.name,
-                    new = %rm.new.name,
-                    old_dir = %old_dir,
-                    new_dir = %new_dir,
-                    "Cross-family type_alias rename with no sibling — rejecting as false positive"
-                );
-            }
-
-            has_sibling
-        })
-        .collect();
-
-    // Only type-compatible renames go into the renamed sets.
-    // Incompatible pairs stay as Removed + Added in the final output.
+    // Only validated renames go into the renamed sets.
     let mut renamed_old: HashSet<&str> = validated_renames
         .iter()
         .map(|r| r.old.qualified_name.as_str())
@@ -869,4 +774,116 @@ impl LanguageSemantics for MinimalSemantics {
     fn visibility_rank(&self, v: crate::types::Visibility) -> u8 {
         helpers::visibility_rank(v)
     }
+}
+
+// ── Rename validation ───────────────────────────────────────────────────
+//
+// Consolidates all rename quality checks in one place. Each candidate
+// rename is either accepted or rejected based on:
+//
+// 1. Type compatibility — structurally incompatible types are rejected
+//    (e.g., SplitButtonOptions → ReactNode[])
+// 2. Cross-family type_alias/enum guard — for cross-family type aliases
+//    and enums, require at least one sibling rename between the same two
+//    directories to validate the match
+
+fn validate_renames<'a>(
+    renames: &'a [rename::RenameMatch<'a>],
+    semantics: &dyn LanguageSemantics,
+) -> (
+    Vec<&'a rename::RenameMatch<'a>>,
+    Vec<&'a rename::RenameMatch<'a>>,
+) {
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+
+    for rm in renames {
+        // ── Check 1: Type compatibility ────────────────────────────────
+        let old_rt = rm
+            .old
+            .signature
+            .as_ref()
+            .and_then(|s| s.return_type.as_deref());
+        let new_rt = rm
+            .new
+            .signature
+            .as_ref()
+            .and_then(|s| s.return_type.as_deref());
+
+        let types_match = match (old_rt, new_rt) {
+            (Some(o), Some(n)) => compare::types_structurally_similar(o, n),
+            _ => true, // No type info → assume compatible
+        };
+
+        if !types_match {
+            tracing::info!(
+                old = %rm.old.name,
+                new = %rm.new.name,
+                old_type = old_rt.unwrap_or("?"),
+                new_type = new_rt.unwrap_or("?"),
+                "Rename rejected: type-incompatible"
+            );
+            rejected.push(rm);
+            continue;
+        }
+
+        // ── Check 2: Cross-family type_alias/enum guard ────────────────
+        //
+        // For cross-family type aliases and enums that passed the 0.50
+        // similarity threshold, require a sibling rename between the same
+        // two directories to validate the match. Without this, high-
+        // similarity cross-family matches like TextListItemVariants →
+        // HelperTextItemVariant (0.714) slip through.
+        let is_type_or_enum = matches!(rm.old.kind, SymbolKind::TypeAlias | SymbolKind::Enum);
+
+        if is_type_or_enum && !semantics.same_family(rm.old, rm.new) {
+            let old_dir = rm
+                .old
+                .file
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let new_dir = rm
+                .new
+                .file
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let has_sibling = renames.iter().any(|other| {
+                if other.old.qualified_name == rm.old.qualified_name {
+                    return false;
+                }
+                let other_old_dir = other
+                    .old
+                    .file
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let other_new_dir = other
+                    .new
+                    .file
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                old_dir == other_old_dir && new_dir == other_new_dir
+            });
+
+            if !has_sibling {
+                tracing::info!(
+                    old = %rm.old.name,
+                    new = %rm.new.name,
+                    old_dir = %old_dir,
+                    new_dir = %new_dir,
+                    "Rename rejected: cross-family type_alias/enum with no sibling rename"
+                );
+                rejected.push(rm);
+                continue;
+            }
+        }
+
+        accepted.push(rm);
+    }
+
+    (accepted, rejected)
 }

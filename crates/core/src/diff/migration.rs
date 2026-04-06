@@ -245,8 +245,13 @@ pub(super) fn detect_migrations<'a>(
             // or isPlain → isPlainList. This is safe for small sets but would
             // produce false positives in large sets due to fingerprint collisions.
             let mut fuzzy_matches: Vec<MemberMapping> = Vec::new();
-            const MAX_FUZZY_SET_SIZE: usize = 5;
-            const FUZZY_MIN_SIMILARITY: f64 = 0.70;
+            // Allow up to 8 unmatched members per side — covers newly-added
+            // interfaces like ContentProps (8 members, 6 unmatched after exact match).
+            const MAX_FUZZY_SET_SIZE: usize = 8;
+            // Threshold of 0.60 catches suffix-extension renames like
+            // isVisited → isVisitedLink (0.69) and isPlain → isPlainList (0.64).
+            // The previous 0.70 threshold rejected both of these.
+            const FUZZY_MIN_SIMILARITY: f64 = 0.60;
 
             if removed_only_names.len() <= MAX_FUZZY_SET_SIZE
                 && added_only_names.len() <= MAX_FUZZY_SET_SIZE
@@ -275,18 +280,48 @@ pub(super) fn detect_migrations<'a>(
 
                     for prm in &prop_renames {
                         let sim = super::rename::name_similarity(&prm.old.name, &prm.new.name);
-                        if sim >= FUZZY_MIN_SIMILARITY {
+                        if sim < FUZZY_MIN_SIMILARITY {
+                            continue;
+                        }
+
+                        // Type compatibility check: reject fuzzy matches where
+                        // the types are structurally incompatible (e.g.,
+                        // onToggle: callback vs toggle: render function).
+                        let old_rt = prm
+                            .old
+                            .signature
+                            .as_ref()
+                            .and_then(|s| s.return_type.as_deref());
+                        let new_rt = prm
+                            .new
+                            .signature
+                            .as_ref()
+                            .and_then(|s| s.return_type.as_deref());
+                        let types_ok = match (old_rt, new_rt) {
+                            (Some(o), Some(n)) => super::compare::types_structurally_similar(o, n),
+                            _ => true, // No type info → assume compatible
+                        };
+                        if !types_ok {
                             tracing::debug!(
                                 old = %prm.old.name,
                                 new = %prm.new.name,
-                                similarity = sim,
-                                "Fuzzy prop rename detected in migration"
+                                old_type = old_rt.unwrap_or("?"),
+                                new_type = new_rt.unwrap_or("?"),
+                                "Fuzzy prop match rejected: type-incompatible"
                             );
-                            fuzzy_matches.push(MemberMapping {
-                                old_name: prm.old.name.clone(),
-                                new_name: prm.new.name.clone(),
-                            });
+                            continue;
                         }
+
+                        tracing::debug!(
+                            old = %prm.old.name,
+                            new = %prm.new.name,
+                            similarity = sim,
+                            "Fuzzy prop rename detected in migration"
+                        );
+                        fuzzy_matches.push(MemberMapping {
+                            old_name: prm.old.name.clone(),
+                            new_name: prm.new.name.clone(),
+                        });
                     }
                 }
             }

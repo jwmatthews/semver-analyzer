@@ -152,32 +152,93 @@ fn find_sibling_replacement_in_report(
         }
     })?;
 
-    // Search all structural changes for renames from the same directory
+    // Collect all candidate replacements with quality scores.
+    // We pick the best one rather than the first one found.
+    let mut candidates: Vec<(String, f64)> = Vec::new();
+
+    let comp_name_lower = comp.name.to_lowercase();
+
     for fc in &report.changes {
         for api_change in &fc.breaking_api_changes {
             if api_change.change != ApiChangeType::Renamed {
                 continue;
             }
 
-            // Check if this rename is from the same canonical directory
+            // The rename must originate from the same canonical directory
             let file_str = fc.file.to_string_lossy();
             let rename_dir = canonical_component_dir(&file_str);
 
-            if rename_dir == comp_dir {
-                // Found a sibling rename — extract the "after" name.
-                // Strip "Props" suffix to get the component name.
-                if let Some(ref after) = api_change.after {
-                    let replacement = after.strip_suffix("Props").unwrap_or(after);
-                    // Don't suggest the same component or the Props variant
-                    if replacement != comp.name && replacement != comp.definition_name {
-                        return Some(replacement.to_string());
-                    }
-                }
+            if rename_dir != comp_dir {
+                continue;
             }
+
+            let after = match &api_change.after {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // Strip "Props" suffix to get the component name
+            let replacement = after.strip_suffix("Props").unwrap_or(after);
+
+            // Don't suggest the same component
+            if replacement == comp.name || replacement == comp.definition_name {
+                continue;
+            }
+
+            // Skip if replacement name is lowercase (it's a prop, not a component)
+            if replacement
+                .chars()
+                .next()
+                .map(|c| c.is_lowercase())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+
+            // Quality check: the replacement name should share naming patterns
+            // with the removed component. E.g., Text → Content is OK because
+            // "TextContent" was renamed to "Content" (the old name contains
+            // the new name or vice versa, or they share significant substrings).
+            //
+            // Reject: Text → Truncate (the rename was TextProps → TruncateProps,
+            // a false rename that shouldn't propagate).
+            let replacement_lower = replacement.to_lowercase();
+            let before_lower = api_change.before.as_deref().unwrap_or("").to_lowercase();
+
+            // Score: how related is this rename to the removed component?
+            // Signal 1: the before name contains the component name
+            // (e.g., "TextContent" contains "Text")
+            let before_contains_comp = before_lower.contains(&comp_name_lower);
+
+            // Signal 2: the replacement name shares prefix/suffix with comp
+            let shared_prefix = comp_name_lower
+                .chars()
+                .zip(replacement_lower.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let prefix_ratio =
+                shared_prefix as f64 / comp_name_lower.len().max(replacement_lower.len()) as f64;
+
+            // Require at least one strong signal
+            if !before_contains_comp && prefix_ratio < 0.3 {
+                continue;
+            }
+
+            // Score: prefer renames where the before name contains the
+            // component name (strongest signal)
+            let score = if before_contains_comp {
+                1.0 + prefix_ratio
+            } else {
+                prefix_ratio
+            };
+
+            candidates.push((replacement.to_string(), score));
         }
     }
 
-    None
+    // Pick the best candidate
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.into_iter().next().map(|(name, _)| name)
 }
 
 fn build_migration_message_v2(comp: &ComponentSummary<TypeScript>) -> String {
