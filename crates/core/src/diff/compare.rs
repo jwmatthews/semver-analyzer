@@ -667,10 +667,13 @@ pub(super) fn diff_members(
     };
 
     // Separate type-compatible from type-incompatible member renames.
+    // Compatible renames (same type category) → StructuralChangeType::Renamed
+    //   (mechanical codemod).
     // Incompatible renames (e.g., splitButtonOptions: SplitButtonOptions →
-    // splitButtonItems: ReactNode[]) should stay as Removed + Added so the
-    // rule generator produces LLM-assisted fixing, not a mechanical codemod.
+    //   splitButtonItems: ReactNode[]) → StructuralChangeType::Changed
+    //   (signature change, routed to LLM-assisted fixing).
     let mut compatible_renames = Vec::new();
+    let mut incompatible_renames = Vec::new();
     for rm in &renames {
         let old_rt = rm
             .old
@@ -695,17 +698,22 @@ pub(super) fn diff_members(
                 new = %rm.new.name,
                 old_type = old_rt.unwrap_or("?"),
                 new_type = new_rt.unwrap_or("?"),
-                "Type-incompatible member rename — keeping as Removed + Added"
+                "Type-incompatible member rename — emitting as signature change"
             );
+            incompatible_renames.push(rm);
         }
     }
 
+    // Build renamed sets from BOTH compatible and incompatible renames so
+    // neither old nor new member appears as a separate Removed/Added entry.
     let renamed_old: std::collections::HashSet<&str> = compatible_renames
         .iter()
+        .chain(incompatible_renames.iter())
         .map(|r| r.old.name.as_str())
         .collect();
     let renamed_new: std::collections::HashSet<&str> = compatible_renames
         .iter()
+        .chain(incompatible_renames.iter())
         .map(|r| r.new.name.as_str())
         .collect();
 
@@ -734,6 +742,32 @@ pub(super) fn diff_members(
                 rm.old.name,
                 rm.new.name,
                 old.name
+            ),
+            is_breaking: true,
+            impact: None,
+            migration_target: None,
+        });
+    }
+
+    // Emit type-incompatible renames as Changed (signature change).
+    // These carry both old and new signatures so the rule generator can
+    // produce a single LLM-assisted migration rule with full context,
+    // instead of a disconnected Removed + Added pair.
+    for rm in &incompatible_renames {
+        changes.push(StructuralChange {
+            symbol: rm.old.name.clone(),
+            qualified_name: format!("{}.{}", old.qualified_name, rm.old.name),
+            kind: rm.old.kind,
+            package: rm.old.package.clone(),
+            change_type: StructuralChangeType::Changed(ChangeSubject::Member {
+                name: rm.old.name.clone(),
+                kind: rm.old.kind,
+            }),
+            before: Some(symbol_summary(rm.old)),
+            after: Some(symbol_summary(rm.new)),
+            description: format!(
+                "property `{}` was replaced by `{}` in `{}` with a different type",
+                rm.old.name, rm.new.name, old.name
             ),
             is_breaking: true,
             impact: None,
@@ -1013,4 +1047,176 @@ fn type_category(t: &str) -> TypeCategory {
 
     // Everything else is a type reference (PascalCase, qualified names, etc.)
     TypeCategory::Reference
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::MinimalSemantics;
+    use crate::types::{Signature, StructuralChangeType, Visibility};
+    use std::path::PathBuf;
+
+    /// Build a Symbol representing a parent interface (e.g., MenuToggleProps)
+    /// with the given member properties.
+    fn make_interface(name: &str, qualified: &str, members: Vec<Symbol>) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            qualified_name: qualified.to_string(),
+            kind: SymbolKind::Interface,
+            visibility: Visibility::Public,
+            file: PathBuf::from(
+                "packages/react-core/src/components/MenuToggle/MenuToggle.MenuToggleProps.d.ts",
+            ),
+            package: Some("@patternfly/react-core".to_string()),
+            import_path: None,
+            line: 1,
+            signature: None,
+            extends: None,
+            implements: vec![],
+            is_abstract: false,
+            type_dependencies: vec![],
+            is_readonly: false,
+            is_static: false,
+            accessor_kind: None,
+            members,
+            rendered_components: vec![],
+            css: vec![],
+        }
+    }
+
+    /// Build a Symbol representing a property member with a type.
+    fn make_member(name: &str, parent_qualified: &str, return_type: &str) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            qualified_name: format!("{}.{}", parent_qualified, name),
+            kind: SymbolKind::Property,
+            visibility: Visibility::Public,
+            file: PathBuf::from(
+                "packages/react-core/src/components/MenuToggle/MenuToggle.MenuToggleProps.d.ts",
+            ),
+            package: Some("@patternfly/react-core".to_string()),
+            import_path: None,
+            line: 1,
+            signature: Some(Signature {
+                return_type: Some(return_type.to_string()),
+                parameters: vec![],
+                is_async: false,
+                type_parameters: vec![],
+            }),
+            extends: None,
+            implements: vec![],
+            is_abstract: false,
+            type_dependencies: vec![],
+            is_readonly: false,
+            is_static: false,
+            accessor_kind: None,
+            members: vec![],
+            rendered_components: vec![],
+            css: vec![],
+        }
+    }
+
+    /// Real PatternFly v5→v6 regression test: splitButtonOptions → splitButtonItems.
+    ///
+    /// In PF v5, MenuToggleProps had `splitButtonOptions: SplitButtonOptions`.
+    /// In PF v6, it was replaced by `splitButtonItems: ReactNode[]`.
+    /// The name similarity (0.73) is detected by rename Pass 4, but the types
+    /// are structurally incompatible (Reference vs Array).
+    ///
+    /// This MUST produce a single Changed (signature change) entry carrying
+    /// both old and new signatures — NOT separate Removed + Added entries,
+    /// which would lose the linkage and produce a useless "remove prop, find
+    /// alternative" fix strategy.
+    #[test]
+    fn test_type_incompatible_member_rename_produces_changed_not_removed_plus_added() {
+        let parent_qn = "packages/react-core/src/components/MenuToggle/MenuToggle.MenuToggleProps";
+
+        // PF v5 MenuToggleProps with splitButtonOptions: SplitButtonOptions
+        // plus a stable member (onClick) that exists in both versions.
+        let old = make_interface(
+            "MenuToggleProps",
+            parent_qn,
+            vec![
+                make_member("splitButtonOptions", parent_qn, "SplitButtonOptions"),
+                make_member("onClick", parent_qn, "(event: MouseEvent) => void"),
+            ],
+        );
+
+        // PF v6 MenuToggleProps with splitButtonItems: ReactNode[]
+        // plus the same stable member.
+        let new = make_interface(
+            "MenuToggleProps",
+            parent_qn,
+            vec![
+                make_member("splitButtonItems", parent_qn, "ReactNode[]"),
+                make_member("onClick", parent_qn, "(event: MouseEvent) => void"),
+            ],
+        );
+
+        let mut changes = Vec::new();
+        diff_members(&old, &new, &mut changes, &MinimalSemantics);
+
+        // There should be exactly one change for the splitButton prop pair.
+        // It must be a Changed entry (structural type change), not Removed + Added.
+        let split_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.symbol.contains("splitButton") || c.description.contains("splitButton"))
+            .collect();
+
+        assert_eq!(
+            split_changes.len(),
+            1,
+            "Type-incompatible rename should produce exactly 1 Changed entry, \
+             not separate Removed + Added. Got {} entries: {:?}",
+            split_changes.len(),
+            split_changes
+                .iter()
+                .map(|c| format!("{:?}: {}", c.change_type, c.description))
+                .collect::<Vec<_>>()
+        );
+
+        let sc = split_changes[0];
+
+        // Must be a Changed variant (maps to SignatureChanged downstream)
+        assert!(
+            matches!(sc.change_type, StructuralChangeType::Changed(..)),
+            "Expected Changed(..), got {:?}",
+            sc.change_type
+        );
+
+        // before must carry the old signature
+        assert_eq!(
+            sc.before.as_deref(),
+            Some("property: splitButtonOptions: SplitButtonOptions"),
+            "before should carry old prop signature"
+        );
+
+        // after must carry the new signature
+        assert_eq!(
+            sc.after.as_deref(),
+            Some("property: splitButtonItems: ReactNode[]"),
+            "after should carry new prop signature"
+        );
+
+        // No separate Removed or Added entries for either prop
+        let removed_or_added: Vec<_> = changes
+            .iter()
+            .filter(|c| {
+                (c.symbol.contains("splitButton") || c.description.contains("splitButton"))
+                    && matches!(
+                        c.change_type,
+                        StructuralChangeType::Removed(..) | StructuralChangeType::Added(..)
+                    )
+            })
+            .collect();
+        assert!(
+            removed_or_added.is_empty(),
+            "There should be no separate Removed/Added entries for the \
+             type-incompatible rename. Found: {:?}",
+            removed_or_added
+                .iter()
+                .map(|c| format!("{:?}: {}", c.change_type, c.description))
+                .collect::<Vec<_>>()
+        );
+    }
 }

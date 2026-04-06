@@ -26,9 +26,7 @@ mod rename;
 mod tests;
 
 use crate::traits::LanguageSemantics;
-use crate::types::{
-    ApiSurface, ChangeSubject, StructuralChange, StructuralChangeType, Symbol, SymbolKind,
-};
+use crate::types::{ApiSurface, ChangeSubject, StructuralChange, StructuralChangeType, Symbol};
 use std::collections::{HashMap, HashSet};
 
 use compare::diff_symbol;

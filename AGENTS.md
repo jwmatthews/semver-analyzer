@@ -108,6 +108,32 @@ Source profiles are extracted in `crates/ts/src/source_profile/`. Submodules:
 - `children_slot.rs` — Children wrapper path tracing
 - `react_api.rs` — React API usage detection (portal, memo, forwardRef)
 
+### Type-Incompatible Member Renames (CRITICAL)
+
+When a property is renamed AND its type changes to a structurally different
+category (e.g., `splitButtonOptions: SplitButtonOptions` →
+`splitButtonItems: ReactNode[]`), the diff engine must emit a **single
+`StructuralChangeType::Changed`** entry — NOT separate Removed + Added entries.
+
+- **rename.rs Pass 4** detects these via name similarity (≥0.6 threshold)
+- **compare.rs `diff_members()`** separates compatible vs incompatible renames
+  using `types_structurally_similar()` (compares `TypeCategory`: Reference vs
+  Array vs Object vs Function vs Primitive vs Tuple)
+- Type-compatible renames → `StructuralChangeType::Renamed` (mechanical codemod)
+- Type-incompatible renames → `StructuralChangeType::Changed` with `before` =
+  old signature, `after` = new signature (routes to LLM-assisted fixing via
+  `ApiChangeType::SignatureChanged`)
+
+**Never** drop type-incompatible renames back to separate Removed + Added. This
+loses the linkage between old and new prop, producing a useless "remove prop,
+find an alternative" fix strategy instead of "prop X was replaced by prop Y
+with a different type."
+
+Regression test:
+`crates/core/src/diff/compare.rs::test_type_incompatible_member_rename_produces_changed_not_removed_plus_added`
+— uses real PatternFly `MenuToggleProps` data
+(`splitButtonOptions: SplitButtonOptions` → `splitButtonItems: ReactNode[]`).
+
 ### Konveyor Rules
 
 - `crates/ts/src/konveyor.rs` — v1 rule generation (TD pipeline)
