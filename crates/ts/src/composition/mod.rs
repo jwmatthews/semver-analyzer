@@ -291,8 +291,8 @@ fn is_prop_passed_component(
     parent_name: &str,
 ) -> bool {
     // Strip parent name prefix to get the child's role suffix
-    let suffix = if child_name.starts_with(parent_name) {
-        &child_name[parent_name.len()..]
+    let suffix = if let Some(stripped) = child_name.strip_prefix(parent_name) {
+        stripped
     } else {
         return false;
     };
@@ -373,7 +373,7 @@ fn infer_ownership_by_name_prefix(
     family_exports: &[String],
     root: &str,
 ) {
-    let root_profile = match profiles.get(root) {
+    let _root_profile = match profiles.get(root) {
         Some(p) => p,
         None => return,
     };
@@ -611,7 +611,7 @@ fn infer_dom_nesting(
 
         let is_list = child_root
             .as_ref()
-            .map_or(false, |r| list_tags.contains(&r.as_str()));
+            .is_some_and(|r| list_tags.contains(&r.as_str()));
         if !is_list {
             continue;
         }
@@ -643,7 +643,7 @@ fn infer_dom_nesting(
                 .rev()
                 .find(|e| e.starts_with(|c: char| c.is_lowercase()));
 
-            let is_flow = parent_slot.map_or(false, |s| flow_containers.contains(&s.as_str()));
+            let is_flow = parent_slot.is_some_and(|s| flow_containers.contains(&s.as_str()));
             if !is_flow {
                 continue;
             }

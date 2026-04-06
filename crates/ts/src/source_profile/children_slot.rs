@@ -260,25 +260,20 @@ fn collect_aliases_from_binding<'a>(
 ) {
     if let BindingPattern::ObjectPattern(obj) = pattern {
         for prop in &obj.properties {
-            match &prop.value {
-                // `{ component = 'td' }` — simple destructuring with default
-                BindingPattern::AssignmentPattern(assign) => {
-                    let binding_name = binding_pattern_name(&assign.left);
-                    if let Some(name) = binding_name {
-                        match &assign.right {
-                            Expression::StringLiteral(s) => {
-                                map.insert(name, AliasValue::Literal(s.value.to_string()));
-                            }
-                            Expression::Identifier(ident) => {
-                                map.insert(name, AliasValue::Ident(ident.name.to_string()));
-                            }
-                            _ => {}
+            // `{ component = 'td' }` — simple destructuring with default
+            if let BindingPattern::AssignmentPattern(assign) = &prop.value {
+                let binding_name = binding_pattern_name(&assign.left);
+                if let Some(name) = binding_name {
+                    match &assign.right {
+                        Expression::StringLiteral(s) => {
+                            map.insert(name, AliasValue::Literal(s.value.to_string()));
                         }
+                        Expression::Identifier(ident) => {
+                            map.insert(name, AliasValue::Ident(ident.name.to_string()));
+                        }
+                        _ => {}
                     }
                 }
-                // Nested object pattern: `const { component: Alias = val } = obj`
-                // The prop.key is the source key, prop.value is the target binding
-                _ => {}
             }
         }
     } else if let BindingPattern::AssignmentPattern(assign) = pattern {
@@ -547,15 +542,13 @@ fn find_children_in_jsx_element<'a>(
     // e.g., <Popper popper={<Menu>{children}</Menu>} />
     for attr_item in &el.opening_element.attributes {
         if let JSXAttributeItem::Attribute(attr) = attr_item {
-            if let Some(value) = &attr.value {
-                if let JSXAttributeValue::ExpressionContainer(container) = value {
-                    if let Some(inner_expr) = container.expression.as_expression() {
-                        path.push(tag_name.clone());
-                        if find_children_in_expression(inner_expr, source, path, aliases) {
-                            return true;
-                        }
-                        path.pop();
+            if let Some(JSXAttributeValue::ExpressionContainer(container)) = &attr.value {
+                if let Some(inner_expr) = container.expression.as_expression() {
+                    path.push(tag_name.clone());
+                    if find_children_in_expression(inner_expr, source, path, aliases) {
+                        return true;
                     }
+                    path.pop();
                 }
             }
         }

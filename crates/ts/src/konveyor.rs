@@ -1392,7 +1392,7 @@ pub fn generate_rules(
         }
     }
 
-    for (old_class_prefix, old_var_prefix, new_var_prefix) in &css_prefix_changes {
+    for (_old_class_prefix, old_var_prefix, new_var_prefix) in &css_prefix_changes {
         rules.push(KonveyorRule {
             rule_id: format!(
                 "semver-consumer-css-stale-var-{}-to-{}",
@@ -2098,7 +2098,7 @@ pub fn generate_dependency_update_rules(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
-    for (_dir_name, info) in pkg_info_cache {
+    for info in pkg_info_cache.values() {
         if packages_with_changes.contains_key(&info.name) {
             continue;
         }
@@ -2720,7 +2720,7 @@ fn api_change_to_rules(
                         .breaking_api_changes
                         .iter()
                         .find(|a| {
-                            let leaf = a.symbol.split('.').last().unwrap_or("");
+                            let leaf = a.symbol.split('.').next_back().unwrap_or("");
                             leaf == new_member.as_str()
                                 && matches!(
                                     a.change,
@@ -2750,7 +2750,6 @@ fn api_change_to_rules(
                         target_type, mechanism, target_type
                     ));
                 }
-                _ => {}
             }
         }
     }

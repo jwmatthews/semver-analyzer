@@ -12,10 +12,10 @@
 //! and carries machine-readable fix_strategy metadata.
 
 use semver_analyzer_core::types::sd::{
-    ChildRelationship, CompositionChange, CompositionChangeType, CompositionTree, ConformanceCheck,
+    ChildRelationship, CompositionChangeType, CompositionTree, ConformanceCheck,
     ConformanceCheckType, SdPipelineResult, SourceLevelCategory, SourceLevelChange,
 };
-use semver_analyzer_core::{AnalysisReport, ApiChange, ApiChangeType, FileChanges};
+use semver_analyzer_core::{AnalysisReport, ApiChangeType};
 use semver_analyzer_konveyor_core::{
     FixStrategyEntry, FrontendPatternFields, FrontendReferencedFields, KonveyorCondition,
     KonveyorRule,
@@ -689,25 +689,22 @@ fn generate_prop_child_migration_rules(
         for change in &file_changes.breaking_api_changes {
             if let Some(component) = extract_component_name_from_symbol(&change.symbol) {
                 if let Some(prop) = extract_prop_name_from_symbol(&change.symbol) {
-                    match &change.change {
-                        ApiChangeType::Removed => {
-                            let is_reactnode = change
-                                .before
-                                .as_ref()
-                                .map(|b| is_react_node_type(b))
-                                .unwrap_or(false);
+                    if change.change == ApiChangeType::Removed {
+                        let is_reactnode = change
+                            .before
+                            .as_ref()
+                            .map(|b| is_react_node_type(b))
+                            .unwrap_or(false);
 
-                            removed_props
-                                .entry(component.clone())
-                                .or_default()
-                                .push(RemovedProp {
-                                    name: prop,
-                                    component,
-                                    is_reactnode,
-                                    before_type: change.before.clone(),
-                                });
-                        }
-                        _ => {}
+                        removed_props
+                            .entry(component.clone())
+                            .or_default()
+                            .push(RemovedProp {
+                                name: prop,
+                                component,
+                                is_reactnode,
+                                before_type: change.before.clone(),
+                            });
                     }
                 }
             }
@@ -720,7 +717,7 @@ fn generate_prop_child_migration_rules(
     // For added props, scan all file changes for new symbols too
     // (TD reports additions as well as removals in some cases)
     // Also check the new API surface directly
-    if let Some(new_surface) = report.changes.first() {
+    if let Some(_new_surface) = report.changes.first() {
         // Build added props from the new surface
         for file_changes in &report.changes {
             for change in &file_changes.breaking_api_changes {
@@ -1364,7 +1361,7 @@ fn extract_bem_prop_name(evidence: &str) -> Option<String> {
 /// migration guidance.
 fn generate_deprecated_migration_rules(
     sd: &SdPipelineResult,
-    component_packages: &HashMap<String, String>,
+    _component_packages: &HashMap<String, String>,
 ) -> Vec<KonveyorRule> {
     let mut rules = Vec::new();
 
@@ -1580,8 +1577,10 @@ fn format_tree_as_jsx(tree: &CompositionTree) -> String {
 
 struct RemovedProp {
     name: String,
+    #[allow(dead_code)]
     component: String,
     is_reactnode: bool,
+    #[allow(dead_code)]
     before_type: Option<String>,
 }
 
@@ -1927,7 +1926,7 @@ fn generate_required_prop_added_rules(
 
     for (component, required) in &sd.new_required_props {
         let old_props = sd.old_component_props.get(component);
-        let old_required = old_props.map(|p| p.clone()).unwrap_or_default();
+        let old_required = old_props.cloned().unwrap_or_default();
 
         // Find required props that are NEW (not in old version)
         let newly_required: Vec<&String> = required

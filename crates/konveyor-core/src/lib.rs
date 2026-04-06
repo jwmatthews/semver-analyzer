@@ -465,7 +465,6 @@ pub fn build_combined_constant_rule(
     }
 }
 
-/// Suppress redundant individual token removal rules.
 // suppress_redundant_token_rules has been removed — the V2 constantgroup
 // path and consolidation handle deduplication of token rules.
 
@@ -1524,6 +1523,7 @@ pub fn build_frontend_condition(
         change
             .before
             .as_deref()
+            .filter(|b| !looks_like_import_path(b))
             .map(extract_leaf_symbol)
             .unwrap_or(leaf_symbol)
     } else {

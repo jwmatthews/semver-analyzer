@@ -774,7 +774,7 @@ fn check_function_flow<'a>(
 /// Handles identifiers, `??`, `||`, `&&`, ternary, etc.
 fn collect_prop_refs_from_expr(
     expr: &Expression,
-    source: &str,
+    _source: &str,
     known_props: &BTreeSet<String>,
     out: &mut Vec<String>,
 ) {
@@ -786,16 +786,16 @@ fn collect_prop_refs_from_expr(
             }
         }
         Expression::LogicalExpression(logical) => {
-            collect_prop_refs_from_expr(&logical.left, source, known_props, out);
-            collect_prop_refs_from_expr(&logical.right, source, known_props, out);
+            collect_prop_refs_from_expr(&logical.left, _source, known_props, out);
+            collect_prop_refs_from_expr(&logical.right, _source, known_props, out);
         }
         Expression::ConditionalExpression(cond) => {
-            collect_prop_refs_from_expr(&cond.test, source, known_props, out);
-            collect_prop_refs_from_expr(&cond.consequent, source, known_props, out);
-            collect_prop_refs_from_expr(&cond.alternate, source, known_props, out);
+            collect_prop_refs_from_expr(&cond.test, _source, known_props, out);
+            collect_prop_refs_from_expr(&cond.consequent, _source, known_props, out);
+            collect_prop_refs_from_expr(&cond.alternate, _source, known_props, out);
         }
         Expression::ParenthesizedExpression(paren) => {
-            collect_prop_refs_from_expr(&paren.expression, source, known_props, out);
+            collect_prop_refs_from_expr(&paren.expression, _source, known_props, out);
         }
         _ => {}
     }

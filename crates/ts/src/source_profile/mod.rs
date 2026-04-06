@@ -379,11 +379,10 @@ fn resolve_heritage_props_type(heritage: &oxc_ast::ast::TSInterfaceHeritage) -> 
     ) {
         // Extract the first type argument — that's the actual Props type
         if let Some(type_args) = &heritage.type_arguments {
-            if let Some(first_param) = type_args.params.first() {
-                if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = first_param {
-                    if let oxc_ast::ast::TSTypeName::IdentifierReference(id) = &type_ref.type_name {
-                        return Some(id.name.to_string());
-                    }
+            if let Some(oxc_ast::ast::TSType::TSTypeReference(type_ref)) = type_args.params.first()
+            {
+                if let oxc_ast::ast::TSTypeName::IdentifierReference(id) = &type_ref.type_name {
+                    return Some(id.name.to_string());
                 }
             }
         }

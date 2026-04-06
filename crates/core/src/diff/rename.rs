@@ -152,8 +152,8 @@ fn regex_replace_all_param_names(s: &str, placeholder: &str) -> String {
             if j < chars.len() && chars[j] == ':' {
                 result.push_str(placeholder);
                 // Keep everything from the end of the word (whitespace + colon)
-                for k in i..=j {
-                    result.push(chars[k]);
+                for ch in &chars[i..=j] {
+                    result.push(*ch);
                 }
                 i = j + 1;
             } else {

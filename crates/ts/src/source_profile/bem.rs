@@ -235,8 +235,7 @@ pub fn classify_bem_relationship(
 ) -> BemRelationship {
     // Check if any of the child's tokens are elements of the parent block
     for token in child_tokens {
-        if token.starts_with(parent_block) {
-            let suffix = &token[parent_block.len()..];
+        if let Some(suffix) = token.strip_prefix(parent_block) {
             if suffix.starts_with(|c: char| c.is_uppercase()) {
                 return BemRelationship::Element {
                     element_name: lowercase_first(suffix),

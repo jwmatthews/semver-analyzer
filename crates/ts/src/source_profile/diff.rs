@@ -51,20 +51,16 @@ fn diff_portal_usage(
                 format!(
                     "{component} now uses createPortal — content renders outside the component's DOM subtree"
                 ),
-                Some(format!(
-                    "screen.getByText() and similar queries cannot find content rendered via portal. \
-                     Use within(document.body).getByText() or configure baseElement in render options."
-                )),
+                Some("screen.getByText() and similar queries cannot find content rendered via portal. \
+                     Use within(document.body).getByText() or configure baseElement in render options.".to_string()),
             )
         } else {
             (
                 format!(
                     "{component} no longer uses createPortal — content renders inline in the component tree"
                 ),
-                Some(format!(
-                    "Content now renders inside the component tree. \
-                     Remove any within(document.body) workarounds if they were used."
-                )),
+                Some("Content now renders inside the component tree. \
+                     Remove any within(document.body) workarounds if they were used.".to_string()),
             )
         };
 
@@ -354,7 +350,7 @@ fn diff_dom_structure(
     }
 
     // Elements removed
-    for (elem, _count) in &old.rendered_elements {
+    for elem in old.rendered_elements.keys() {
         if !new.rendered_elements.contains_key(elem) {
             changes.push(SourceLevelChange {
                 component: component.to_string(),

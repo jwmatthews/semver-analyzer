@@ -741,7 +741,7 @@ fn enrich_trees_with_css(
         let mode_switcher: Option<&str> = member_to_element
             .iter()
             .find(|(_, element)| {
-                lookup_css_el(element).map_or(false, |info| {
+                lookup_css_el(element).is_some_and(|info| {
                     info.is_mode_switcher
                         || (info.display_values.contains("var") && info.has_grid_column)
                 })
@@ -797,7 +797,7 @@ fn enrich_trees_with_css(
         let is_root_level_child = |member: &str| -> bool {
             member_to_element
                 .get(member)
-                .map_or(false, |el| root_level_children.contains(el))
+                .is_some_and(|el| root_level_children.contains(el))
         };
 
         // Move promoted_grid items under the mode-switcher (skip self)
@@ -913,9 +913,9 @@ fn enrich_trees_with_css(
                     .iter()
                     .filter(|(member, element)| {
                         **member != tree.root
-                            && mode_switcher.map_or(true, |s| s != **member)
+                            && (mode_switcher != Some(**member))
                             && lookup_css_el(element)
-                                .map_or(false, |info| info.display_values.contains("flex"))
+                                .is_some_and(|info| info.display_values.contains("flex"))
                     })
                     .map(|(member, element)| (*member, element.as_str()))
                     .collect();
@@ -925,7 +925,7 @@ fn enrich_trees_with_css(
 
                     // Try to find a container whose variable_child_refs include this element
                     let via_var_ref = all_flex_containers.iter().find(|(_, el)| {
-                        lookup_css_el(el).map_or(false, |info| {
+                        lookup_css_el(el).is_some_and(|info| {
                             info.variable_child_refs.contains(member_element.as_str())
                         })
                     });
@@ -940,14 +940,14 @@ fn enrich_trees_with_css(
                         // the rigid flex container (flex-shrink: 0), not in
                         // the wrapping one (flex-wrap: wrap).
                         let child_has_sizing =
-                            lookup_css_el(member_element).map_or(false, |info| info.has_sizing);
+                            lookup_css_el(member_element).is_some_and(|info| info.has_sizing);
 
                         if child_has_sizing {
                             // Find the rigid (non-wrapping) flex container
                             all_flex_containers
                                 .iter()
                                 .find(|(_, el)| {
-                                    lookup_css_el(el).map_or(false, |info| {
+                                    lookup_css_el(el).is_some_and(|info| {
                                         info.flex_shrink_zero && !info.flex_wrap
                                     })
                                 })
@@ -957,7 +957,7 @@ fn enrich_trees_with_css(
                             all_flex_containers
                                 .iter()
                                 .find(|(_, el)| {
-                                    lookup_css_el(el).map_or(false, |info| info.flex_wrap)
+                                    lookup_css_el(el).is_some_and(|info| info.flex_wrap)
                                 })
                                 .map(|(c, _)| *c)
                         }
@@ -1255,7 +1255,7 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
 /// If Menu's tree has edges like Menu → MenuList → MenuItem, this function
 /// projects them as Dropdown → DropdownList → DropdownItem.
 fn project_delegate_trees(
-    trees: &mut Vec<CompositionTree>,
+    trees: &mut [CompositionTree],
     all_profiles: &HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile>,
     all_trees: &[CompositionTree],
 ) {
@@ -1546,18 +1546,18 @@ fn generate_conformance_checks(
         .filter(|e| {
             e.bem_evidence
                 .as_ref()
-                .map_or(false, |ev| ev.contains("BEM element"))
+                .is_some_and(|ev| ev.contains("BEM element"))
         })
         .map(|e| e.child.as_str())
         .collect();
 
     // Check if at least one BEM child is a generic wrapper (div/span with children)
     let has_generic_wrapper = bem_children.iter().any(|name| {
-        profiles.get(*name).map_or(false, |p| {
+        profiles.get(*name).is_some_and(|p| {
             p.has_children_prop
                 && p.children_slot_path
                     .first()
-                    .map_or(false, |tag| matches!(tag.as_str(), "div" | "span"))
+                    .is_some_and(|tag| matches!(tag.as_str(), "div" | "span"))
         })
     });
 
@@ -1580,11 +1580,11 @@ fn generate_conformance_checks(
         let primary_wrapper = bem_children
             .iter()
             .find(|name| {
-                profiles.get(**name).map_or(false, |p| {
+                profiles.get(**name).is_some_and(|p| {
                     p.has_children_prop
                         && p.children_slot_path
                             .first()
-                            .map_or(false, |tag| matches!(tag.as_str(), "div" | "span"))
+                            .is_some_and(|tag| matches!(tag.as_str(), "div" | "span"))
                 })
             })
             .unwrap_or(&bem_children[0]);

@@ -535,12 +535,12 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     if let Some(ref sd) = report.sd_result {
         for (name, version) in &sd.dep_repo_packages {
             let dir_name = name.rsplit('/').next().unwrap_or(name);
-            pkg_info_cache.entry(dir_name.to_string()).or_insert_with(|| {
-                semver_analyzer_konveyor_core::PackageInfo {
+            pkg_info_cache
+                .entry(dir_name.to_string())
+                .or_insert_with(|| semver_analyzer_konveyor_core::PackageInfo {
                     name: name.clone(),
                     version: Some(version.clone()),
-                }
-            });
+                });
         }
     }
 
@@ -567,15 +567,10 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
                 .iter()
                 .filter(|r| {
                     r.labels.iter().any(|l| {
-                        l == "change-type=prop-to-child"
-                            || l == "change-type=deprecated-migration"
+                        l == "change-type=prop-to-child" || l == "change-type=deprecated-migration"
                     })
                 })
-                .filter_map(|r| {
-                    r.fix_strategy
-                        .as_ref()
-                        .and_then(|fs| fs.component.clone())
-                })
+                .filter_map(|r| r.fix_strategy.as_ref().and_then(|fs| fs.component.clone()))
                 .collect();
 
             if !sd_covered.is_empty() {

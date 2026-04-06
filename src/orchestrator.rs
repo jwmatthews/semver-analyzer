@@ -404,8 +404,7 @@ impl<L: Language> Analyzer<L> {
 
                     tokio::task::spawn_blocking(move || {
                         let _span = info_span!("rename_inference").entered();
-                        let rename_phase =
-                            progress_rename.start_phase("Inferring rename patterns");
+                        let rename_phase = progress_rename.start_phase("Inferring rename patterns");
                         let result = Self::infer_rename_patterns(
                             lang_rename.as_ref(),
                             &changes_rename,
@@ -558,39 +557,35 @@ impl<L: Language> Analyzer<L> {
                             // the real version during CI. Fall back to the git tag
                             // (e.g., "v6.4.0" → "6.4.0") if the version looks like
                             // a placeholder.
-                            let effective_version =
-                                if version.starts_with("0.0.0") || version == "0.0.0-development" {
-                                    // Use `git tag -l` with version sort to find the
-                                    // latest release tag (e.g., "v6.4.0"), skipping
-                                    // prerelease tags like "prerelease-v6.4.0-...".
-                                    let tag_version = std::process::Command::new("git")
-                                        .args([
-                                            "tag", "-l", "v[0-9]*",
-                                            "--sort=-v:refname",
-                                        ])
-                                        .current_dir(dep_dir)
-                                        .output()
-                                        .ok()
-                                        .and_then(|o| {
-                                            if o.status.success() {
-                                                let output = String::from_utf8_lossy(&o.stdout);
-                                                output
-                                                    .lines()
-                                                    .next()
-                                                    .map(|tag| {
-                                                        tag.trim()
-                                                            .trim_start_matches('v')
-                                                            .to_string()
-                                                    })
-                                                    .filter(|t| !t.is_empty())
-                                            } else {
-                                                None
-                                            }
-                                        });
-                                    tag_version.unwrap_or_else(|| version.to_string())
-                                } else {
-                                    version.to_string()
-                                };
+                            let effective_version = if version.starts_with("0.0.0")
+                                || version == "0.0.0-development"
+                            {
+                                // Use `git tag -l` with version sort to find the
+                                // latest release tag (e.g., "v6.4.0"), skipping
+                                // prerelease tags like "prerelease-v6.4.0-...".
+                                let tag_version = std::process::Command::new("git")
+                                    .args(["tag", "-l", "v[0-9]*", "--sort=-v:refname"])
+                                    .current_dir(dep_dir)
+                                    .output()
+                                    .ok()
+                                    .and_then(|o| {
+                                        if o.status.success() {
+                                            let output = String::from_utf8_lossy(&o.stdout);
+                                            output
+                                                .lines()
+                                                .next()
+                                                .map(|tag| {
+                                                    tag.trim().trim_start_matches('v').to_string()
+                                                })
+                                                .filter(|t| !t.is_empty())
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                tag_version.unwrap_or_else(|| version.to_string())
+                            } else {
+                                version.to_string()
+                            };
                             info!(name, version = %effective_version, "Captured dep-repo package info");
                             sd.dep_repo_packages
                                 .insert(name.to_string(), effective_version);
@@ -1902,8 +1897,7 @@ impl<L: Language> Analyzer<L> {
         //
         // The old surface uses rendered_components only (no structural changes).
         // The new surface uses all three signals.
-        let deterministic_old =
-            hierarchy.compute_deterministic_hierarchy(old_surface, &[]);
+        let deterministic_old = hierarchy.compute_deterministic_hierarchy(old_surface, &[]);
         let deterministic_new =
             hierarchy.compute_deterministic_hierarchy(new_surface, structural_changes);
 
@@ -1980,10 +1974,8 @@ impl<L: Language> Analyzer<L> {
             "analyzing component hierarchy for both versions"
         );
 
-        let bar = progress.start_counted(
-            "[Hierarchy] Inference",
-            families_needing_llm.len() as u64,
-        );
+        let bar =
+            progress.start_counted("[Hierarchy] Inference", families_needing_llm.len() as u64);
 
         // Run LLM calls concurrently — only for families without deterministic data
         let semaphore = Arc::new(tokio::sync::Semaphore::new(LLM_CONCURRENCY));
@@ -2273,10 +2265,7 @@ fn detect_removed_css_blocks(dep_dir: &Path, from_ref: &str, to_ref: &str) -> Ve
     let old_dirs = list_dirs(from_ref);
     let new_dirs = list_dirs(to_ref);
 
-    let mut removed: Vec<String> = old_dirs
-        .difference(&new_dirs)
-        .cloned()
-        .collect();
+    let mut removed: Vec<String> = old_dirs.difference(&new_dirs).cloned().collect();
     removed.sort();
 
     if !removed.is_empty() {

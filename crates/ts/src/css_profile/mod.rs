@@ -20,7 +20,6 @@ use lightningcss::properties::Property;
 use lightningcss::rules::CssRule;
 use lightningcss::selector::{Combinator, Component, Selector};
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
-use lightningcss::traits::ParseWithOptions;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -166,7 +165,7 @@ pub fn extract_css_profiles_from_dir(dir: &Path) -> Result<HashMap<String, CssBl
         for css_entry in std::fs::read_dir(entry.path())? {
             let css_entry = css_entry?;
             let css_path = css_entry.path();
-            if !css_path.extension().map_or(false, |e| e == "css") {
+            if css_path.extension().is_none_or(|e| e != "css") {
                 continue;
             }
             // Skip minified, sourcemaps, examples
@@ -295,7 +294,7 @@ fn extract_css_block_profile(source: &str, _component_dir: &str) -> Result<CssBl
     }
 
     // Step 3: Detect mode-switchers (display: contents ↔ flex/grid)
-    for (_name, info) in &mut profile.elements {
+    for info in profile.elements.values_mut() {
         let has_contents = info.display_values.contains("contents");
         let has_flex_or_grid =
             info.display_values.contains("flex") || info.display_values.contains("grid");
@@ -374,10 +373,7 @@ fn extract_from_rule(rule: &CssRule, class_prefix: &str, profile: &mut CssBlockP
             // Extract layout properties per element
             for selector in style_rule.selectors.0.iter() {
                 if let Some(element_name) = extract_element_from_selector(selector, class_prefix) {
-                    let info = profile
-                        .elements
-                        .entry(element_name)
-                        .or_insert_with(CssElementInfo::default);
+                    let info = profile.elements.entry(element_name).or_default();
 
                     for property in style_rule.declarations.declarations.iter() {
                         match property {
@@ -597,11 +593,11 @@ fn extract_variable_nesting(source: &str, class_prefix: &str, profile: &mut CssB
                     let info = profile
                         .elements
                         .entry(parent_element.to_string())
-                        .or_insert_with(CssElementInfo::default);
+                        .or_default();
 
                     for child_ref in &parts[1..] {
                         // Stop at property names (start with uppercase)
-                        if child_ref.chars().next().map_or(true, |c| c.is_uppercase()) {
+                        if child_ref.chars().next().is_none_or(|c| c.is_uppercase()) {
                             break;
                         }
                         // Skip modifier markers
@@ -662,10 +658,7 @@ fn detect_grid_column_reverts(source: &str, block_class: &str, profile: &mut Css
                 if let Some(prop_idx) = after_dunder.find("--") {
                     let element = &after_dunder[..prop_idx];
                     if !element.is_empty() {
-                        let info = profile
-                            .elements
-                            .entry(element.to_string())
-                            .or_insert_with(CssElementInfo::default);
+                        let info = profile.elements.entry(element.to_string()).or_default();
                         info.grid_column_reverts = true;
                     }
                 }

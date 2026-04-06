@@ -394,7 +394,7 @@ pub trait HierarchySemantics {
         let mut absorption_children: HashMap<String, BTreeMap<String, Vec<String>>> =
             HashMap::new();
 
-        for (_family_name, members) in &families {
+        for members in families.values() {
             for parent in members.iter() {
                 let removed = match removed_props_by_parent.get(&parent.name) {
                     Some(r) if !r.is_empty() => r,
@@ -455,7 +455,7 @@ pub trait HierarchySemantics {
         // extends_map: family member → external component it wraps
         // e.g., "Dropdown" → "Menu", "DropdownList" → "MenuList"
         let mut extends_map: HashMap<&str, &str> = HashMap::new();
-        for (_, members) in &families {
+        for members in families.values() {
             for sym in members {
                 let props_name = format!("{}Props", sym.name);
                 if let Some(ext_iface) = iface_extends.get(props_name.as_str()) {
@@ -514,7 +514,7 @@ pub trait HierarchySemantics {
                 // ── Signal 1: absorption ─────────────────────────────
                 // Children that absorbed removed props from this parent.
                 if let Some(absorbed) = absorption_children.get(&parent.name) {
-                    for (child_name, _absorbed_props) in absorbed {
+                    for child_name in absorbed.keys() {
                         if !member_names.contains(child_name.as_str()) {
                             continue;
                         }
@@ -588,65 +588,60 @@ pub trait HierarchySemantics {
                         // Skip: either this component doesn't render the
                         // external parent, or the external parent isn't a
                         // container in its family.
-                    } else {
-                        if let Some(ext_sym) = ext_parent_sym {
-                            // For each family member that extends an external component,
-                            // check if that external component is rendered by the
-                            // external parent OR is a known child of it.
-                            for candidate in members.iter() {
-                                if candidate.name == parent.name {
-                                    continue;
-                                }
-                                if children.contains_key(candidate.name.as_str()) {
-                                    continue; // Already found via absorption
-                                }
+                    } else if let Some(ext_sym) = ext_parent_sym {
+                        // For each family member that extends an external component,
+                        // check if that external component is rendered by the
+                        // external parent OR is a known child of it.
+                        for candidate in members.iter() {
+                            if candidate.name == parent.name {
+                                continue;
+                            }
+                            if children.contains_key(candidate.name.as_str()) {
+                                continue; // Already found via absorption
+                            }
 
-                                // Does this candidate extend something from the external family?
-                                if let Some(ext_child) = extends_map.get(candidate.name.as_str()) {
-                                    // ext_child is the external component this candidate wraps.
-                                    // Is it rendered by the external parent?
-                                    let ext_renders_child = ext_sym
-                                        .rendered_components
-                                        .contains(&ext_child.to_string());
+                            // Does this candidate extend something from the external family?
+                            if let Some(ext_child) = extends_map.get(candidate.name.as_str()) {
+                                // ext_child is the external component this candidate wraps.
+                                // Is it rendered by the external parent?
+                                let ext_renders_child =
+                                    ext_sym.rendered_components.contains(&ext_child.to_string());
 
-                                    // Only add the child if:
-                                    // 1. The external parent does NOT render it
-                                    //    (consumers must provide it as JSX child)
-                                    // 2. The candidate's external component is
-                                    //    NOT itself a container (to prevent
-                                    //    mapping parents as children — e.g.,
-                                    //    Menu should not be a child of MenuGroup)
-                                    if !ext_renders_child {
-                                        // Check: is ext_child a container?
-                                        let ext_child_sym = new_surface
-                                            .symbols
-                                            .iter()
-                                            .find(|s| s.name.as_str() == *ext_child);
-                                        let ext_child_is_container = ext_child_sym
-                                            .map(|ec| {
-                                                let ec_family =
-                                                    self.family_name_from_symbols(&[ec]);
-                                                ec.rendered_components.iter().any(|rc| {
-                                                    new_surface
-                                                        .symbols
-                                                        .iter()
-                                                        .filter(|s| self.is_hierarchy_candidate(s))
-                                                        .any(|s| {
-                                                            s.name.as_str() == rc.as_str()
-                                                                && self
-                                                                    .family_name_from_symbols(&[s])
-                                                                    == ec_family
-                                                        })
-                                                })
+                                // Only add the child if:
+                                // 1. The external parent does NOT render it
+                                //    (consumers must provide it as JSX child)
+                                // 2. The candidate's external component is
+                                //    NOT itself a container (to prevent
+                                //    mapping parents as children — e.g.,
+                                //    Menu should not be a child of MenuGroup)
+                                if !ext_renders_child {
+                                    // Check: is ext_child a container?
+                                    let ext_child_sym = new_surface
+                                        .symbols
+                                        .iter()
+                                        .find(|s| s.name.as_str() == *ext_child);
+                                    let ext_child_is_container = ext_child_sym
+                                        .map(|ec| {
+                                            let ec_family = self.family_name_from_symbols(&[ec]);
+                                            ec.rendered_components.iter().any(|rc| {
+                                                new_surface
+                                                    .symbols
+                                                    .iter()
+                                                    .filter(|s| self.is_hierarchy_candidate(s))
+                                                    .any(|s| {
+                                                        s.name.as_str() == rc.as_str()
+                                                            && self.family_name_from_symbols(&[s])
+                                                                == ec_family
+                                                    })
                                             })
-                                            .unwrap_or(false);
+                                        })
+                                        .unwrap_or(false);
 
-                                        if !ext_child_is_container {
-                                            children.insert(
-                                                &candidate.name,
-                                                ExpectedChild::new(&candidate.name, false),
-                                            );
-                                        }
+                                    if !ext_child_is_container {
+                                        children.insert(
+                                            &candidate.name,
+                                            ExpectedChild::new(&candidate.name, false),
+                                        );
                                     }
                                 }
                             }
