@@ -231,12 +231,28 @@ fn build_report_inner(
         let mut reclassified = 0usize;
         for changes in file_api_map.values_mut() {
             for change in changes.iter_mut() {
-                if change.change != ApiChangeType::Removed {
+                if !matches!(
+                    change.change,
+                    ApiChangeType::Removed | ApiChangeType::Renamed
+                ) {
                     continue;
                 }
                 let new_member = match &change.removal_disposition {
                     Some(RemovalDisposition::ReplacedByMember { new_member }) => new_member.clone(),
-                    _ => continue,
+                    _ => {
+                        // For Renamed changes, derive the replacement member
+                        // from the `after` field (e.g., "splitButtonItems" or
+                        // "MenuToggleProps.splitButtonItems").
+                        if change.change == ApiChangeType::Renamed {
+                            if let Some(ref after) = change.after {
+                                after.rsplit('.').next().unwrap_or(after).to_string()
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
                 };
 
                 // Look up the replacement member's type
