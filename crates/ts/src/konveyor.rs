@@ -1380,6 +1380,7 @@ pub fn generate_rules(
                 when: KonveyorCondition::FrontendCssClass {
                     cssclass: FrontendPatternFields {
                         pattern: old_class.clone(),
+                        file_pattern: None,
                     },
                 },
                 fix_strategy: Some(FixStrategyEntry::with_from_to(
@@ -1417,6 +1418,7 @@ pub fn generate_rules(
             when: KonveyorCondition::FrontendCssVar {
                 cssvar: FrontendPatternFields {
                     pattern: old_var_prefix.clone(),
+                    file_pattern: None,
                 },
             },
             fix_strategy: Some(FixStrategyEntry::with_from_to(
@@ -1515,6 +1517,7 @@ pub fn generate_rules(
                 when: KonveyorCondition::FrontendCssVar {
                     cssvar: FrontendPatternFields {
                         pattern: combined_pattern,
+                        file_pattern: None,
                     },
                 },
                 fix_strategy: Some(strategy),

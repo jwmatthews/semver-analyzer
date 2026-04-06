@@ -17,7 +17,8 @@ use semver_analyzer_core::types::sd::{
 };
 use semver_analyzer_core::{AnalysisReport, ApiChange, ApiChangeType, FileChanges};
 use semver_analyzer_konveyor_core::{
-    FixStrategyEntry, FrontendReferencedFields, KonveyorCondition, KonveyorRule,
+    FixStrategyEntry, FrontendPatternFields, FrontendReferencedFields, KonveyorCondition,
+    KonveyorRule,
 };
 
 use crate::TypeScript;
@@ -91,6 +92,9 @@ pub fn generate_sd_rules(
         &sd.source_level_changes,
         &component_packages,
     ));
+
+    // ── CSS class removal rules ─────────────────────────────────────
+    rules.extend(generate_css_class_removal_rules(&sd.removed_css_blocks));
 
     rules
 }
@@ -2300,6 +2304,77 @@ fn generate_test_impact_rules(
     }
 
     rules
+}
+
+// ── CSS class removal rules ─────────────────────────────────────────────
+//
+// When entire CSS component blocks are removed between PF versions (e.g.,
+// Select CSS removed because Select now uses Menu's CSS), generate rules
+// that flag consumer CSS files referencing the removed class prefixes.
+
+const CSS_FILE_PATTERN: &str = ".*\\.css$";
+
+fn generate_css_class_removal_rules(removed_blocks: &[String]) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+
+    for block in removed_blocks {
+        // Match both v5 and v6 prefixed versions of the class, plus any
+        // BEM element or modifier suffixes.
+        // e.g., block "select" → matches:
+        //   .pf-v5-c-select, .pf-v6-c-select
+        //   .pf-v5-c-select__menu, .pf-v6-c-select__menu
+        //   .pf-v5-c-select.pf-m-scrollable
+        let pattern = format!("pf-(v5|v6)-c-{}", block);
+
+        let rule_id = format!("sd-css-removed-{}", block);
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=css-removal".into(),
+                "impact=visual-regression".into(),
+            ],
+            effort: 3,
+            category: "mandatory".into(),
+            description: format!("CSS component class 'pf-c-{}' was removed in PF v6", block),
+            message: format!(
+                "This CSS references the 'pf-c-{}' component class which was removed \
+                 in PatternFly v6.\n\n\
+                 The {} component was rebuilt and no longer uses this CSS class. \
+                 This CSS override is dead and should be removed.\n\n\
+                 Check if the behavior you were overriding is now available via a \
+                 component prop instead.",
+                block,
+                block_to_component_name(block),
+            ),
+            links: vec![],
+            when: KonveyorCondition::FrontendCssClass {
+                cssclass: FrontendPatternFields {
+                    pattern,
+                    file_pattern: Some(CSS_FILE_PATTERN.into()),
+                },
+            },
+            fix_strategy: None,
+        });
+    }
+
+    rules
+}
+
+/// Convert a kebab-case BEM block name to a likely PascalCase component name.
+/// e.g., "select" → "Select", "app-launcher" → "AppLauncher"
+fn block_to_component_name(block: &str) -> String {
+    block
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 // ── Helper functions ────────────────────────────────────────────────────

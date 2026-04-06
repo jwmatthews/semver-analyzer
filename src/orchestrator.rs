@@ -469,18 +469,36 @@ impl<L: Language> Analyzer<L> {
                         None
                     };
 
+                    // Detect CSS component blocks removed between dep-repo versions.
+                    // Compare component directory listings at dep_from vs dep_to.
+                    // Must run before dep_css_dir_sd is consumed below.
+                    let removed_css_blocks = if let (Some(dep_dir), Some(from), Some(to)) =
+                        (&dep_css_dir_sd, &dep_from_sd, &dep_to_sd)
+                    {
+                        detect_removed_css_blocks(dep_dir, from, to)
+                    } else {
+                        Vec::new()
+                    };
+
                     // Use worktree path if available, otherwise fall back to raw dir
                     let css_dir = dep_worktree_guard
                         .as_ref()
                         .map(|g| g.path().to_path_buf())
                         .or(dep_css_dir_sd);
 
-                    lang_sd.run_source_diff(
+                    let mut sd_result = lang_sd.run_source_diff(
                         &repo_sd,
                         &from_sd,
                         &to_sd,
                         css_dir.as_deref(),
-                    )
+                    );
+
+                    // Attach the removed CSS blocks to the SD result
+                    if let Ok(ref mut r) = sd_result {
+                        r.removed_css_blocks = removed_css_blocks;
+                    }
+
+                    sd_result
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("SD task panicked: {}", e))?;
@@ -2210,3 +2228,86 @@ impl<L: Language> Analyzer<L> {
         (deltas, all_new)
     }
 } // end impl Analyzer<L> (private methods, part 2)
+
+/// Detect CSS component blocks removed between two refs of a CSS repo.
+///
+/// Lists the `src/patternfly/components/` directories at each ref using
+/// `git ls-tree`, then returns the directory names that exist in `from_ref`
+/// but not in `to_ref`. These map to CSS BEM block names (e.g., "Select" →
+/// `pf-v5-c-select`).
+fn detect_removed_css_blocks(dep_dir: &Path, from_ref: &str, to_ref: &str) -> Vec<String> {
+    let list_dirs = |git_ref: &str| -> std::collections::HashSet<String> {
+        let output = std::process::Command::new("git")
+            .args([
+                "ls-tree",
+                "--name-only",
+                git_ref,
+                "src/patternfly/components/",
+            ])
+            .current_dir(dep_dir)
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                stdout
+                    .lines()
+                    .filter_map(|line| {
+                        let name = line
+                            .trim()
+                            .strip_prefix("src/patternfly/components/")
+                            .unwrap_or(line.trim());
+                        // Skip SCSS index files
+                        if name.ends_with(".scss") || name.is_empty() {
+                            None
+                        } else {
+                            Some(name.to_string())
+                        }
+                    })
+                    .collect()
+            }
+            _ => std::collections::HashSet::new(),
+        }
+    };
+
+    let old_dirs = list_dirs(from_ref);
+    let new_dirs = list_dirs(to_ref);
+
+    let mut removed: Vec<String> = old_dirs
+        .difference(&new_dirs)
+        .cloned()
+        .collect();
+    removed.sort();
+
+    if !removed.is_empty() {
+        tracing::info!(
+            count = removed.len(),
+            blocks = ?removed,
+            "Detected removed CSS component blocks between dep-repo versions"
+        );
+    }
+
+    // Convert PascalCase directory names to kebab-case BEM block names
+    // e.g., "Select" → "select", "AppLauncher" → "app-launcher"
+    removed
+        .into_iter()
+        .map(|name| pascal_to_kebab(&name))
+        .collect()
+}
+
+/// Convert PascalCase to kebab-case.
+/// e.g., "AppLauncher" → "app-launcher", "Select" → "select"
+fn pascal_to_kebab(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('-');
+            }
+            result.push(c.to_lowercase().next().unwrap());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}

@@ -456,6 +456,13 @@ pub struct SdPipelineResult {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub dep_repo_packages: HashMap<String, String>,
 
+    /// CSS component blocks that were removed between the old and new
+    /// versions of the dependency CSS repo (e.g., "select", "chip").
+    /// Used to generate rules that flag consumer CSS files referencing
+    /// removed PF class prefixes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_css_blocks: Vec<String>,
+
     /// Extracted profiles keyed by component name, for both versions.
     /// Retained for downstream use (rule generation, debugging).
     /// Skipped during serialization — profiles contain tuple-keyed maps
