@@ -335,44 +335,50 @@ cargo test -p semver-analyzer-ts --lib
    checks if a sibling in the same family was renamed. If `TextContent` →
    `Content` exists, annotates `Text`'s removal with "use Content instead."
 
-### Phase 2 (Medium Risk) — Future Work
+### Phase 2 (Medium Risk) — Implemented
 
-3. **Same-family false prop renames**: `isDisabled`→`hasAnimations`,
-   `isOverflowLabel`→`isClickable`, `bodyAriaLabel`→`backdropClassName`. These
-   need fingerprint disambiguation within same-component — cannot be fixed by
-   similarity thresholds alone. Consider: when multiple boolean props are
-   removed and multiple boolean props are added within the same interface,
-   require higher similarity or additional structural context.
+3. **Same-family false prop renames**: Added primitive-type ambiguous group
+   guard in Passes 1-3. When a fingerprint has a primitive return type
+   (`boolean`, `string`, etc.) AND the collision group has >2 members on either
+   side, the threshold is raised from 0.15 to 0.45. This blocks false matches
+   like `isDisabled`→`hasAnimations` (0.23) from large boolean-prop pools while
+   allowing small 1:1 and 2:2 groups to use the lower threshold (preserving
+   true renames like `isActive`→`isClicked`).
 
-4. **TextListItemVariants → HelperTextItemVariant**: Cross-family with similarity
-   0.714. The 0.50 threshold alone won't catch this. Needs additional guard:
-   deprecated type_alias should not match non-related families, or require
-   semantic naming pattern match.
+4. **TextListItemVariants → HelperTextItemVariant**: Added cross-family
+   type_alias guard in `mod.rs` post-filter. For cross-family type_alias
+   renames, requires at least one sibling rename to exist between the same two
+   component families. `TextVariants`→`ContentVariants` passes because it has
+   the sibling `TextContent`→`Content`. `TextListItemVariants`→`HelperTextItemVariant`
+   is rejected because no other Text/→HelperText/ renames exist.
 
-5. **Many-to-one merges**: `Text` + `TextContent` both → `Content`. The 1:1
-   greedy matching can't express this. The rule generator fix (Phase 1 item 2)
-   handles the presentation, but the core algorithm could be enhanced to detect
-   merge patterns explicitly.
+5. **Many-to-one merges**: The rule generator fix (Phase 1 item 2) handles
+   the presentation. Core algorithm enhancement deferred — not needed now.
 
-6. **Composition inversion detection (SD pipeline)**: When a component migrates
-   from deprecated to next-gen API (e.g., deprecated Select → next-gen Select),
-   the SD pipeline should detect "composition inversions" — patterns where the
-   old component managed a subcomponent internally (e.g., `<SelectToggle>`) but
-   the new component exposes a render prop instead (e.g., `toggle={(ref) =>
-   <MenuToggle ref={ref} />}`). This would produce migration rules mapping old
-   internal-management props (`onToggle`, `toggleRef`, `toggleAriaLabel`) to
-   the new render-function pattern. Requires:
-   - Cross-component composition diffing between deprecated and non-deprecated
-     versions
-   - Detecting "render prop delegation" patterns
-   - Mapping old internal component's props to new render prop's pattern
+6. **Composition inversion detection**: Added `generate_composition_inversion_rules()`
+   in `konveyor_v2.rs`. When a family member is removed from the old
+   composition tree AND the root gained a new prop whose type is a render
+   function (`(...) => ReactNode`), emits a `CompositionInversion` rule
+   explaining the before/after pattern. Detects Select/SelectToggle → toggle
+   render prop and similar patterns.
 
-7. **Fuzzy prop matching in migration detection**: Extend `detect_migrations()`
-   to run rename detection on unmatched props between deprecated and non-deprecated
-   interfaces. Would catch mechanical renames like `selections` → `selected`
-   (similarity 0.667) that currently fall into "removed with no equivalent."
+7. **Fuzzy prop matching in migration**: Added small-set fuzzy prop matching
+   in `migration.rs`. After exact name matching, if both unmatched sets are
+   ≤5 members, runs `detect_renames()` with a 0.70 similarity threshold.
+   Catches mechanical renames like `isVisited`→`isVisitedLink` and
+   `isPlain`→`isPlainList`. Skips large sets (Select/Dropdown) to avoid
+   fingerprint collision false positives.
+
+### Remaining Future Work
 
 8. **Fix-guidance data alignment**: The fix-guidance.yaml pipeline has a data
    corruption bug where rule IDs are mapped to wrong symbols (e.g., Text
    component rule IDs mapped to ModalProps descriptions). This is a generation
    pipeline bug, not a rename detector issue.
+
+9. **Cross-boundary profile diffing**: The SD pipeline currently diffs profiles
+   at the same file path across versions. It does NOT compare deprecated Select's
+   profile against next-gen Select's profile. Enhancing this would allow
+   detecting `rendered_components` changes (e.g., old Select rendered
+   `<SelectToggle>`, new Select does not) and correlating with the render prop
+   pattern for richer migration guidance.

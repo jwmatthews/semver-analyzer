@@ -26,7 +26,9 @@ mod rename;
 mod tests;
 
 use crate::traits::LanguageSemantics;
-use crate::types::{ApiSurface, ChangeSubject, StructuralChange, StructuralChangeType, Symbol};
+use crate::types::{
+    ApiSurface, ChangeSubject, StructuralChange, StructuralChangeType, Symbol, SymbolKind,
+};
 use std::collections::{HashMap, HashSet};
 
 use compare::diff_symbol;
@@ -358,13 +360,82 @@ pub fn diff_surfaces_with_semantics(
         }
     }
 
+    // ── Cross-family type_alias guard ─────────────────────────────────
+    //
+    // For cross-family type_alias renames that pass the 0.50 threshold,
+    // require a validation signal: at least one other rename exists between
+    // the same two component families. Without a sibling rename, a high-
+    // similarity cross-family type_alias match is likely false (e.g.,
+    // TextListItemVariants → HelperTextItemVariant, sim 0.714, Text/ vs
+    // HelperText/ — no other Text/ → HelperText/ renames exist).
+    //
+    // The true cross-family rename (TextVariants → ContentVariants, sim
+    // 0.667, Text/ → Content/) passes because it has the sibling rename
+    // TextContent → Content between the same families.
+    let validated_renames: Vec<_> = compatible_renames
+        .into_iter()
+        .filter(|rm| {
+            // Only apply the guard to cross-family type_alias symbols
+            if rm.old.kind != SymbolKind::TypeAlias || semantics.same_family(rm.old, rm.new) {
+                return true; // same-family or non-type_alias → keep
+            }
+
+            // Check for a sibling rename between the same two families
+            let old_dir = rm
+                .old
+                .file
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let new_dir = rm
+                .new
+                .file
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let has_sibling = renames.iter().any(|other| {
+                // Must be a different rename (not itself)
+                if other.old.qualified_name == rm.old.qualified_name {
+                    return false;
+                }
+                let other_old_dir = other
+                    .old
+                    .file
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let other_new_dir = other
+                    .new
+                    .file
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                // Same source and target directories (canonicalized)
+                old_dir == other_old_dir && new_dir == other_new_dir
+            });
+
+            if !has_sibling {
+                tracing::info!(
+                    old = %rm.old.name,
+                    new = %rm.new.name,
+                    old_dir = %old_dir,
+                    new_dir = %new_dir,
+                    "Cross-family type_alias rename with no sibling — rejecting as false positive"
+                );
+            }
+
+            has_sibling
+        })
+        .collect();
+
     // Only type-compatible renames go into the renamed sets.
     // Incompatible pairs stay as Removed + Added in the final output.
-    let mut renamed_old: HashSet<&str> = compatible_renames
+    let mut renamed_old: HashSet<&str> = validated_renames
         .iter()
         .map(|r| r.old.qualified_name.as_str())
         .collect();
-    let mut renamed_new: HashSet<&str> = compatible_renames
+    let mut renamed_new: HashSet<&str> = validated_renames
         .iter()
         .map(|r| r.new.qualified_name.as_str())
         .collect();
@@ -408,9 +479,10 @@ pub fn diff_surfaces_with_semantics(
         map
     };
 
-    // Emit rename changes (type-compatible only — incompatible pairs
+    // Emit rename changes (type-compatible and validated only —
+    // incompatible pairs and unvalidated cross-family type_alias renames
     // stay as Removed + Added for LLM-assisted fixing)
-    for rm in &compatible_renames {
+    for rm in &validated_renames {
         // Same export name, different file path. Check whether the
         // consumer-facing import path changed (e.g., a symbol moved from
         // `@patternfly/react-charts` to `@patternfly/react-charts/victory`).

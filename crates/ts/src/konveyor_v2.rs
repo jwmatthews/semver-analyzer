@@ -93,6 +93,12 @@ pub fn generate_sd_rules(
         &component_packages,
     ));
 
+    // ── Composition inversion rules (internal → render prop) ──────
+    rules.extend(generate_composition_inversion_rules(
+        sd,
+        &component_packages,
+    ));
+
     // ── Prop attribute override rules ──────────────────────────────
     rules.extend(generate_prop_attribute_override_rules(
         &sd.source_level_changes,
@@ -2317,6 +2323,187 @@ fn generate_test_impact_rules(
 // When entire CSS component blocks are removed between PF versions (e.g.,
 // Select CSS removed because Select now uses Menu's CSS), generate rules
 // that flag consumer CSS files referencing the removed class prefixes.
+
+// ── Composition inversion rules ─────────────────────────────────────────
+// Detect when an internal subcomponent was removed from a family and the
+// parent gained a render-function prop instead. The consumer must now provide
+// the subcomponent via a render prop rather than having it managed internally.
+//
+// Example: deprecated Select rendered <SelectToggle> internally. Next-gen
+// Select exposes `toggle: (toggleRef) => ReactNode` — the consumer provides
+// <MenuToggle> via the render prop.
+
+/// Returns true if the type string looks like a render function — a function
+/// that returns a React element. Matches patterns like:
+/// - `(toggleRef: React.Ref<...>) => React.ReactNode`
+/// - `((toggleRef: React.RefObject<any>) => React.ReactNode) | SelectToggleProps`
+fn is_render_prop_type(type_str: &str) -> bool {
+    type_str.contains("=>") && {
+        let lower = type_str.to_lowercase();
+        lower.contains("reactnode")
+            || lower.contains("react.reactnode")
+            || lower.contains("reactelement")
+            || lower.contains("jsx.element")
+    }
+}
+
+fn generate_composition_inversion_rules(
+    sd: &SdPipelineResult,
+    component_packages: &HashMap<String, String>,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+
+    for new_tree in &sd.composition_trees {
+        let root = &new_tree.root;
+        let pkg = pkg_for(root, component_packages);
+
+        // Find the old tree for this family
+        let old_tree = match sd.old_composition_trees.iter().find(|t| t.root == *root) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        // Find removed family members (in old tree but not in new tree)
+        let new_members: HashSet<&str> =
+            new_tree.family_members.iter().map(|s| s.as_str()).collect();
+
+        // Compute added props on the root
+        let old_root_props: BTreeSet<&str> = sd
+            .old_component_props
+            .get(root)
+            .map(|s| s.iter().map(|p| p.as_str()).collect())
+            .unwrap_or_default();
+        let new_root_props: BTreeSet<&str> = sd
+            .new_component_props
+            .get(root)
+            .map(|s| s.iter().map(|p| p.as_str()).collect())
+            .unwrap_or_default();
+        let added_props: BTreeSet<&str> = new_root_props
+            .difference(&old_root_props)
+            .copied()
+            .collect();
+
+        // Get prop types for the root
+        let new_prop_types = sd.new_component_prop_types.get(root);
+
+        for old_member in &old_tree.family_members {
+            // Only consider removed members
+            if new_members.contains(old_member.as_str()) || old_member == root {
+                continue;
+            }
+
+            // Check if any added prop on the root is a render function whose
+            // name matches the removed member. We check several patterns:
+            // - "SelectToggle" removed, "toggle" prop added
+            // - Strip the root prefix: "Select" + "Toggle" → "toggle"
+            let member_lower = old_member.to_lowercase();
+            let root_lower = root.to_lowercase();
+            let stripped = member_lower
+                .strip_prefix(&root_lower)
+                .unwrap_or(&member_lower);
+
+            for prop_name in &added_props {
+                let prop_lower = prop_name.to_lowercase();
+
+                // Check name match: prop matches the stripped member name
+                if prop_lower != stripped
+                    && !stripped.contains(&prop_lower)
+                    && !prop_lower.contains(stripped)
+                {
+                    continue;
+                }
+
+                // Check if the prop type is a render function
+                let is_render = new_prop_types
+                    .and_then(|types| types.get(*prop_name))
+                    .map(|t| is_render_prop_type(t))
+                    .unwrap_or(false);
+
+                if !is_render {
+                    continue;
+                }
+
+                // Composition inversion detected!
+                let prop_type = new_prop_types
+                    .and_then(|types| types.get(*prop_name))
+                    .cloned()
+                    .unwrap_or_default();
+
+                let rule_id = format!(
+                    "sd-composition-inversion-{}-{}-to-{}",
+                    sanitize(root),
+                    sanitize(old_member),
+                    sanitize(prop_name),
+                );
+
+                let message = format!(
+                    "<{root}> no longer internally renders <{old_member}>.\n\
+                     Instead, provide a render function via the `{prop}` prop.\n\n\
+                     The `{prop}` prop accepts: `{prop_type}`\n\n\
+                     Before (v5):\n\
+                     \x20 <{root}>\n\
+                     \x20   {{/* {old_member} was rendered internally */}}\n\
+                     \x20 </{root}>\n\n\
+                     After (v6):\n\
+                     \x20 <{root} {prop}={{(ref) => <MenuToggle ref={{ref}}>...</MenuToggle>}}>\n\
+                     \x20   ...\n\
+                     \x20 </{root}>\n\n\
+                     Any props previously passed to <{root}> that controlled {old_member}\n\
+                     (e.g., onToggle, toggleRef, toggleAriaLabel) should now be set\n\
+                     directly on the component you provide via the `{prop}` render function.",
+                    root = root,
+                    old_member = old_member,
+                    prop = prop_name,
+                    prop_type = prop_type,
+                );
+
+                rules.push(KonveyorRule {
+                    rule_id,
+                    labels: vec![
+                        "source=semver-analyzer".into(),
+                        "change-type=composition-inversion".into(),
+                        format!("package={}", pkg),
+                        format!("family={}", root),
+                    ],
+                    effort: 5,
+                    category: "mandatory".into(),
+                    description: format!(
+                        "<{}> internal <{}> replaced by `{}` render prop",
+                        root, old_member, prop_name,
+                    ),
+                    message,
+                    links: vec![],
+                    when: KonveyorCondition::FrontendReferenced {
+                        referenced: FrontendReferencedFields {
+                            pattern: format!("^{}$", regex_escape(root)),
+                            location: "IMPORT".into(),
+                            component: None,
+                            parent: None,
+                            not_parent: None,
+                            not_child: None,
+                            parent_from: None,
+                            value: None,
+                            from: Some(pkg.clone()),
+                            file_pattern: None,
+                        },
+                    },
+                    fix_strategy: Some(FixStrategyEntry {
+                        strategy: "CompositionInversion".into(),
+                        from: Some(old_member.clone()),
+                        to: Some(prop_name.to_string()),
+                        component: Some(root.clone()),
+                        prop: Some(prop_name.to_string()),
+                        ..Default::default()
+                    }),
+                });
+
+                break; // Only one rule per removed member
+            }
+        }
+    }
+
+    rules
+}
 
 // ── Prop attribute override rules ───────────────────────────────────────
 // When a component extracts a prop, transforms it via a helper, and spreads

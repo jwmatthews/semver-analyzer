@@ -63,6 +63,29 @@ impl MemberFingerprint {
         }
     }
 
+    /// Returns true if the return type is a primitive (boolean, string, number,
+    /// etc.) or absent entirely. Primitive fingerprints are degenerate — they
+    /// match ALL symbols of the same type, providing zero discriminating signal.
+    /// When the collision group is large (multiple candidates), the similarity
+    /// threshold should be raised to prevent false rename matches among leftovers.
+    fn is_primitive_or_absent(&self) -> bool {
+        match &self.return_type {
+            None => true,
+            Some(t) => matches!(
+                t.as_str(),
+                "boolean"
+                    | "string"
+                    | "number"
+                    | "void"
+                    | "null"
+                    | "undefined"
+                    | "any"
+                    | "unknown"
+                    | "never"
+            ),
+        }
+    }
+
     /// Create a fingerprint with deep normalization that also replaces
     /// string literal values with placeholders. This catches renames where
     /// the enum values also changed (e.g., spacer → gap where
@@ -243,6 +266,43 @@ pub(super) fn detect_renames<'a>(
         *removed_by_fp.entry(fp).or_default() += 1;
     }
 
+    // ── Similarity thresholds ──────────────────────────────────────────
+    //
+    // Same-family (0.15): Catches low-similarity renames like "isActive" →
+    // "isClicked". Exact type match is the primary signal.
+    //
+    // Cross-family (0.50): Higher bar for different component directories.
+    // Prevents false renames like "DropdownSeparator" → "DrawerPanelDescription".
+    //
+    // Primitive ambiguous (0.45): When a fingerprint has a primitive return
+    // type (boolean, string, etc.) AND the collision group has >2 members on
+    // either side, the type provides zero signal. Raise the bar to prevent
+    // false matches like "isDisabled" → "hasAnimations" (0.23) from large
+    // boolean-prop collision pools. The >2 threshold allows small 1:1 and 2:2
+    // groups to use the lower threshold, since those are still constrained
+    // enough for greedy matching to work correctly.
+    //
+    // See design/rename-detector-verification.md for threshold analysis.
+    const MIN_SIMILARITY: f64 = 0.15;
+    const CROSS_FAMILY_MIN_SIMILARITY: f64 = 0.50;
+    const PRIMITIVE_AMBIGUOUS_MIN_SIMILARITY: f64 = 0.45;
+
+    // Compute the effective similarity threshold for a candidate pair.
+    let effective_threshold = |rsym: &Symbol,
+                               asym: &Symbol,
+                               fp: &MemberFingerprint,
+                               removed_count: usize,
+                               added_count: usize|
+     -> f64 {
+        if !same_family(rsym, asym) {
+            CROSS_FAMILY_MIN_SIMILARITY
+        } else if fp.is_primitive_or_absent() && (removed_count > 2 || added_count > 2) {
+            PRIMITIVE_AMBIGUOUS_MIN_SIMILARITY
+        } else {
+            MIN_SIMILARITY
+        }
+    };
+
     for (ri, rsym) in removed.iter().enumerate() {
         let fp = MemberFingerprint::from_symbol(rsym);
 
@@ -254,11 +314,8 @@ pub(super) fn detect_renames<'a>(
             }
             for (ai, asym) in added_syms {
                 let sim = name_similarity(&rsym.name, &asym.name);
-                let threshold = if same_family(rsym, asym) {
-                    MIN_SIMILARITY
-                } else {
-                    CROSS_FAMILY_MIN_SIMILARITY
-                };
+                let threshold =
+                    effective_threshold(rsym, asym, &fp, removed_count, added_syms.len());
                 if sim >= threshold {
                     candidates.push((ri, *ai, sim));
                 }
@@ -282,9 +339,15 @@ pub(super) fn detect_renames<'a>(
         let fp = MemberFingerprint::from_symbol_normalized(sym);
         structural_fp.entry(fp).or_default().push((ai, sym));
     }
+    let mut removed_by_structural_fp: HashMap<MemberFingerprint, usize> = HashMap::new();
+    for rsym in removed.iter() {
+        let fp = MemberFingerprint::from_symbol_normalized(rsym);
+        *removed_by_structural_fp.entry(fp).or_default() += 1;
+    }
 
     for (ri, rsym) in removed.iter().enumerate() {
         let fp = MemberFingerprint::from_symbol_normalized(rsym);
+        let removed_count = removed_by_structural_fp.get(&fp).copied().unwrap_or(0);
 
         if let Some(added_syms) = structural_fp.get(&fp) {
             if added_syms.len() > MAX_GROUP_SIZE {
@@ -296,11 +359,8 @@ pub(super) fn detect_renames<'a>(
                     continue;
                 }
                 let sim = name_similarity(&rsym.name, &asym.name);
-                let threshold = if same_family(rsym, asym) {
-                    MIN_SIMILARITY
-                } else {
-                    CROSS_FAMILY_MIN_SIMILARITY
-                };
+                let threshold =
+                    effective_threshold(rsym, asym, &fp, removed_count, added_syms.len());
                 if sim >= threshold {
                     candidates.push((ri, *ai, sim));
                 }
@@ -319,9 +379,15 @@ pub(super) fn detect_renames<'a>(
         let fp = MemberFingerprint::from_symbol_deep_normalized(sym);
         deep_fp.entry(fp).or_default().push((ai, sym));
     }
+    let mut removed_by_deep_fp: HashMap<MemberFingerprint, usize> = HashMap::new();
+    for rsym in removed.iter() {
+        let fp = MemberFingerprint::from_symbol_deep_normalized(rsym);
+        *removed_by_deep_fp.entry(fp).or_default() += 1;
+    }
 
     for (ri, rsym) in removed.iter().enumerate() {
         let fp = MemberFingerprint::from_symbol_deep_normalized(rsym);
+        let removed_count = removed_by_deep_fp.get(&fp).copied().unwrap_or(0);
 
         if let Some(added_syms) = deep_fp.get(&fp) {
             if added_syms.len() > MAX_GROUP_SIZE {
@@ -333,11 +399,8 @@ pub(super) fn detect_renames<'a>(
                     continue;
                 }
                 let sim = name_similarity(&rsym.name, &asym.name);
-                let threshold = if same_family(rsym, asym) {
-                    MIN_SIMILARITY
-                } else {
-                    CROSS_FAMILY_MIN_SIMILARITY
-                };
+                let threshold =
+                    effective_threshold(rsym, asym, &fp, removed_count, added_syms.len());
                 if sim >= threshold {
                     candidates.push((ri, *ai, sim));
                 }
@@ -417,22 +480,6 @@ pub(super) fn detect_renames<'a>(
     let mut used_removed = vec![false; removed.len()];
     let mut used_added = vec![false; added.len()];
     let mut matches = Vec::new();
-
-    // Minimum similarity thresholds for rename candidates.
-    //
-    // Same-family (0.15): Catches cases like "isActive" → "isClicked" (share
-    // "is" prefix), "chipGroupContentRef" → "labelGroupContentRef".
-    // Exact type match is the primary signal; name similarity is tiebreaker.
-    //
-    // Cross-family (0.50): Higher bar when symbols come from different component
-    // directories. Prevents false renames like "DropdownSeparator" →
-    // "DrawerPanelDescription" (0.36, Dropdown/ vs Drawer/) while preserving
-    // legitimate cross-family renames like "TextVariants" → "ContentVariants"
-    // (0.67, Text/ vs Content/).
-    //
-    // See design/rename-detector-verification.md for threshold analysis.
-    const MIN_SIMILARITY: f64 = 0.15;
-    const CROSS_FAMILY_MIN_SIMILARITY: f64 = 0.50;
 
     for (ri, ai, sim) in candidates {
         if sim < MIN_SIMILARITY {
@@ -1523,6 +1570,56 @@ mod token_tests {
         );
         assert_eq!(matches[0].old.name, "TextVariants");
         assert_eq!(matches[0].new.name, "ContentVariants");
+    }
+
+    #[test]
+    fn test_primitive_ambiguous_guard_rejects_false_boolean_renames() {
+        // Simulate DualListSelector: many boolean props removed and added.
+        // isDisabled → hasAnimations (sim 0.231) should be rejected because
+        // the boolean fingerprint group has >2 members on the removed side,
+        // triggering the primitive-ambiguous guard (threshold 0.45).
+        let removed = vec![
+            make_prop("isDisabled", "DLS.DLSProps", "boolean"),
+            make_prop("isSearchable", "DLS.DLSProps", "boolean"),
+            make_prop("isCompact", "DLS.DLSProps", "boolean"),
+        ];
+        let added = vec![
+            make_prop("hasAnimations", "DLS.DLSProps", "boolean"),
+            make_prop("hasCheckbox", "DLS.DLSProps", "boolean"),
+            make_prop("hasTooltip", "DLS.DLSProps", "boolean"),
+        ];
+
+        let removed_refs: Vec<&Symbol> = removed.iter().collect();
+        let added_refs: Vec<&Symbol> = added.iter().collect();
+        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
+
+        // None of these boolean props should match — all similarities are
+        // below 0.45 and the group is ambiguous (3 removed, 2 added).
+        assert!(
+            matches.is_empty(),
+            "Ambiguous boolean prop group should not produce false renames, got: {:?}",
+            matches
+                .iter()
+                .map(|m| (&m.old.name, &m.new.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_primitive_guard_allows_1to1_boolean_rename() {
+        // When there's only 1 boolean removed and 1 boolean added (no
+        // ambiguity), the primitive guard should NOT apply.
+        let removed = vec![make_prop("isActive", "Button.ButtonProps", "boolean")];
+        let added = vec![make_prop("isClicked", "Button.ButtonProps", "boolean")];
+
+        let removed_refs: Vec<&Symbol> = removed.iter().collect();
+        let added_refs: Vec<&Symbol> = added.iter().collect();
+        let matches = detect_renames(&removed_refs, &added_refs, |_, _| true);
+
+        // 1:1 group → primitive guard doesn't apply → 0.15 threshold → 0.444 passes
+        assert_eq!(matches.len(), 1, "1:1 boolean rename should still match");
+        assert_eq!(matches[0].old.name, "isActive");
+        assert_eq!(matches[0].new.name, "isClicked");
     }
 }
 

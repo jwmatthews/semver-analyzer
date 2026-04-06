@@ -227,9 +227,80 @@ pub(super) fn detect_migrations<'a>(
                 continue;
             }
 
-            let removed_only: Vec<String> = removed_members
+            let removed_only_names: Vec<&str> = removed_members
                 .iter()
                 .filter(|m| !effective_candidate_members.contains(*m))
+                .copied()
+                .collect();
+            let added_only_names: Vec<&str> = effective_candidate_members
+                .iter()
+                .filter(|m| !removed_members.contains(*m))
+                .copied()
+                .collect();
+
+            // ── Small-set fuzzy prop matching ──────────────────────────
+            //
+            // When both unmatched sets are small (≤5), run rename detection
+            // to catch mechanical prop renames like isVisited → isVisitedLink
+            // or isPlain → isPlainList. This is safe for small sets but would
+            // produce false positives in large sets due to fingerprint collisions.
+            let mut fuzzy_matches: Vec<MemberMapping> = Vec::new();
+            const MAX_FUZZY_SET_SIZE: usize = 5;
+            const FUZZY_MIN_SIMILARITY: f64 = 0.70;
+
+            if removed_only_names.len() <= MAX_FUZZY_SET_SIZE
+                && added_only_names.len() <= MAX_FUZZY_SET_SIZE
+                && !removed_only_names.is_empty()
+                && !added_only_names.is_empty()
+            {
+                // Collect the actual Symbol objects for unmatched props
+                let unmatched_removed: Vec<&Symbol> = removed_sym
+                    .members
+                    .iter()
+                    .filter(|m| removed_only_names.contains(&m.name.as_str()))
+                    .collect();
+                let unmatched_added: Vec<&Symbol> = candidate
+                    .members
+                    .iter()
+                    .filter(|m| added_only_names.contains(&m.name.as_str()))
+                    .collect();
+
+                if !unmatched_removed.is_empty() && !unmatched_added.is_empty() {
+                    // Use detect_renames with same_family=true (within migration)
+                    let prop_renames = super::rename::detect_renames(
+                        &unmatched_removed,
+                        &unmatched_added,
+                        |_, _| true,
+                    );
+
+                    for prm in &prop_renames {
+                        let sim = super::rename::name_similarity(&prm.old.name, &prm.new.name);
+                        if sim >= FUZZY_MIN_SIMILARITY {
+                            tracing::debug!(
+                                old = %prm.old.name,
+                                new = %prm.new.name,
+                                similarity = sim,
+                                "Fuzzy prop rename detected in migration"
+                            );
+                            fuzzy_matches.push(MemberMapping {
+                                old_name: prm.old.name.clone(),
+                                new_name: prm.new.name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Merge fuzzy matches into the matching set and remove them
+            // from the removed_only list.
+            let mut all_matching = matching;
+            let fuzzy_old_names: HashSet<String> =
+                fuzzy_matches.iter().map(|m| m.old_name.clone()).collect();
+            all_matching.extend(fuzzy_matches);
+
+            let removed_only: Vec<String> = removed_only_names
+                .iter()
+                .filter(|m| !fuzzy_old_names.contains(**m))
                 .map(|m| m.to_string())
                 .collect();
 
@@ -238,7 +309,7 @@ pub(super) fn detect_migrations<'a>(
                 .as_ref()
                 .is_none_or(|(_, r, _, _)| best_ratio > *r)
             {
-                best_match = Some((*candidate, best_ratio, matching, removed_only));
+                best_match = Some((*candidate, best_ratio, all_matching, removed_only));
             }
         }
 
