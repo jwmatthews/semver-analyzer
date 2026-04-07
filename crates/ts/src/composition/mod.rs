@@ -414,24 +414,38 @@ fn infer_ownership_by_name_prefix(
         return;
     };
 
-    // Check if root name is a prefix of the children's block
+    // Check if root name is a prefix of the children's block.
+    //
+    // BEM blocks are stored in camelCase (e.g., "labelGroup" from
+    // "label-group"). We need to distinguish:
+    //   - "labelGroup" from "label-group" → separate BEM block (reject)
+    //   - "modalBox" from "modal-box" → sub-block of "modal" (allow)
+    //
+    // Both look the same in camelCase! The difference is whether the
+    // original CSS file name was a hyphenated extension of the root
+    // (e.g., "label" + "-group" = separate block) vs a genuine sub-block.
+    //
+    // Since camelCase erases the hyphen boundary, we instead check
+    // whether the child_block exactly equals the root name (same block)
+    // or starts with it followed by an uppercase letter (sub-element
+    // in the SAME block). When child_block == root_name_lower, the
+    // child shares the root's block. When child_block starts with
+    // root_name + uppercase, it COULD be a sub-block OR a separate
+    // block — we can't tell from camelCase alone.
+    //
+    // The safe approach: only proceed when the child's BEM block is
+    // the SAME as the root's block (child_block == root_name). This
+    // avoids false ownership from naming collisions.
     let child_block_lower = child_block.to_lowercase();
-    if !child_block_lower.starts_with(&root_name_lower) {
-        return;
-    }
-
-    // Reject if the block boundary is at a hyphen — this indicates a
-    // separate BEM block, not a sub-element of the root's block.
-    // e.g., root "label" with child block "label-group":
-    //   remainder = "-group" → starts with '-' → separate block → reject
-    // vs. root "modal" with child block "modalBox":
-    //   remainder = "box" → no hyphen → camelCase element → allow
-    let remainder = &child_block_lower[root_name_lower.len()..];
-    if remainder.starts_with('-') {
+    if child_block_lower != root_name_lower {
+        // Child has a different BEM block name — even if the root name
+        // is a prefix (e.g., "label" prefix of "labelGroup"), we cannot
+        // determine ownership because the camelCase form is ambiguous
+        // between sub-element and separate block.
         debug!(
             root = %root,
             child_block = %child_block,
-            "Rejecting name-prefix ownership — hyphen boundary indicates separate BEM block"
+            "Skipping name-prefix ownership — child block differs from root block"
         );
         return;
     }
@@ -1716,8 +1730,8 @@ mod tests {
 
     #[test]
     fn test_label_labelgroup_no_ownership_edge() {
-        // LabelGroup has BEM block "label-group" — a SEPARATE block from
-        // Label's "label" block. The hyphen boundary means Label should NOT
+        // LabelGroup has BEM block "labelGroup" (camelCase of "label-group")
+        // — a SEPARATE block from Label's "label" block. Label should NOT
         // own LabelGroup via name-prefix inference.
         let mut label = make_profile("Label");
         label.has_children_prop = true;
@@ -1732,7 +1746,7 @@ mod tests {
 
         let mut label_group = make_profile("LabelGroup");
         label_group.has_children_prop = true;
-        label_group.bem_block = Some("label-group".into());
+        label_group.bem_block = Some("labelGroup".into()); // camelCase of "label-group"
         label_group.css_tokens_used = [
             "styles.labelGroup".to_string(),
             "styles.labelGroupList".to_string(),
@@ -1776,7 +1790,7 @@ mod tests {
 
         let mut alert_group = make_profile("AlertGroup");
         alert_group.has_children_prop = true;
-        alert_group.bem_block = Some("alert-group".into());
+        alert_group.bem_block = Some("alertGroup".into()); // camelCase of "alert-group"
         alert_group.css_tokens_used = [
             "styles.alertGroup".to_string(),
             "styles.alertGroupItem".to_string(),
@@ -1805,17 +1819,24 @@ mod tests {
     }
 
     #[test]
-    fn test_modal_modalbox_ownership_allowed() {
-        // Modal owns ModalBox because "modalBox" has no hyphen at the
-        // boundary — it's a camelCase sub-block, not a separate BEM block.
+    fn test_modal_modalbox_no_false_ownership() {
+        // Modal's own BEM block is "backdrop", children use "modalBox".
+        // Even though "modal" is a prefix of "modalBox", the name-prefix
+        // inference should NOT create ownership edges because "modalBox"
+        // is a different block from "modal" (it's a separate CSS file
+        // pf-v6-c-modal-box, not an element of a "modal" block).
+        //
+        // In practice, Modal has zero composition tree edges because its
+        // children (ModalBody, ModalHeader, ModalFooter) are consumer-
+        // provided via {children}, not internally rendered.
         let mut modal = make_profile("Modal");
         modal.has_children_prop = true;
-        modal.bem_block = Some("backdrop".into()); // Modal's own block is different
+        modal.bem_block = Some("backdrop".into());
         modal.css_tokens_used = ["styles.backdrop".to_string()].into_iter().collect();
 
         let mut modal_box = make_profile("ModalBox");
         modal_box.has_children_prop = true;
-        modal_box.bem_block = Some("modalBox".into());
+        modal_box.bem_block = Some("modalBox".into()); // camelCase of "modal-box"
         modal_box.css_tokens_used = [
             "styles.modalBox".to_string(),
             "styles.modalBoxBody".to_string(),
@@ -1838,16 +1859,19 @@ mod tests {
 
         let tree = build_composition_tree(&profiles, &family).unwrap();
 
-        // Modal should own ModalBox (no hyphen at boundary: "modalBox")
-        // ModalBox and ModalBoxBody are camelCase elements
+        // Name-prefix inference should NOT create Modal → ModalBox because
+        // "modalBox" != "modal" (different block). ModalBox → ModalBoxBody
+        // edges may be created via BEM element matching (modalBoxBody is an
+        // element of the modalBox block).
         let modal_owns_box = tree
             .edges
             .iter()
             .any(|e| e.parent == "Modal" && e.child == "ModalBox");
         assert!(
-            modal_owns_box,
-            "Modal should own ModalBox — 'modalBox' is a camelCase sub-block \
-             (no hyphen boundary). Edges: {:?}",
+            !modal_owns_box,
+            "Modal should NOT own ModalBox via name-prefix — 'modalBox' is a different \
+             BEM block from 'modal'. Modal's children are consumer-provided. \
+             Edges: {:?}",
             tree.edges
         );
     }
@@ -1862,7 +1886,7 @@ mod tests {
 
         let mut menu_toggle = make_profile("MenuToggle");
         menu_toggle.has_children_prop = true;
-        menu_toggle.bem_block = Some("menu-toggle".into());
+        menu_toggle.bem_block = Some("menuToggle".into()); // camelCase of "menu-toggle"
         menu_toggle.css_tokens_used = [
             "styles.menuToggle".to_string(),
             "styles.menuToggleIcon".to_string(),
