@@ -1414,6 +1414,13 @@ fn diff_composition_trees(
 
     // Find new required children (edges in new but not in old)
     for ((parent, child), edge) in &new_edges {
+        // Skip internal rendering edges — these are not consumer-facing
+        // children. For example, Tab → TabTitleText via internal OverflowTab
+        // is an implementation detail, not something consumers place in JSX.
+        if edge.relationship == semver_analyzer_core::types::sd::ChildRelationship::Internal {
+            continue;
+        }
+
         if !old_edges.contains_key(&(parent.clone(), child.clone())) {
             changes.push(CompositionChange {
                 family: family.to_string(),
@@ -1469,10 +1476,44 @@ fn generate_conformance_checks(
             .push(edge.parent.as_str());
     }
 
+    // Compute depth from root via BFS over non-internal edges.
+    // Used to detect back-edges: an edge A → B is a back-edge if B
+    // has a smaller depth than A (i.e., points upward toward root).
+    let mut depth: HashMap<&str, usize> = HashMap::new();
+    depth.insert(tree.root.as_str(), 0);
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(tree.root.as_str());
+    while let Some(node) = queue.pop_front() {
+        let node_depth = depth[node];
+        for edge in &tree.edges {
+            if edge.parent == node
+                && edge.relationship != semver_analyzer_core::types::sd::ChildRelationship::Internal
+                && !depth.contains_key(edge.child.as_str())
+            {
+                depth.insert(edge.child.as_str(), node_depth + 1);
+                queue.push_back(edge.child.as_str());
+            }
+        }
+    }
+
     for edge in &tree.edges {
         // Skip internal edges (not consumer-facing)
         if edge.relationship == semver_analyzer_core::types::sd::ChildRelationship::Internal {
             continue;
+        }
+
+        // Skip back-edges that create cycles (e.g., Tab → Tabs where Tabs
+        // is an ancestor of Tab). These represent optional recursive nesting
+        // (nested tabs), not mandatory containment constraints.
+        //
+        // A back-edge is one where the child's depth from root is ≤
+        // the parent's depth (i.e., pointing upward or sideways).
+        let parent_depth = depth.get(edge.parent.as_str()).copied();
+        let child_depth = depth.get(edge.child.as_str()).copied();
+        if let (Some(pd), Some(cd)) = (parent_depth, child_depth) {
+            if cd <= pd {
+                continue;
+            }
         }
 
         // MissingChild: parent should contain this required child
@@ -1819,6 +1860,142 @@ export { DropdownList } from './DropdownList';
                 expected_parent
             } if parent == "Dropdown" && child == "DropdownItem" && expected_parent == "DropdownList"
         )));
+    }
+
+    /// Back-edges (cycles) in the composition tree should NOT generate
+    /// conformance checks. For example, Tab → Tabs (nested tabs) should
+    /// not produce "Tabs must be inside Tab" because top-level Tabs is
+    /// valid without a Tab parent.
+    #[test]
+    fn test_conformance_checks_skip_back_edges() {
+        use semver_analyzer_core::types::sd::{ChildRelationship, CompositionEdge};
+
+        // Mimics the Tabs family: Tabs → Tab (direct_child), Tab → Tabs (direct_child)
+        let tree = CompositionTree {
+            root: "Tabs".to_string(),
+            family_members: vec!["Tabs".to_string(), "Tab".to_string()],
+            edges: vec![
+                CompositionEdge {
+                    parent: "Tabs".to_string(),
+                    child: "Tab".to_string(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                },
+                // Back-edge: Tab → Tabs (for nested tabs)
+                CompositionEdge {
+                    parent: "Tab".to_string(),
+                    child: "Tabs".to_string(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                },
+            ],
+        };
+
+        let checks = generate_conformance_checks("Tabs", &tree, &HashMap::new());
+
+        // "Tab must be in Tabs" should exist (correct, forward edge)
+        assert!(
+            checks.iter().any(|c| {
+                c.description.contains("Tab")
+                    && c.description.contains("Tabs")
+                    && !c.description.contains("Tabs should be inside Tab")
+                    && !c.description.contains("Tabs must")
+            }),
+            "Expected a check for 'Tab must be in Tabs'"
+        );
+
+        // "Tabs must be in Tab" should NOT exist (back-edge, cycle)
+        assert!(
+            !checks.iter().any(|c| {
+                matches!(&c.check_type, ConformanceCheckType::InvalidDirectChild {
+                    child, expected_parent, ..
+                } if child == "Tabs" && expected_parent == "Tab")
+            }),
+            "Back-edge should not produce InvalidDirectChild conformance check"
+        );
+
+        // No MissingChild for Tabs in Tab (not required, and it's a back-edge)
+        assert!(
+            !checks.iter().any(|c| {
+                matches!(&c.check_type, ConformanceCheckType::MissingChild {
+                    parent, expected_child,
+                } if parent == "Tab" && expected_child == "Tabs")
+            }),
+            "Back-edge should not produce MissingChild conformance check"
+        );
+    }
+
+    /// Internal edges should NOT produce NewRequiredChild composition changes.
+    /// For example, Tab → TabTitleText (internal, via collapsed OverflowTab)
+    /// should not generate a "Tab requires TabTitleText as child" change.
+    #[test]
+    fn test_composition_changes_skip_internal_edges() {
+        use semver_analyzer_core::types::sd::{ChildRelationship, CompositionEdge};
+
+        let old_tree = CompositionTree {
+            root: "Tabs".to_string(),
+            family_members: vec![
+                "Tabs".to_string(),
+                "Tab".to_string(),
+                "TabTitleText".to_string(),
+            ],
+            edges: vec![CompositionEdge {
+                parent: "Tabs".to_string(),
+                child: "Tab".to_string(),
+                relationship: ChildRelationship::DirectChild,
+                required: false,
+                bem_evidence: None,
+            }],
+        };
+
+        let new_tree = CompositionTree {
+            root: "Tabs".to_string(),
+            family_members: vec![
+                "Tabs".to_string(),
+                "Tab".to_string(),
+                "TabTitleText".to_string(),
+            ],
+            edges: vec![
+                CompositionEdge {
+                    parent: "Tabs".to_string(),
+                    child: "Tab".to_string(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                },
+                // New internal edge (collapsed from Tab → OverflowTab → TabTitleText)
+                CompositionEdge {
+                    parent: "Tab".to_string(),
+                    child: "TabTitleText".to_string(),
+                    relationship: ChildRelationship::Internal,
+                    required: false,
+                    bem_evidence: Some(
+                        "Collapsed through internal OverflowTab: Tab → OverflowTab → TabTitleText"
+                            .to_string(),
+                    ),
+                },
+            ],
+        };
+
+        let exports: Vec<String> = vec!["Tabs".into(), "Tab".into(), "TabTitleText".into()];
+        let changes =
+            diff_composition_trees("Tabs", Some(&old_tree), &new_tree, &exports, &exports);
+
+        // Should NOT have a NewRequiredChild for Tab → TabTitleText
+        let has_tab_tabtitletext = changes.iter().any(|c| {
+            matches!(&c.change_type, CompositionChangeType::NewRequiredChild {
+                parent, new_child, ..
+            } if parent == "Tab" && new_child == "TabTitleText")
+        });
+
+        assert!(
+            !has_tab_tabtitletext,
+            "Internal edges should not produce NewRequiredChild composition changes. \
+             Got changes: {:?}",
+            changes.iter().map(|c| &c.description).collect::<Vec<_>>()
+        );
     }
 
     #[test]

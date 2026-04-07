@@ -394,10 +394,46 @@ fn generate_conformance_rules(
                 .push(edge.parent.as_str());
         }
 
+        // Compute depth from root via BFS over non-internal edges.
+        // Used to detect back-edges: an edge A → B is a back-edge if B
+        // has a smaller depth than A (i.e., points upward toward root).
+        let mut depth: HashMap<&str, usize> = HashMap::new();
+        depth.insert(tree.root.as_str(), 0);
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(tree.root.as_str());
+        while let Some(node) = queue.pop_front() {
+            let node_depth = depth[node];
+            for edge in &tree.edges {
+                if edge.parent == node
+                    && edge.relationship != ChildRelationship::Internal
+                    && !depth.contains_key(edge.child.as_str())
+                {
+                    depth.insert(edge.child.as_str(), node_depth + 1);
+                    queue.push_back(edge.child.as_str());
+                }
+            }
+        }
+
         for edge in &tree.edges {
             // Skip internal rendering edges — not consumer-facing
             if edge.relationship == ChildRelationship::Internal {
                 continue;
+            }
+
+            // Skip back-edges that create cycles (e.g., Tab → Tabs where
+            // Tabs is the root/ancestor of Tab). These represent optional
+            // recursive nesting patterns (nested tabs), not mandatory
+            // parent-child constraints. Generating a "Tabs must be inside
+            // Tab" rule would incorrectly fire on all top-level <Tabs>.
+            //
+            // A back-edge is one where the child's depth from root is ≤
+            // the parent's depth (i.e., pointing upward or sideways).
+            let parent_depth = depth.get(edge.parent.as_str()).copied();
+            let child_depth = depth.get(edge.child.as_str()).copied();
+            if let (Some(pd), Some(cd)) = (parent_depth, child_depth) {
+                if cd <= pd {
+                    continue;
+                }
             }
 
             let pkg = pkg_for(&edge.child, component_packages);
@@ -2922,6 +2958,67 @@ mod tests {
         } else {
             panic!("Expected FrontendReferenced condition");
         }
+    }
+
+    /// Back-edges (cycles like Tab → Tabs) should NOT generate conformance
+    /// rules. The "Tabs must be in Tab" rule would fire on ALL top-level
+    /// <Tabs> usage, which is incorrect — only nested tabs need Tab as parent.
+    #[test]
+    fn test_conformance_rules_skip_back_edges_to_root() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Tabs".into(), "@patternfly/react-core".into());
+        pkgs.insert("Tab".into(), "@patternfly/react-core".into());
+
+        let tree = CompositionTree {
+            root: "Tabs".into(),
+            family_members: vec!["Tabs".into(), "Tab".into()],
+            edges: vec![
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Tabs".into(),
+                    child: "Tab".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                },
+                // Back-edge: nested tabs pattern
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Tab".into(),
+                    child: "Tabs".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                },
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // "Tab must be in Tabs" should exist (correct forward edge)
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.rule_id == "sd-conformance-tab-must-be-in-tabs"),
+            "Expected 'tab-must-be-in-tabs' rule. Got rules: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // "Tabs must be in Tab" should NOT exist (back-edge cycle)
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r.rule_id == "sd-conformance-tabs-must-be-in-tab"),
+            "Back-edge 'tabs-must-be-in-tab' should be suppressed. Got rules: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // "Tabs not in Tabs use Tab" should NOT exist either
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r.rule_id.contains("tabs-not-in-tabs-use-tab")),
+            "Back-edge InvalidDirectChild should be suppressed. Got rules: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
