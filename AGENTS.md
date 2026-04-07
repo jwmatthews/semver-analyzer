@@ -120,6 +120,57 @@ Source profiles are extracted in `crates/ts/src/source_profile/`. Submodules:
 - `children_slot.rs` — Children wrapper path tracing
 - `react_api.rs` — React API usage detection (portal, memo, forwardRef)
 
+### BEM Block Independence (CRITICAL)
+
+When classifying parent-child relationships via BEM analysis, components with
+their own distinct BEM block must be classified as `Independent`, not as
+elements of another component's block. There are two code paths that enforce
+this:
+
+1. **`classify_bem_relationship()` in `bem.rs`** — Checks `child_block !=
+   parent_block` BEFORE token prefix matching. This prevents camelCase naming
+   collisions (e.g., `labelGroup` from `label-group` appearing to be element
+   `Group` of block `label`).
+
+2. **`infer_ownership_by_name_prefix()` in `composition/mod.rs`** — Uses strict
+   block equality (`child_block_lower == root_name_lower`). Only proceeds when
+   the child's dominant BEM block is the SAME as the root's name. Rejects all
+   cases where they differ, because BEM blocks are stored in camelCase
+   (`kebab_to_camel_case` at extraction time), making it impossible to
+   distinguish separate blocks from sub-elements by name alone.
+
+**Known collision families** (upstream-verified as independent):
+- `label` vs `label-group` (Label / LabelGroup — LabelGroup CONTAINS Labels)
+- `alert` vs `alert-group` (Alert / AlertGroup — AlertGroup CONTAINS Alerts)
+- `menu` vs `menu-toggle` (Menu / MenuToggle — MenuToggle is a trigger, not a child)
+- `form` vs `form-control` (Form / FormControl — separate component)
+- `progress` vs `progress-stepper` (Progress / ProgressStepper — unrelated components)
+
+**Never** add a composition edge between components that have different BEM
+blocks. If a future PF component genuinely needs cross-block ownership, add
+an explicit override rather than weakening the BEM independence checks.
+
+### Composition Rule Generation (CRITICAL)
+
+The rule generator in `konveyor_v2.rs` creates three types of composition rules:
+
+- **`removed-member`** — Fires when a removed component is still used as JSX.
+  These are kept and are correct.
+- **`requires`** — Removed. Redundant with conformance rules which check the
+  same parent-child relationship from the child's perspective (via `notParent`).
+  Conformance is more precise because it only fires when the child is misplaced.
+- **`new-member`** — Removed. The migration rule (`component-import-deprecated`)
+  already lists new child components in its message. New-member rules fired on
+  every parent usage regardless of whether the new child was already present.
+
+**Migration rule `when` clauses** (`component-import-deprecated`) use:
+- `JSX_PROP` conditions (one per removed prop) for Modified components — only
+  fires when a deprecated prop is actually used
+- `IMPORT` trigger for fully Removed components — importing a removed component
+  is itself the issue
+- `child` filter for structural detection — fires when old internal components
+  are still used as children
+
 ### Type-Incompatible Member Renames (CRITICAL)
 
 When a property is renamed AND its type changes to a structurally different
