@@ -305,6 +305,13 @@ pub fn run_sd(
             // and transfer their edges to their parents.
             let exports_set: HashSet<&str> = new_exports.iter().map(|s| s.as_str()).collect();
             collapse_internal_nodes(&mut tree, &exports_set);
+
+            // Use the family name as the tree root identifier. This
+            // distinguishes deprecated/next variants from the main
+            // component (e.g., "deprecated/DualListSelector" vs
+            // "DualListSelector").
+            tree.root = family_name.clone();
+
             composition_trees.push(tree);
         }
 
@@ -550,8 +557,9 @@ fn should_exclude_from_sd(path: &str) -> bool {
     || path.ends_with(".d.ts") || path.ends_with(".d.tsx")
     // Demo/example files
     || path.contains("/examples/") || path.contains("/demos/")
-    // Figma code connect files
+    // Figma code connect files and code-connect package
     || path.contains(".figma.")
+    || path.contains("/code-connect/")
 }
 
 /// Extract the component name from a .tsx filename.
@@ -577,7 +585,21 @@ fn extract_family_from_path(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
     for (i, part) in parts.iter().enumerate() {
         if *part == "components" && i + 1 < parts.len() && i + 2 < parts.len() {
-            return Some(parts[i + 1].to_string());
+            let component_dir = parts[i + 1];
+            // Check if the segment before "components" is a modifier
+            // (e.g., "deprecated" or "next"). If so, prefix the family
+            // name to keep them as separate families.
+            //
+            // src/components/DualListSelector/...          → "DualListSelector"
+            // src/deprecated/components/DualListSelector/... → "deprecated/DualListSelector"
+            // src/next/components/Foo/...                  → "next/Foo"
+            if i > 0 {
+                let prev = parts[i - 1];
+                if prev == "deprecated" || prev == "next" {
+                    return Some(format!("{}/{}", prev, component_dir));
+                }
+            }
+            return Some(component_dir.to_string());
         }
     }
     None
@@ -807,6 +829,14 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
     // becomes Modal → ModalBody).
     //
     // We iterate until no more edges reference internal nodes.
+    //
+    // Cycle detection: track which internal nodes have already been
+    // collapsed. When creating a transitive edge, if the target child
+    // has already been collapsed in a prior iteration, skip it — the
+    // edge would re-enter a cycle among internal nodes and never reach
+    // an exported surface. This causes the loop to make no progress
+    // and break naturally.
+    let mut collapsed_set: HashSet<String> = HashSet::new();
     let mut iteration = 0usize;
     loop {
         iteration += 1;
@@ -847,11 +877,21 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
 
             if !parent_edges.is_empty() && !child_edges.is_empty() {
                 made_progress = true;
+                collapsed_set.insert(internal.clone());
             }
 
             for parent_edge in &parent_edges {
                 for child_edge in &child_edges {
                     if parent_edge.parent == child_edge.child {
+                        continue;
+                    }
+                    // Skip transitive edges to already-collapsed internal
+                    // nodes — this breaks cycles among internals (e.g.,
+                    // TreeViewList → TreeViewRoot → TreeViewListItem →
+                    // TreeViewList). The target was already processed and
+                    // its edges removed; re-creating an edge to it would
+                    // just restart the cycle.
+                    if collapsed_set.contains(&child_edge.child) {
                         continue;
                     }
                     // Inherit the STRONGER strength of the two edges in the chain.

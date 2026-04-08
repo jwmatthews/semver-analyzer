@@ -111,7 +111,8 @@ a single Renamed.
 
 Source profiles are extracted in `crates/ts/src/source_profile/`. Submodules:
 
-- `mod.rs` — Main extraction, JSX walking (also detects cloneElement inline)
+- `mod.rs` — Main extraction, JSX walking (also detects cloneElement inline
+  and JSX elements in parameter/variable destructuring defaults)
 - `prop_defaults.rs` — Default value extraction from destructuring
 - `prop_style.rs` — Prop-to-CSS-class binding detection
 - `managed_attrs.rs` — Prop-overrides-attribute dataflow tracing
@@ -132,18 +133,37 @@ from structural evidence.**
 
 | Step | Signal | Strength | Rationale |
 |------|--------|----------|-----------|
-| 1 | Internal rendering | Required | Component literally renders the child |
-| 2 | CSS direct-child `>` | Required | Styles require exact parent-child DOM |
-| 3 | CSS grid parent-child | Required | Layout breaks without grid container |
-| 3b | CSS implicit grid child | Required | Same — grid layout dependency |
+| 1 | Internal rendering | Required | Component renders the child (JSX body + prop-default JSX) |
+| 2 | CSS direct-child `>` | Required* | Styles require exact parent-child DOM |
+| 3 | CSS grid parent-child | Required* | Layout breaks without grid container |
+| 3b | CSS implicit grid child | Required* | Same — grid layout dependency |
 | 4 | CSS flex context | Allowed | Layout preference, not strict |
 | 5 | CSS descendant ` ` | Allowed | Works at any depth |
 | 6 | React context | Required | Null context = crash/broken behavior |
 | 7 | DOM nesting | Required | Invalid HTML without correct parent |
 | 8 | cloneElement | Required | Missing injected props breaks functionality |
 
-After all steps, members with zero incoming edges are dropped from the tree
-(no "default to root" guessing).
+*Steps 2, 3, 3b use `Allowed` instead of `Required` when the child component
+equals the family root — this indicates recursive/self-nesting (e.g., DataList
+inside DataListContent, Menu inside MenuItem) which is optional, not required.
+
+Step 1 detects JSX elements in **parameter destructuring defaults**
+(`({ bar = <Bar /> }) => ...`) and **variable destructuring defaults**
+(`const { icon = <Icon /> } = this.props`), not just the function body.
+This is critical for components like ChartBullet that receive sub-components
+as props with JSX defaults.
+
+Step 8 has two filters to prevent false edges from shared prop vocabularies:
+(1) skip creating A→B if B→A already exists from a prior step (prevents
+reverse-of-existing cycles), and (2) remove bidirectional cloneElement pairs
+(A→B + B→A both from cloneElement = peers, not hierarchy).
+
+After all steps, members with zero edges (no incoming AND no outgoing) are
+dropped from the tree (no "default to root" guessing). Members with outgoing
+edges but no incoming edges are retained as **secondary roots** — top-level
+containers within the family (e.g., JumpLinksList wraps `<ul>` containing
+JumpLinksItem `<li>` children). Non-exported secondary roots are then properly
+collapsed by `collapse_internal_nodes`.
 
 #### EdgeStrength: Required vs Allowed
 
@@ -205,6 +225,25 @@ parses for path and detail).
 - **Prop-based composition**: Components passed via props (e.g., `panelContent`
   on DrawerContent) create collapsed edges that look like children composition.
   The TD pipeline handles these separately.
+
+#### Family Grouping and Deprecated Separation
+
+`extract_family_from_path` in `sd_pipeline.rs` determines which component
+family a file belongs to. It looks for the `"components"` path segment and
+takes the next segment as the family name. When a modifier directory
+(`deprecated/` or `next/`) precedes `"components"`, it is included as a
+prefix:
+
+- `src/components/DualListSelector/` → `"DualListSelector"`
+- `src/deprecated/components/DualListSelector/` → `"deprecated/DualListSelector"`
+- `src/next/components/Foo/` → `"next/Foo"`
+
+The tree's `root` field is set to the family name (not the component name)
+after tree construction and collapse, so deprecated families are
+distinguishable from main families in the output.
+
+Files from the `code-connect` package (Figma integration) are excluded from
+SD file discovery via `should_exclude_from_sd`.
 
 ### BEM Block Independence (CRITICAL)
 

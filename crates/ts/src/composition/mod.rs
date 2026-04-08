@@ -93,6 +93,16 @@ pub fn build_composition_tree_v2(
             ) {
                 let key = (parent_comp.clone(), child_comp.clone());
                 if parent_comp != child_comp && edge_set.insert(key) {
+                    // Recursive nesting (child == root) is Allowed, not
+                    // Required. E.g., DataList inside DataListContent or
+                    // Menu inside MenuItem are valid CSS-supported patterns
+                    // but not structurally required — most instances don't
+                    // recurse.
+                    let strength = if *child_comp == root {
+                        EdgeStrength::Allowed
+                    } else {
+                        EdgeStrength::Required
+                    };
                     tree.edges.push(CompositionEdge {
                         parent: parent_comp.clone(),
                         child: child_comp.clone(),
@@ -102,7 +112,7 @@ pub fn build_composition_tree_v2(
                             "CSS direct child: .{} > .{}",
                             css_parent, css_child
                         )),
-                        strength: EdgeStrength::Required,
+                        strength,
                     });
                 }
             }
@@ -176,6 +186,11 @@ pub fn build_composition_tree_v2(
             if let Some(parent_comp) = best_parent {
                 let key = (parent_comp.to_string(), child_comp.clone());
                 if edge_set.insert(key) {
+                    let strength = if *child_comp == root {
+                        EdgeStrength::Allowed
+                    } else {
+                        EdgeStrength::Required
+                    };
                     tree.edges.push(CompositionEdge {
                         parent: parent_comp.to_string(),
                         child: child_comp.clone(),
@@ -185,7 +200,7 @@ pub fn build_composition_tree_v2(
                             "CSS grid: {} has grid-template, {} has grid-column/row",
                             parent_comp, child_comp
                         )),
-                        strength: EdgeStrength::Required,
+                        strength,
                     });
                 }
             }
@@ -269,6 +284,11 @@ pub fn build_composition_tree_v2(
                 if let Some(parent_comp) = best_parent {
                     let key = (parent_comp.to_string(), child_comp.clone());
                     if edge_set.insert(key) {
+                        let strength = if *child_comp == root {
+                            EdgeStrength::Allowed
+                        } else {
+                            EdgeStrength::Required
+                        };
                         tree.edges.push(CompositionEdge {
                             parent: parent_comp.to_string(),
                             child: child_comp.clone(),
@@ -278,7 +298,7 @@ pub fn build_composition_tree_v2(
                                 "CSS grid: {} is grid container, {} is implicit grid child",
                                 parent_comp, child_comp
                             )),
-                            strength: EdgeStrength::Required,
+                            strength,
                         });
                     }
                 }
@@ -463,14 +483,24 @@ pub fn build_composition_tree_v2(
     suppress_root_edges_with_intermediate(&mut tree);
 
     // ── Step 10: Drop unconnected members ───────────────────────────
-    // Members with no incoming edge from any signal are dropped from
-    // the tree entirely. No "default to root" guessing — every edge
-    // must have structural evidence. Unconnected members may be
-    // standalone components, context objects, type exports, or members
-    // that need stronger signals to connect.
+    // Members with no edges at all are dropped from the tree entirely.
+    // No "default to root" guessing — every edge must have structural
+    // evidence. Unconnected members may be standalone components,
+    // context objects, type exports, or members that need stronger
+    // signals to connect.
+    //
+    // Members with outgoing edges but no incoming edges are secondary
+    // roots — top-level containers within the family (e.g.,
+    // JumpLinksList wraps <ul> containing JumpLinksItem <li> children,
+    // but nothing is "above" JumpLinksList). These are retained so that
+    // collapse_internal_nodes can properly handle them: exported
+    // secondary roots stay as roots; non-exported ones get collapsed
+    // (and since they have no incoming edges, collapsing removes their
+    // outgoing edges cleanly with zero transitive edges created).
     let parented: HashSet<&str> = tree.edges.iter().map(|e| e.child.as_str()).collect();
+    let parenting: HashSet<&str> = tree.edges.iter().map(|e| e.parent.as_str()).collect();
     tree.family_members
-        .retain(|m| m == &root || parented.contains(m.as_str()));
+        .retain(|m| m == &root || parented.contains(m.as_str()) || parenting.contains(m.as_str()));
 
     Some(tree)
 }
@@ -479,11 +509,31 @@ pub fn build_composition_tree_v2(
 ///
 /// If component A uses `cloneElement(child, { prop1 })` and family member B
 /// declares `prop1` in its interface, then B is a child of A.
+///
+/// Two filters prevent false edges from shared prop vocabularies:
+///
+/// 1. **Skip reverse-of-existing**: If B→A already exists from a prior step
+///    (e.g., Step 1 internal rendering), don't create A→B from cloneElement.
+///    The prior edge establishes the direction; adding the reverse creates a
+///    false cycle.
+///
+/// 2. **Remove bidirectional pairs**: After creating all cloneElement edges,
+///    if both A→B and B→A exist from cloneElement, both are removed. This
+///    indicates a peer relationship (shared prop vocabulary) rather than a
+///    parent-child hierarchy. E.g., chart sub-components that all inject
+///    the same layout props (height, width, theme) into non-family primitives.
 fn infer_clone_element_nesting(
     tree: &mut CompositionTree,
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
 ) {
+    // Collect existing edges from prior steps to detect reverse conflicts
+    let prior_edges: HashSet<(&str, &str)> = tree
+        .edges
+        .iter()
+        .map(|e| (e.parent.as_str(), e.child.as_str()))
+        .collect();
+
     let mut new_edges = Vec::new();
 
     for parent_name in family_exports {
@@ -519,6 +569,11 @@ fn infer_clone_element_nesting(
             if edge_exists(tree, parent_name, child_name) {
                 continue;
             }
+            // Filter 1: skip if reverse edge already exists from a prior step.
+            // If B→A exists (B renders A), creating A→B would be a false cycle.
+            if prior_edges.contains(&(child_name.as_str(), parent_name.as_str())) {
+                continue;
+            }
 
             let Some(child_profile) = profiles.get(child_name) else {
                 continue;
@@ -548,6 +603,16 @@ fn infer_clone_element_nesting(
             }
         }
     }
+
+    // Filter 2: remove bidirectional cloneElement pairs.
+    // If A→B and B→A both come from cloneElement, they indicate peers
+    // with shared prop vocabulary, not a parent-child relationship.
+    let clone_pairs: HashSet<(String, String)> = new_edges
+        .iter()
+        .map(|e| (e.parent.clone(), e.child.clone()))
+        .collect();
+
+    new_edges.retain(|e| !clone_pairs.contains(&(e.child.clone(), e.parent.clone())));
 
     tree.edges.extend(new_edges);
 }
@@ -1512,6 +1577,107 @@ mod tests {
         );
     }
 
+    /// Components with outgoing edges but no incoming edges should be
+    /// retained as secondary roots, not dropped by Step 10.
+    ///
+    /// Models the JumpLinks pattern: JumpLinksList wraps <ul> and
+    /// JumpLinksItem renders <li>. JumpLinksList has no parent in the
+    /// tree, making it a secondary root alongside JumpLinks.
+    #[test]
+    fn test_secondary_root_retained_for_dom_nesting() {
+        // JumpLinks is the primary root (first export).
+        // JumpLinksList wraps <ul>, JumpLinksItem renders <li>.
+        // No signal creates an edge INTO JumpLinksList, but DOM nesting
+        // creates JumpLinksList → JumpLinksItem. JumpLinksList should
+        // survive as a secondary root.
+        let jump_links = make_profile("JumpLinks");
+
+        let mut jump_links_list = make_profile("JumpLinksList");
+        jump_links_list.has_children_prop = true;
+        jump_links_list.children_slot_path = vec!["ul".into()];
+        jump_links_list.rendered_elements.insert("ul".into(), 1);
+
+        let mut jump_links_item = make_profile("JumpLinksItem");
+        jump_links_item.has_children_prop = true;
+        jump_links_item.children_slot_path = vec!["li".into(), "a".into()];
+        jump_links_item.rendered_elements.insert("li".into(), 1);
+
+        let mut profiles = HashMap::new();
+        profiles.insert("JumpLinks".into(), jump_links);
+        profiles.insert("JumpLinksList".into(), jump_links_list);
+        profiles.insert("JumpLinksItem".into(), jump_links_item);
+
+        let family = vec![
+            "JumpLinks".into(),
+            "JumpLinksList".into(),
+            "JumpLinksItem".into(),
+        ];
+
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+
+        // JumpLinksList should be retained as a member (secondary root)
+        assert!(
+            tree.family_members.contains(&"JumpLinksList".into()),
+            "JumpLinksList should be retained as a secondary root. Members: {:?}",
+            tree.family_members
+        );
+
+        // The DOM nesting edge JumpLinksList → JumpLinksItem should exist
+        let list_to_item = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "JumpLinksList" && e.child == "JumpLinksItem");
+        assert!(
+            list_to_item.is_some(),
+            "Expected JumpLinksList → JumpLinksItem from DOM nesting. Edges: {:?}",
+            tree.edges
+        );
+
+        // JumpLinksItem should also be retained (it has an incoming edge)
+        assert!(
+            tree.family_members.contains(&"JumpLinksItem".into()),
+            "JumpLinksItem should be retained (has incoming edge). Members: {:?}",
+            tree.family_members
+        );
+    }
+
+    /// Components with no edges at all should still be dropped by Step 10.
+    #[test]
+    fn test_truly_unconnected_member_still_dropped() {
+        let mut root = make_profile("Root");
+        root.has_children_prop = true;
+
+        let mut child = make_profile("Child");
+        child.has_children_prop = true;
+
+        // Orphan has no edges at all — no structural evidence
+        let orphan = make_profile("Orphan");
+
+        // Create a context edge Root → Child to give them structure
+        root.rendered_components = vec!["RootContext.Provider".into()];
+        child.consumed_contexts = vec!["RootContext".into()];
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Root".into(), root);
+        profiles.insert("Child".into(), child);
+        profiles.insert("Orphan".into(), orphan);
+
+        let family = vec!["Root".into(), "Child".into(), "Orphan".into()];
+
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+
+        // Orphan has no edges, should be dropped
+        assert!(
+            !tree.family_members.contains(&"Orphan".into()),
+            "Orphan with no edges should be dropped. Members: {:?}",
+            tree.family_members
+        );
+
+        // Root and Child should still be present
+        assert!(tree.family_members.contains(&"Root".into()));
+        assert!(tree.family_members.contains(&"Child".into()));
+    }
+
     #[test]
     fn test_menu_menutoggle_no_ownership_edge() {
         // MenuToggle has BEM block "menu-toggle" — separate from Menu.
@@ -1547,6 +1713,129 @@ mod tests {
             "Menu should NOT own MenuToggle — 'menu-toggle' is a separate BEM block. \
              Found edge: {:?}",
             bad_edge
+        );
+    }
+
+    /// Bidirectional cloneElement edges (A→B and B→A) should be removed.
+    /// These indicate peers with shared prop vocabulary, not hierarchy.
+    #[test]
+    fn test_clone_element_bidirectional_pairs_removed() {
+        use semver_analyzer_core::types::sd::CloneElementInjection;
+
+        // Three components: Root, SubA, SubB.
+        // SubA and SubB both inject the same props (height, width)
+        // and both declare the same props. This creates bidirectional
+        // cloneElement edges SubA→SubB and SubB→SubA.
+        let mut root = make_profile("Root");
+        root.has_children_prop = true;
+        // Root renders SubA and SubB via Step 1
+        root.rendered_components = vec!["SubA".into(), "SubB".into()];
+
+        let mut sub_a = make_profile("SubA");
+        sub_a.clone_element_injections = vec![CloneElementInjection {
+            injected_props: vec!["height".into(), "width".into(), "theme".into()],
+        }];
+        sub_a.all_props = vec!["height".into(), "width".into(), "theme".into()]
+            .into_iter()
+            .collect();
+
+        let mut sub_b = make_profile("SubB");
+        sub_b.clone_element_injections = vec![CloneElementInjection {
+            injected_props: vec!["height".into(), "width".into(), "theme".into()],
+        }];
+        sub_b.all_props = vec!["height".into(), "width".into(), "theme".into()]
+            .into_iter()
+            .collect();
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Root".into(), root);
+        profiles.insert("SubA".into(), sub_a);
+        profiles.insert("SubB".into(), sub_b);
+
+        let family = vec!["Root".into(), "SubA".into(), "SubB".into()];
+
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+
+        // Step 1 edges Root→SubA and Root→SubB should exist
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "Root" && e.child == "SubA"),
+            "Root → SubA should exist from internal rendering"
+        );
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "Root" && e.child == "SubB"),
+            "Root → SubB should exist from internal rendering"
+        );
+
+        // Bidirectional cloneElement edges SubA↔SubB should NOT exist
+        let sub_a_to_b = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "SubA" && e.child == "SubB");
+        assert!(
+            sub_a_to_b.is_none(),
+            "SubA → SubB should be removed as bidirectional cloneElement pair. Edges: {:?}",
+            tree.edges
+        );
+
+        let sub_b_to_a = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "SubB" && e.child == "SubA");
+        assert!(
+            sub_b_to_a.is_none(),
+            "SubB → SubA should be removed as bidirectional cloneElement pair. Edges: {:?}",
+            tree.edges
+        );
+    }
+
+    /// cloneElement edge A→B should be skipped when B→A already exists
+    /// from a prior step (e.g., Step 1 internal rendering).
+    #[test]
+    fn test_clone_element_skipped_when_reverse_exists() {
+        use semver_analyzer_core::types::sd::CloneElementInjection;
+
+        // Root renders Sub (Step 1). Sub uses cloneElement to inject
+        // props that Root declares. Without the reverse-edge check,
+        // Sub→Root would be created (wrong). With it, Sub→Root is skipped.
+        let mut root = make_profile("Root");
+        root.has_children_prop = true;
+        root.rendered_components = vec!["Sub".into()];
+        root.all_props = vec!["height".into(), "width".into()].into_iter().collect();
+
+        let mut sub = make_profile("Sub");
+        sub.clone_element_injections = vec![CloneElementInjection {
+            injected_props: vec!["height".into(), "width".into()],
+        }];
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Root".into(), root);
+        profiles.insert("Sub".into(), sub);
+
+        let family = vec!["Root".into(), "Sub".into()];
+
+        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+
+        // Root→Sub should exist from Step 1
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "Root" && e.child == "Sub"),
+            "Root → Sub should exist from internal rendering"
+        );
+
+        // Sub→Root should NOT exist (reverse of Step 1 edge)
+        let bad_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Sub" && e.child == "Root");
+        assert!(
+            bad_edge.is_none(),
+            "Sub → Root should be skipped (reverse of prior Root → Sub). Edges: {:?}",
+            tree.edges
         );
     }
 }

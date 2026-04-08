@@ -19,8 +19,8 @@ incorrect conformance rules that fire as false positive incidents.
 **BEM determines family membership. CSS + React source determine hierarchy.**
 
 Every edge in the tree must have structural evidence from one of 8 signals.
-Components with zero incoming edges are dropped from the tree entirely — no
-"default to root" guessing.
+Components with zero edges are dropped from the tree entirely — no "default to
+root" guessing.
 
 ### EdgeStrength: Required vs Allowed
 
@@ -46,7 +46,7 @@ steps in order:
 
 | Step | Signal | Strength | What It Detects |
 |------|--------|----------|----------------|
-| 1 | Internal rendering | Required | Component A renders component B in its JSX |
+| 1 | Internal rendering | Required | Component A renders component B in its JSX (including prop-default JSX) |
 | 2 | CSS direct-child `>` | Required | `.block__A > .block__B` selector in CSS |
 | 3 | CSS grid parent-child | Required | A has `grid-template-*`, B has `grid-column`/`grid-row` |
 | 3b | CSS implicit grid child | Required | B is in same block as non-root grid container A, has no grid positioning |
@@ -57,7 +57,43 @@ steps in order:
 | 8 | cloneElement | Required | A uses `Children.map + cloneElement({ prop })`, B declares `prop` |
 
 After all steps: deduplicate, suppress root edges when intermediate exists,
-drop members with zero incoming edges.
+drop members with zero edges. Members with outgoing edges but no incoming
+edges are retained as **secondary roots** — top-level containers within the
+family (e.g., JumpLinksList wraps `<ul>` containing JumpLinksItem `<li>`
+children, but nothing is above JumpLinksList in the hierarchy). Non-exported
+secondary roots are then properly handled by `collapse_internal_nodes`:
+since they have no incoming edges, collapsing removes their outgoing edges
+cleanly with zero transitive edges created.
+
+### Prop-Default JSX Detection (Step 1 enhancement)
+
+Step 1 detects components rendered via `rendered_components` in the source
+profile. The source profile extractor walks JSX elements in:
+
+- Function/arrow body (return statements, variable initializers, conditionals)
+- **Parameter destructuring defaults**: `({ bar = <Bar /> }) => { ... }`
+- **Variable destructuring defaults**: `const { icon = <Icon /> } = this.props`
+
+This is critical for components like ChartBullet that receive sub-components
+as props with JSX defaults (e.g.,
+`comparativeErrorMeasureComponent = <ChartBulletComparativeErrorMeasure />`).
+Without this, Step 1 misses the rendering relationship and cloneElement
+(Step 8) incorrectly creates a complete graph of peer edges.
+
+### cloneElement Filtering (Step 8)
+
+Step 8 has two filters to prevent false edges from shared prop vocabularies:
+
+1. **Skip reverse-of-existing**: If B→A already exists from a prior step
+   (e.g., Step 1 internal rendering), don't create A→B from cloneElement.
+   The prior edge establishes the direction; adding the reverse creates a
+   false cycle.
+
+2. **Remove bidirectional pairs**: After creating all cloneElement edges,
+   if both A→B and B→A exist from cloneElement, both are removed. This
+   indicates a peer relationship (shared prop vocabulary) rather than a
+   parent-child hierarchy. E.g., chart sub-components that all inject
+   the same layout props (height, width, theme) into non-family primitives.
 
 ### CSS Element → Component Mapping
 
@@ -97,6 +133,13 @@ The pipeline:
 transitive edges. Collapsed edges inherit the **stronger** strength of the two
 edges in the chain (`Required > Allowed`).
 
+**Cycle detection**: The collapse loop tracks which internal nodes have been
+processed in a `collapsed_set`. When creating a transitive edge, if the target
+child is already in `collapsed_set`, the edge is skipped — it would re-enter
+a cycle among internal nodes and never reach an exported surface. This breaks
+cycles like `TreeViewList → TreeViewRoot → TreeViewListItem → TreeViewList`
+cleanly in O(n) iterations instead of hitting the 100-iteration safety limit.
+
 ### 5 Technical Enforcement Mechanisms
 
 Every required nesting has a concrete technical reason rendering breaks without
@@ -124,119 +167,136 @@ it:
 
 ## Verification Scorecard
 
-Verified against canonical PF source examples for all 41 non-trivial families
-(3+ members or 2 members with edges).
+Verified against upstream PatternFly v6 documentation for all 115 component
+families (110 main + 5 deprecated).
 
-### Full Results
-
-| Family | Members | Correct-R | Correct-A | Wrong-R | Wrong-A | Missing | Score |
-|---|---|---|---|---|---|---|---|
-| Accordion | 5 | 3 | 1 | 0 | 0 | 0 | 1.00 |
-| Alert | 2 | 0 | 0 | 2 | 0 | 1 | 0.00 |
-| Breadcrumb | 3 | 2 | 0 | 0 | 0 | 0 | 1.00 |
-| Card | 6 | 3 | 1 | 0 | 0 | 1 | 0.80 |
-| ChartBullet | 9 | 56 | 0 | 0 | 0 | 0 | 1.00 |
-| ChartCursorTooltip | 2 | 1 | 0 | 0 | 0 | 0 | 1.00 |
-| ChartDonutUtilization | 2 | 2 | 0 | 0 | 0 | 0 | 1.00 |
-| ChartLegendTooltip | 3 | 4 | 0 | 0 | 0 | 0 | 1.00 |
-| CodeEditor | 2 | 1 | 0 | 0 | 0 | 0 | 1.00 |
-| DataList | 9 | 4 | 2 | 2 | 1 | 2 | 0.75 |
-| DescriptionList | 5 | 3 | 0 | 1 | 1 | 1 | 0.75 |
-| DragDrop | 2 | 1 | 0 | 0 | 0 | 0 | 1.00 |
-| Drawer | 7 | 4 | 1 | 2 | 0 | 2 | 0.71 |
-| Dropdown | 2 | 0 | 1 | 2 | 0 | 0 | 0.50 |
-| DualListSelector | 17 | 4 | 1 | 0 | 3 | 0 | 1.00 |
-| FileUpload | 2 | 1 | 0 | 0 | 0 | 0 | 1.00 |
-| Form | 4 | 0 | 2 | 0 | 1 | 1 | 0.67 |
-| FormSelect | 3 | 2 | 0 | 0 | 0 | 1 | 0.67 |
-| Hint | 3 | 2 | 0 | 0 | 0 | 0 | 1.00 |
-| InputGroup | 2 | 0 | 1 | 1 | 0 | 0 | 0.50 |
-| JumpLinks | 2 | 1 | 0 | 0 | 0 | 1 | 0.50 |
-| List | 2 | 1 | 0 | 0 | 0 | 0 | 1.00 |
-| LoginPage | 7 | 6 | 0 | 0 | 0 | 0 | 1.00 |
-| Masthead | 6 | 3 | 0 | 0 | 2 | 3 | 0.50 |
-| Menu | 6 | 4 | 1 | 4 | 1 | 1 | 0.50 |
-| MultipleFileUpload | 2 | 1 | 0 | 0 | 0 | 0 | 1.00 |
-| Nav | 6 | 8 | 1 | 1 | 0 | 0 | 1.00 |
-| NotificationDrawer | 4 | 3 | 0 | 0 | 0 | 1 | 0.75 |
-| OverflowMenu | 6 | 5 | 0 | 0 | 0 | 2 | 0.71 |
-| Page | 8 | 1 | 2 | 4 | 3 | 2 | 0.60 |
-| Pagination | 2 | 1 | 0 | 0 | 0 | 0 | 1.00 |
-| Progress | 3 | 3 | 0 | 0 | 0 | 0 | 1.00 |
-| ProgressStepper | 2 | 1 | 0 | 0 | 0 | 0 | 1.00 |
-| Select | 3 | 0 | 3 | 10 | 0 | 0 | 1.00 |
-| SimpleList | 2 | 1 | 0 | 0 | 0 | 0 | 1.00 |
-| Table | 13 | 8 | 4 | 1 | 0 | 1 | 0.92 |
-| Tabs | 5 | 1 | 2 | 1 | 0 | 0 | 1.00 |
-| TextInputGroup | 2 | 0 | 1 | 0 | 0 | 0 | 1.00 |
-| ToggleGroup | 2 | 1 | 0 | 0 | 0 | 0 | 1.00 |
-| Toolbar | 7 | 4 | 4 | 2 | 1 | 1 | 0.89 |
-| Wizard | 7 | 3 | 2 | 2 | 0 | 1 | 0.83 |
-
-### Totals
+### Current State (post-session-3 fixes)
 
 | Metric | Count |
 |--------|-------|
-| Correct-R (Required, correct) | 148 |
-| Correct-A (Allowed, correct) | 30 |
-| Wrong-R (Required, wrong — generates false rules) | 32 |
-| Wrong-A (Allowed, wrong — harmless, no rules) | 13 |
-| Missing | 22 |
-| **Overall Score** | **(148 + 30) / (148 + 30 + 22) = 178/200 = 0.89** |
+| Total composition trees | 115 (110 main + 5 deprecated) |
+| Total edges | 206 (Required: 157, Allowed: 49) |
+| Conformance checks generated | 88 |
+| Non-member parent edges | 0 |
+| Non-member child edges | 0 |
+| Duplicate member entries | 0 |
+| Families CORRECT | 76 |
+| Families CORRECT (minor notes) | 6 |
+| Families WRONG | 28 |
 
-### Progress Over Session
+### Progress Over Sessions
 
-| Metric | Start (BEM v1) | After v2 builder | After styles. fix | After drop unconnected | After EdgeStrength |
-|--------|---------------|-------------------|-------------------|----------------------|-------------------|
-| Correct edges | ~31 | ~121 | ~155 | 165 | 178 |
-| Wrong edges | ~42 | ~74 | ~82 | 51 | 45 (32R + 13A) |
-| Missing edges | ~42 | ~74 | ~62 | 16 | 22 |
-| Accuracy | 42% | 62% | 71% | 91% | 89% |
+| Metric | Start (BEM v1) | Session 1 (EdgeStrength) | Session 3 (current) |
+|--------|---------------|--------------------------|---------------------|
+| Total edges | ~300 | 261 | 206 |
+| Conformance checks | ~600 | 488 | 88 |
+| Non-member edges | ~50 | 39 | 0 |
+| Duplicate members | ? | 9 | 0 |
+| Correct families (of 110) | ~40% | ~70% | 75% |
 
-Note: accuracy dipped from 91% to 89% because the verification became stricter
-(prop-based edges reclassified as wrong, non-member parent edges caught). The
-key improvement is that 13 of the 45 wrong edges are `Allowed` (harmless — no
-conformance rules generated).
+### Session 3 Fixes Applied
 
-### Remaining Wrong-R Edges (32)
+1. **Secondary root retention** (Step 10): Components with outgoing edges but
+   no incoming edges are kept as secondary roots. Non-exported ones are properly
+   collapsed. Reduced non-member parent edges from 34 → 0.
 
-These generate false conformance rules. Categorized by root cause:
+2. **Prop-default JSX detection + cloneElement filtering**: Source profile
+   extractor now detects JSX elements in parameter and variable destructuring
+   defaults. Combined with bidirectional pair removal and reverse-of-existing
+   skip in Step 8. Eliminated ChartBullet's 60 wrong edges and 408 wrong
+   conformance rules → 10 correct edges, 0 wrong rules.
 
-**Non-member parents (18)**: Edges reference components not in the family's
-member list. Examples: `SimpleDropdown -> Dropdown`, `CheckboxSelect -> Select`,
-`InputGroupText -> InputGroupItem`. These come from collapsed internal rendering
-where the parent is an unexported "template" component.
+3. **Collapse cycle detection**: Tracks collapsed internal nodes to break
+   cycles among internal components. Fixes TreeView infinite loop (100
+   iterations → 3 iterations, clean exit).
 
-**Prop-based edges (5)**: Components passed via props (not children) create
-edges through internal rendering collapse. Examples:
-`DrawerContent -> DrawerPanelContent` (panelContent prop),
-`Drawer -> DrawerPanelContent` (collapsed through DrawerMain).
+4. **Recursive nesting = Allowed**: CSS edges where the child component equals
+   the family root (recursive/self-nesting patterns like DataList inside
+   DataListContent, Menu inside MenuItem) are marked `Allowed` instead of
+   `Required`. The nesting is valid but optional.
 
-**CSS mapping to wrong ancestor (5)**: CSS descendant selectors or direct-child
-selectors map to wrong component due to shared CSS tokens. Examples:
-`MenuContent -> MenuItem` (should be MenuList→MenuItem, CSS `.list > .list-item`
-maps "list" to MenuContent instead of MenuList).
+5. **Family path modifier prefix**: `extract_family_from_path` now prefixes
+   family names with `deprecated/` or `next/` when the component lives under
+   a modifier directory. Fixes DualListSelector duplicate members (17 → 6
+   unique in main, 7 in deprecated). Also separates deprecated Modal, Wizard,
+   Table, Chip, DragDrop, and Tile into their own families.
 
-**CSS token ambiguity (2)**: Shared `__body` element. `DrawerPanelContent ->
-DrawerContentBody` should be `DrawerPanelContent -> DrawerPanelBody`.
+6. **code-connect exclusion**: Files from the `code-connect` Figma integration
+   package are excluded from SD file discovery.
 
-**Reversed edges (2)**: Direction swapped. `DataListContent -> DataList`,
-`NavItem -> NavExpandable`.
+### Remaining Issues by Category
 
-### Remaining Missing Edges (22)
+#### Category 1: Missing sub-components (11 families)
 
-Key gaps by family:
+Components documented in PF docs but not appearing in family member lists.
+Root cause: components not in the same directory, not exported from the same
+index, or no structural signals connecting them.
 
-- **Masthead (3)**: MastheadMain→MastheadToggle, MastheadMain→MastheadBrand,
-  MastheadBrand→MastheadLogo — no CSS selectors, no context, no DOM nesting
-  between these components.
-- **OverflowMenu (2)**: OverflowMenuContent→OverflowMenuItem,
-  OverflowMenuContent→OverflowMenuGroup — no CSS connection.
-- **Drawer (2)**: DrawerPanelContent→DrawerHead, DrawerActions→DrawerCloseButton
-  — CSS token ambiguity prevents correct mapping.
-- **DataList (2)**: DataList→DataListItem (DOM nesting not detected because
-  DataList renders `<ul>` but has multiple CSS tokens that confuse mapping),
-  DataListItemRow→DataListCheck/Action.
+| Family | Missing members |
+|--------|----------------|
+| ActionList | ActionListGroup, ActionListItem |
+| CodeBlock | CodeBlockAction, CodeBlockCode |
+| EmptyState | EmptyStateBody, EmptyStateFooter, EmptyStateActions |
+| HelperText | HelperTextItem |
+| Panel | PanelMain, PanelMainBody, PanelHeader, PanelFooter |
+| Sidebar | SidebarContent, SidebarPanel |
+| Dropdown | DropdownGroup, DropdownItem |
+| Modal | ModalHeader, ModalFooter (+ missing edges to ModalBody) |
+| TextInputGroup | TextInputGroupUtilities |
+| Hint | HintTitle |
+| NotificationDrawer | NotificationDrawerBody, NotificationDrawerHeader, NotificationDrawerGroup, NotificationDrawerGroupList |
+
+#### Category 2: CSS token mapping errors (2 families)
+
+**RESOLVED — Recursive nesting edges are Allowed, not Required** (DataList,
+Menu): CSS rules like `.expandable-content-body > .dataList` and
+`.list-item > .menu` represent valid recursive nesting patterns. These edges
+are now correctly marked `Allowed` (fix #4 above).
+
+**Shared CSS element name** (Drawer): `DrawerContentBody` and `DrawerPanelBody`
+both use `styles.drawerBody`. First-wins maps `"body"` to `DrawerContentBody`.
+CSS rule `.panel > .body` creates `DrawerPanelContent -> DrawerContentBody`
+instead of `DrawerPanelContent -> DrawerPanelBody`. Compounded by
+`DrawerPanelBody` not being in the family members at all.
+
+**CSS element collision** (DataList): Multiple components share
+`styles.dataListItemAction` and `styles.dataListItemControl`. First-wins
+assigns to wrong component in some contexts.
+
+#### Category 3: Wrong parent-child relationships (12 families)
+
+| Family | Wrong edge | Correct relationship |
+|--------|-----------|---------------------|
+| Alert | AlertGroup -> AlertActionCloseButton | Alert -> AlertActionCloseButton |
+| DataList | DataListContent -> DataList (root) | RESOLVED — now Allowed (recursive nesting) |
+| DescriptionList | Term -> Description | Siblings in Group, not parent-child |
+| Drawer | DrawerPanelContent -> DrawerContentBody | Should be DrawerPanelBody (missing) |
+| InputGroup | InputGroupText -> InputGroupItem | Reversed — Item wraps Text |
+| LoginPage | LoginPage -> LoginMain* | Children of Login, not LoginPage |
+| Masthead | Masthead -> MastheadBrand, MastheadContent -> Toggle/Logo | Brand/Toggle in MastheadMain, Logo in MastheadBrand |
+| Nav | NavItem -> NavExpandable | Reversed — NavExpandable contains NavItem |
+| OverflowMenu | Flat star under root | OverflowMenuContent as intermediate |
+| Page | PageBreadcrumb as parent of many | PageBreadcrumb is a child, not parent |
+| Select | SelectOption -> Select (root) | RESOLVED — now Allowed (projected recursive nesting) |
+| Tabs | Tabs -> TabTitleText | Should be Tab -> TabTitleText |
+
+#### Category 4: Structural/data issues (3 families)
+
+| Family | Issue |
+|--------|-------|
+| DualListSelector | RESOLVED — deprecated/main separation (fix #5 above) |
+| Menu | Missing MenuGroup, MenuSearch, MenuSearchInput, MenuContainer |
+| Wizard | WizardContext is a context object, not a component. Missing WizardHeader, WizardFooterWrapper. |
+| SimpleList | Missing SimpleList -> SimpleListItem and SimpleList -> SimpleListGroup edges |
+
+#### Category 5: Rule generation direction (future work)
+
+Secondary roots (LabelGroup, AlertGroup, JumpLinksList, etc.) have edges TO
+the primary root component. These edges are structurally correct but generate
+the wrong type of conformance rule. Current: "Label must be inside LabelGroup"
+(wrong — Label can be standalone). Correct: "If LabelGroup exists, it must
+contain Labels" (constraint on the parent, not the child). This requires a new
+`requiresChildren` rule type in `konveyor_v2.rs`, not a tree structure change.
 
 ---
 
@@ -247,9 +307,9 @@ Key gaps by family:
 | `crates/core/src/types/sd.rs` | `CompositionEdge`, `EdgeStrength`, `CompositionTree` types |
 | `crates/ts/src/composition/mod.rs` | `build_composition_tree_v2` — the v2 builder |
 | `crates/ts/src/css_profile/mod.rs` | CSS profile extraction, `CssBlockProfile`, `CssElementInfo` |
-| `crates/ts/src/source_profile/mod.rs` | Source profile extraction (JSX walk, cloneElement detection) |
+| `crates/ts/src/source_profile/mod.rs` | Source profile extraction (JSX walk, cloneElement detection, prop-default JSX) |
 | `crates/ts/src/source_profile/children_slot.rs` | `trace_children_slot_both` — children path + CSS token detail |
 | `crates/ts/src/source_profile/clone_element.rs` | `detect_clone_element_injections`, `try_extract_clone_element_from_call` |
-| `crates/ts/src/sd_pipeline.rs` | Pipeline orchestration, `collapse_internal_nodes` |
+| `crates/ts/src/sd_pipeline.rs` | Pipeline orchestration, `collapse_internal_nodes` (with cycle detection) |
 | `crates/ts/src/konveyor_v2.rs` | Conformance rule generation (filters by Required) |
 | `src/orchestrator.rs` | Dep-repo worktree creation (`create_only` + build command) |

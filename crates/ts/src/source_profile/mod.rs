@@ -432,6 +432,7 @@ fn walk_stmt_for_jsx<'a>(stmt: &'a Statement<'a>, source: &str, info: &mut FullS
         Statement::ClassDeclaration(cls) => {
             for item in &cls.body.body {
                 if let ClassElement::MethodDefinition(method) = item {
+                    walk_params_for_jsx(&method.value.params, source, info);
                     if let Some(body) = &method.value.body {
                         walk_stmts_for_jsx(&body.statements, source, info);
                     }
@@ -439,6 +440,7 @@ fn walk_stmt_for_jsx<'a>(stmt: &'a Statement<'a>, source: &str, info: &mut FullS
             }
         }
         Statement::FunctionDeclaration(f) => {
+            walk_params_for_jsx(&f.params, source, info);
             if let Some(body) = &f.body {
                 walk_stmts_for_jsx(&body.statements, source, info);
             }
@@ -453,6 +455,7 @@ fn walk_stmt_for_jsx<'a>(stmt: &'a Statement<'a>, source: &str, info: &mut FullS
         }
         Statement::VariableDeclaration(decl) => {
             for declarator in &decl.declarations {
+                walk_binding_defaults_for_jsx(&declarator.id, source, info);
                 if let Some(init) = &declarator.init {
                     walk_expr_for_jsx(init, source, info);
                 }
@@ -484,12 +487,14 @@ fn walk_stmt_for_jsx<'a>(stmt: &'a Statement<'a>, source: &str, info: &mut FullS
 fn walk_decl_for_jsx<'a>(decl: &'a Declaration<'a>, source: &str, info: &mut FullSourceInfo) {
     match decl {
         Declaration::FunctionDeclaration(f) => {
+            walk_params_for_jsx(&f.params, source, info);
             if let Some(body) = &f.body {
                 walk_stmts_for_jsx(&body.statements, source, info);
             }
         }
         Declaration::VariableDeclaration(var_decl) => {
             for declarator in &var_decl.declarations {
+                walk_binding_defaults_for_jsx(&declarator.id, source, info);
                 if let Some(init) = &declarator.init {
                     walk_expr_for_jsx(init, source, info);
                 }
@@ -498,6 +503,7 @@ fn walk_decl_for_jsx<'a>(decl: &'a Declaration<'a>, source: &str, info: &mut Ful
         Declaration::ClassDeclaration(cls) => {
             for item in &cls.body.body {
                 if let ClassElement::MethodDefinition(method) = item {
+                    walk_params_for_jsx(&method.value.params, source, info);
                     if let Some(body) = &method.value.body {
                         walk_stmts_for_jsx(&body.statements, source, info);
                     }
@@ -505,6 +511,49 @@ fn walk_decl_for_jsx<'a>(decl: &'a Declaration<'a>, source: &str, info: &mut Ful
             }
         }
         _ => {}
+    }
+}
+
+/// Walk a binding pattern's destructuring defaults for JSX elements.
+///
+/// Handles patterns like `const { bar = <Bar /> } = this.props` and
+/// function params `({ bar = <Bar /> }) => ...`. When a destructured
+/// property has an `AssignmentPattern` with a JSX default value, the
+/// JSX element is fed into the normal expression walker so it appears
+/// in `rendered_components`.
+fn walk_binding_defaults_for_jsx<'a>(
+    pattern: &'a BindingPattern<'a>,
+    source: &str,
+    info: &mut FullSourceInfo,
+) {
+    if let BindingPattern::ObjectPattern(obj) = pattern {
+        for prop in &obj.properties {
+            if let BindingPattern::AssignmentPattern(assign) = &prop.value {
+                walk_expr_for_jsx(&assign.right, source, info);
+            }
+        }
+    }
+    // Also handle AssignmentPattern wrapping ObjectPattern:
+    // ({ variant = 'primary' }: Props = {})
+    if let BindingPattern::AssignmentPattern(assign) = pattern {
+        if let BindingPattern::ObjectPattern(obj) = &assign.left {
+            for prop in &obj.properties {
+                if let BindingPattern::AssignmentPattern(inner) = &prop.value {
+                    walk_expr_for_jsx(&inner.right, source, info);
+                }
+            }
+        }
+    }
+}
+
+/// Walk formal parameters for JSX elements in destructuring defaults.
+fn walk_params_for_jsx<'a>(
+    params: &'a FormalParameters<'a>,
+    source: &str,
+    info: &mut FullSourceInfo,
+) {
+    for param in &params.items {
+        walk_binding_defaults_for_jsx(&param.pattern, source, info);
     }
 }
 
@@ -538,9 +587,11 @@ fn walk_expr_for_jsx<'a>(expr: &'a Expression<'a>, source: &str, info: &mut Full
             }
         }
         Expression::ArrowFunctionExpression(arrow) => {
+            walk_params_for_jsx(&arrow.params, source, info);
             walk_stmts_for_jsx(&arrow.body.statements, source, info);
         }
         Expression::FunctionExpression(func) => {
+            walk_params_for_jsx(&func.params, source, info);
             if let Some(body) = &func.body {
                 walk_stmts_for_jsx(&body.statements, source, info);
             }
@@ -1012,6 +1063,87 @@ mod tests {
             unique.len(),
             profile.consumed_contexts.len(),
             "consumed_contexts should have no duplicates"
+        );
+    }
+
+    /// JSX elements in arrow function parameter destructuring defaults
+    /// should appear in rendered_components.
+    ///
+    /// Models the ChartBullet pattern:
+    /// `({ measureComponent = <ChartBar /> }) => { ... }`
+    #[test]
+    fn test_extract_profile_arrow_param_default_jsx() {
+        let source = r#"
+            import { cloneElement } from 'react';
+            export const ChartBullet = ({
+                comparativeErrorMeasureComponent = <ChartBulletComparativeErrorMeasure />,
+                qualitativeRangeComponent = <ChartBulletQualitativeRange />,
+                titleComponent = <ChartBulletTitle />,
+            }: ChartBulletProps) => {
+                const measure = cloneElement(comparativeErrorMeasureComponent, { height: 100 });
+                return <div>{measure}</div>;
+            };
+        "#;
+
+        let profile = extract_profile("ChartBullet", "ChartBullet.tsx", source);
+        assert!(
+            profile
+                .rendered_components
+                .contains(&"ChartBulletComparativeErrorMeasure".to_string()),
+            "Expected ChartBulletComparativeErrorMeasure in rendered_components, got: {:?}",
+            profile.rendered_components
+        );
+        assert!(
+            profile
+                .rendered_components
+                .contains(&"ChartBulletQualitativeRange".to_string()),
+            "Expected ChartBulletQualitativeRange in rendered_components, got: {:?}",
+            profile.rendered_components
+        );
+        assert!(
+            profile
+                .rendered_components
+                .contains(&"ChartBulletTitle".to_string()),
+            "Expected ChartBulletTitle in rendered_components, got: {:?}",
+            profile.rendered_components
+        );
+    }
+
+    /// JSX elements in class component render() destructuring defaults
+    /// should appear in rendered_components.
+    ///
+    /// Models the ExpandableSection pattern:
+    /// `const { toggleIcon = <CaretDownIcon /> } = this.props;`
+    #[test]
+    fn test_extract_profile_class_render_destructuring_default_jsx() {
+        let source = r#"
+            import { Component } from 'react';
+
+            class ExpandableSection extends Component<ExpandableSectionProps> {
+                render() {
+                    const {
+                        toggleIcon = <RhMicronsCaretDownIcon />,
+                        children,
+                    } = this.props;
+
+                    return (
+                        <div>
+                            {toggleIcon}
+                            {children}
+                        </div>
+                    );
+                }
+            }
+            export { ExpandableSection };
+        "#;
+
+        let profile = extract_profile("ExpandableSection", "ExpandableSection.tsx", source);
+        assert!(
+            profile
+                .rendered_components
+                .contains(&"RhMicronsCaretDownIcon".to_string()),
+            "Expected RhMicronsCaretDownIcon in rendered_components, got: {:?}",
+            profile.rendered_components
         );
     }
 
