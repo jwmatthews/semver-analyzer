@@ -47,6 +47,7 @@ steps in order:
 | Step | Signal | Strength | What It Detects |
 |------|--------|----------|----------------|
 | 1 | Internal rendering | Required | Component A renders component B in its JSX (including prop-default JSX) |
+| 1.5 | Delegate tree projection | Allowed | Wrapper family inherits edges from delegate family's tree via `extends_props` |
 | 2 | CSS direct-child `>` | Required | `.block__A > .block__B` selector in CSS |
 | 3 | CSS grid parent-child | Required | A has `grid-template-*`, B has `grid-column`/`grid-row` |
 | 3b | CSS implicit grid child | Required | B is in same block as non-root grid container A, has no grid positioning |

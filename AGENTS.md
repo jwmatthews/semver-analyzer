@@ -134,6 +134,7 @@ from structural evidence.**
 | Step | Signal | Strength | Rationale |
 |------|--------|----------|-----------|
 | 1 | Internal rendering | Required | Component renders the child (JSX body + prop-default JSX) |
+| 1.5 | Delegate tree projection | Allowed | Wrapper family inherits edges from delegate family tree |
 | 2 | CSS direct-child `>` | Required* | Styles require exact parent-child DOM |
 | 3 | CSS grid parent-child | Required* | Layout breaks without grid container |
 | 3b | CSS implicit grid child | Required* | Same — grid layout dependency |
@@ -154,6 +155,23 @@ Step 1 detects JSX elements in **parameter destructuring defaults**
 (`const { icon = <Icon /> } = this.props`), not just the function body.
 This is critical for components like ChartBullet that receive sub-components
 as props with JSX defaults.
+
+Step 1.5 projects edges from a delegate family's composition tree onto
+wrapper families. When a family like Dropdown wraps Menu (each Dropdown
+component extends the corresponding Menu component's props via
+`extends_props`), the Menu tree's edges are projected onto Dropdown.
+This runs inside the builder before Step 10, so projected edges prevent
+wrapper family members from being dropped. The projection uses
+`DelegateContext` which provides the delegate tree and a
+`wrapper_to_delegate` mapping (e.g., `DropdownList → MenuList`).
+
+Composition tree building is **dependency-aware**: families are classified
+as independent (no external `extends_props`) or deferred (depends on
+another family's tree). Independent families are built in Phase 1.
+Deferred families are resolved in Phase 2 by iterating until all
+dependencies are available. Chains (A → B → C) resolve naturally
+across iterations. Circular or unresolvable dependencies fall back
+to building without delegate context (with a warning).
 
 Step 5.5 consumes `layout_children` from `CssBlockProfile` — pairs of BEM
 elements where one is a layout container (has flex-wrap/gap/grid) and the

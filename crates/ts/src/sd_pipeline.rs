@@ -20,7 +20,7 @@
 //!
 //! All analysis is deterministic — no LLM, no confidence scores.
 
-use crate::composition::build_composition_tree_v2;
+use crate::composition::{build_composition_tree_v2, DelegateContext};
 use crate::source_profile::{self, diff::diff_profiles};
 
 use semver_analyzer_core::types::sd::{
@@ -239,29 +239,47 @@ pub fn run_sd(
         .filter_map(|f| f.family.clone())
         .collect();
 
-    // ── B1: Build all to-version composition trees ──────────────────
+    // ── B1: Build composition trees (dependency-aware) ────────────────
     //
-    // For each family, build the tree with ALL component files in the
-    // directory (including internal/non-exported ones like ModalBox,
-    // ModalContent). This lets us trace rendering chains through
-    // internal components. Afterwards, collapse non-exported nodes.
-    let mut composition_trees = Vec::new();
+    // Families are built in dependency order. A family that has members
+    // with `extends_props` pointing to components in another family is
+    // "deferred" until the delegate family's tree is available. This
+    // allows the builder to project the delegate tree's edges directly
+    // (Step 1.5), so that wrapper components like DropdownItem inherit
+    // MenuList→MenuItem constraints before Step 10 drops members.
+    //
+    // Phase 1: Build independent families (no external extends_props)
+    // Phase 2: Resolve deferred families (iterate until all resolved)
+
+    let mut composition_trees: Vec<CompositionTree> = Vec::new();
     let mut family_exports_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Resolved trees indexed by family name for delegate lookups
+    let mut resolved_trees: HashMap<String, CompositionTree> = HashMap::new();
+
+    // Pre-compute per-family build info
+    struct FamilyBuildInfo {
+        family_name: String,
+        new_exports: Vec<String>,
+        all_members_for_tree: Vec<String>,
+        all_family_profiles: HashMap<String, ComponentSourceProfile>,
+        family_css_profile_key: Option<String>, // BEM block key into css_profiles
+    }
+
+    // Map: component name → family name (for all profiles, including non-exported)
+    let mut component_to_family: HashMap<String, String> = HashMap::new();
+
+    let mut build_infos: Vec<FamilyBuildInfo> = Vec::new();
 
     for (family_name, family_files) in &all_families {
         let new_exports = read_family_exports_from_dir(repo, to_ref, family_name, family_files);
 
-        // Collect ALL family member names (including internal components)
         let all_member_names: Vec<String> = family_files
             .iter()
             .map(|f| f.component_name.clone())
             .collect();
 
-        // Collect profiles for ALL members (not just exports)
         let all_family_profiles = collect_family_profiles(&new_profiles, &all_member_names);
 
-        // Build tree with all members, using exports[0] as root
-        // Pass all member names so the builder sees the internal components
         let mut all_members_for_tree = new_exports.clone();
         for name in &all_member_names {
             if !all_members_for_tree.contains(name) {
@@ -269,18 +287,21 @@ pub fn run_sd(
             }
         }
 
-        // Find the CSS profile for this family (by dominant BEM block)
-        let family_css_profile = css_profiles.and_then(|css_profs| {
-            // Try root component's bem_block first
+        // Register all members → family mapping
+        for name in &all_members_for_tree {
+            component_to_family.insert(name.clone(), family_name.clone());
+        }
+
+        // Determine CSS profile key
+        let css_key = css_profiles.and_then(|css_profs| {
             let root_name = new_exports.first()?;
             if let Some(root_prof) = all_family_profiles.get(root_name) {
                 if let Some(ref block) = root_prof.bem_block {
-                    if let Some(css_prof) = css_profs.get(block) {
-                        return Some(css_prof);
+                    if css_profs.contains_key(block.as_str()) {
+                        return Some(block.clone());
                     }
                 }
             }
-            // Fall back to dominant bem_block among all members
             let mut block_counts: HashMap<&str, usize> = HashMap::new();
             for prof in all_family_profiles.values() {
                 if let Some(ref block) = prof.bem_block {
@@ -291,49 +312,202 @@ pub fn run_sd(
                 .into_iter()
                 .max_by_key(|(_, count)| *count)
                 .map(|(block, _)| block)?;
-            css_profs.get(dominant)
+            if css_profs.contains_key(dominant) {
+                Some(dominant.to_string())
+            } else {
+                None
+            }
         });
 
-        let full_tree = build_composition_tree_v2(
-            &all_family_profiles,
-            &all_members_for_tree,
-            family_css_profile,
-        );
-
-        if let Some(mut tree) = full_tree {
-            // Collapse non-exported nodes: remove internal components
-            // and transfer their edges to their parents.
-            let exports_set: HashSet<&str> = new_exports.iter().map(|s| s.as_str()).collect();
-            collapse_internal_nodes(&mut tree, &exports_set);
-
-            // Use the family name as the tree root identifier. This
-            // distinguishes deprecated/next variants from the main
-            // component (e.g., "deprecated/DualListSelector" vs
-            // "DualListSelector").
-            tree.root = family_name.clone();
-
-            composition_trees.push(tree);
-        }
-
-        family_exports_map.insert(family_name.clone(), new_exports);
+        build_infos.push(FamilyBuildInfo {
+            family_name: family_name.clone(),
+            new_exports,
+            all_members_for_tree,
+            all_family_profiles,
+            family_css_profile_key: css_key,
+        });
     }
 
-    // ── B2: Delegation projection ───────────────────────────────────
-    //
-    // Wrapper families (e.g., Dropdown wraps Menu) have sparse trees
-    // because they lack BEM tokens. Project edges from the delegate
-    // family's tree using `extends_props` (e.g., DropdownListProps
-    // extends MenuListProps → DropdownList maps to MenuList).
-    // This must happen BEFORE diffing so composition diffs see the
-    // projected edges.
+    // Classify: find each family's delegate dependencies
+    // Key: family_name → set of delegate family names
+    let mut family_delegates: HashMap<String, HashSet<String>> = HashMap::new();
+    // Key: family_name → (wrapper_component → delegate_component)
+    let mut family_wrapper_maps: HashMap<String, HashMap<String, String>> = HashMap::new();
 
-    let trees_snapshot: Vec<CompositionTree> = composition_trees.clone();
-    project_delegate_trees(&mut composition_trees, &new_profiles, &trees_snapshot);
+    for info in &build_infos {
+        let mut delegate_families: HashSet<String> = HashSet::new();
+        let mut wrapper_map: HashMap<String, String> = HashMap::new();
 
-    // ── B2.5: CSS enrichment is now handled by build_composition_tree_v2 ──
-    // The v2 tree builder integrates CSS direct-child selectors, grid
-    // parent-child, flex context, and descendant selectors directly into
-    // tree construction. The old enrich_trees_with_css is no longer called.
+        for member_name in &info.all_members_for_tree {
+            let Some(profile) = info.all_family_profiles.get(member_name) else {
+                continue;
+            };
+            for ext in &profile.extends_props {
+                let delegate_name = ext.strip_suffix("Props").unwrap_or(ext).to_string();
+                if let Some(delegate_family) = component_to_family.get(&delegate_name) {
+                    if delegate_family != &info.family_name {
+                        delegate_families.insert(delegate_family.clone());
+                        wrapper_map.insert(member_name.clone(), delegate_name);
+                    }
+                }
+            }
+        }
+
+        if !delegate_families.is_empty() {
+            family_delegates.insert(info.family_name.clone(), delegate_families);
+            family_wrapper_maps.insert(info.family_name.clone(), wrapper_map);
+        }
+    }
+
+    // Helper: build a family tree given its info and optional delegate contexts
+    let build_family_tree = |info: &FamilyBuildInfo,
+                             delegate_ctxs: &[DelegateContext<'_>],
+                             css_profiles: Option<
+        &HashMap<String, crate::css_profile::CssBlockProfile>,
+    >|
+     -> Option<(CompositionTree, Vec<String>)> {
+        let family_css_profile = info
+            .family_css_profile_key
+            .as_ref()
+            .and_then(|key| css_profiles?.get(key.as_str()));
+
+        let full_tree = build_composition_tree_v2(
+            &info.all_family_profiles,
+            &info.all_members_for_tree,
+            family_css_profile,
+            delegate_ctxs,
+        );
+
+        full_tree.map(|mut tree| {
+            let exports_set: HashSet<&str> = info.new_exports.iter().map(|s| s.as_str()).collect();
+            collapse_internal_nodes(&mut tree, &exports_set);
+            tree.root = info.family_name.clone();
+            (tree, info.new_exports.clone())
+        })
+    };
+
+    // Phase 1: Build independent families (no external extends_props)
+    let mut deferred_indices: Vec<usize> = Vec::new();
+
+    for (idx, info) in build_infos.iter().enumerate() {
+        if family_delegates.contains_key(&info.family_name) {
+            deferred_indices.push(idx);
+            // Still record exports even if deferred
+            family_exports_map.insert(info.family_name.clone(), info.new_exports.clone());
+            continue;
+        }
+
+        if let Some((tree, exports)) = build_family_tree(info, &[], css_profiles) {
+            resolved_trees.insert(info.family_name.clone(), tree.clone());
+            composition_trees.push(tree);
+            family_exports_map.insert(info.family_name.clone(), exports);
+        } else {
+            family_exports_map.insert(info.family_name.clone(), info.new_exports.clone());
+        }
+    }
+
+    debug!(
+        independent = build_infos.len() - deferred_indices.len(),
+        deferred = deferred_indices.len(),
+        "Phase B1: independent trees built"
+    );
+
+    // Phase 2: Resolve deferred families
+    // Iterate until all are resolved or no progress is made (max 10 iterations).
+    let mut remaining = deferred_indices;
+    for iteration in 0..10 {
+        if remaining.is_empty() {
+            break;
+        }
+
+        let mut still_remaining = Vec::new();
+        let mut resolved_this_round = 0;
+
+        for &idx in &remaining {
+            let info = &build_infos[idx];
+            let deps = &family_delegates[&info.family_name];
+
+            // Check if all delegate families are resolved
+            let all_resolved = deps.iter().all(|d| resolved_trees.contains_key(d));
+            if !all_resolved {
+                still_remaining.push(idx);
+                continue;
+            }
+
+            // Build delegate contexts from the wrapper map and resolved trees
+            let wrapper_map = family_wrapper_maps
+                .get(&info.family_name)
+                .cloned()
+                .unwrap_or_default();
+
+            // Group wrapper mappings by delegate family
+            let mut per_delegate: HashMap<&str, HashMap<String, String>> = HashMap::new();
+            for (wrapper, delegate) in &wrapper_map {
+                if let Some(del_family) = component_to_family.get(delegate) {
+                    per_delegate
+                        .entry(del_family.as_str())
+                        .or_default()
+                        .insert(wrapper.clone(), delegate.clone());
+                }
+            }
+
+            let delegate_ctxs: Vec<DelegateContext<'_>> = per_delegate
+                .iter()
+                .filter_map(|(del_family, mapping)| {
+                    let tree = resolved_trees.get(*del_family)?;
+                    Some(DelegateContext {
+                        delegate_tree: tree,
+                        wrapper_to_delegate: mapping.clone(),
+                    })
+                })
+                .collect();
+
+            debug!(
+                family = %info.family_name,
+                delegates = ?deps,
+                mappings = delegate_ctxs.len(),
+                iteration,
+                "resolving deferred family"
+            );
+
+            if let Some((tree, _exports)) = build_family_tree(info, &delegate_ctxs, css_profiles) {
+                resolved_trees.insert(info.family_name.clone(), tree.clone());
+                composition_trees.push(tree);
+                resolved_this_round += 1;
+            }
+        }
+
+        debug!(
+            iteration,
+            resolved = resolved_this_round,
+            remaining = still_remaining.len(),
+            "Phase B1 deferred resolution"
+        );
+
+        if resolved_this_round == 0 {
+            // No progress — remaining families have circular or unresolvable deps
+            for &idx in &still_remaining {
+                let info = &build_infos[idx];
+                let unresolved: Vec<&String> = family_delegates[&info.family_name]
+                    .iter()
+                    .filter(|d| !resolved_trees.contains_key(*d))
+                    .collect();
+                tracing::warn!(
+                    family = %info.family_name,
+                    unresolved_deps = ?unresolved,
+                    "building without delegate context (deps not resolved)"
+                );
+                // Build without delegate context as fallback
+                if let Some((tree, _exports)) = build_family_tree(info, &[], css_profiles) {
+                    resolved_trees.insert(info.family_name.clone(), tree.clone());
+                    composition_trees.push(tree);
+                }
+            }
+            break;
+        }
+
+        remaining = still_remaining;
+    }
 
     // ── B3: Composition diff + conformance checks ───────────────────
     //
@@ -361,7 +535,8 @@ pub fn run_sd(
                     read_family_exports_from_dir(repo, from_ref, family_name, family_files);
                 let old_family_profiles =
                     extract_family_profiles_at_ref(repo, from_ref, &old_exports, family_files);
-                let old_tree = build_composition_tree_v2(&old_family_profiles, &old_exports, None);
+                let old_tree =
+                    build_composition_tree_v2(&old_family_profiles, &old_exports, None, &[]);
 
                 let changes = diff_composition_trees(
                     family_name,
@@ -945,129 +1120,11 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
         .retain(|name| !internal_nodes.contains(name));
 }
 
-// ── Delegation projection ───────────────────────────────────────────────
-
-/// Project edges from delegate family trees onto wrapper family trees.
-///
-/// A wrapper family (e.g., Dropdown) wraps another family (e.g., Menu).
-/// Each wrapper component extends the corresponding delegate's Props:
-///   DropdownProps extends MenuProps
-///   DropdownListProps extends MenuListProps
-///   DropdownItemProps extends MenuItemProps
-///
-/// If Menu's tree has edges like Menu → MenuList → MenuItem, this function
-/// projects them as Dropdown → DropdownList → DropdownItem.
-fn project_delegate_trees(
-    trees: &mut [CompositionTree],
-    all_profiles: &HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile>,
-    all_trees: &[CompositionTree],
-) {
-    // Build a lookup: component name → which tree it belongs to
-    let mut component_to_tree: HashMap<&str, usize> = HashMap::new();
-    for (i, tree) in all_trees.iter().enumerate() {
-        for member in &tree.family_members {
-            component_to_tree.insert(member.as_str(), i);
-        }
-    }
-
-    for tree in trees.iter_mut() {
-        // Skip trees that already have meaningful edges
-        // (more than just internal rendering edges)
-        let non_internal_edges = tree
-            .edges
-            .iter()
-            .filter(|e| {
-                e.relationship != semver_analyzer_core::types::sd::ChildRelationship::Internal
-            })
-            .count();
-        if non_internal_edges > 0 {
-            continue;
-        }
-
-        // Build the wrapping map: wrapper_component → delegate_component
-        // by matching `extends_props` to components in other families.
-        //
-        // e.g., DropdownList.extends_props = ["MenuListProps"]
-        //       → strip "Props" suffix → "MenuList"
-        //       → if "MenuList" exists in another family's tree → map DropdownList → MenuList
-        let mut wrapper_to_delegate: HashMap<String, String> = HashMap::new();
-        let mut delegate_tree_idx: Option<usize> = None;
-
-        for member in &tree.family_members {
-            let Some(profile) = all_profiles.get(member) else {
-                continue;
-            };
-
-            for ext in &profile.extends_props {
-                // Strip "Props" suffix to get the component name
-                let delegate_name = ext.strip_suffix("Props").unwrap_or(ext).to_string();
-
-                if let Some(&tree_idx) = component_to_tree.get(delegate_name.as_str()) {
-                    // Skip self-family references
-                    if tree.family_members.contains(&delegate_name) {
-                        continue;
-                    }
-                    wrapper_to_delegate.insert(member.clone(), delegate_name);
-                    delegate_tree_idx = Some(tree_idx);
-                }
-            }
-        }
-
-        if wrapper_to_delegate.is_empty() {
-            continue;
-        }
-
-        let Some(dt_idx) = delegate_tree_idx else {
-            continue;
-        };
-        let delegate_tree = &all_trees[dt_idx];
-
-        // Build reverse map: delegate → wrapper
-        let mut delegate_to_wrapper: HashMap<&str, &str> = HashMap::new();
-        for (wrapper, delegate) in &wrapper_to_delegate {
-            delegate_to_wrapper.insert(delegate.as_str(), wrapper.as_str());
-        }
-
-        debug!(
-            family = %tree.root,
-            delegate_family = %delegate_tree.root,
-            mappings = ?wrapper_to_delegate,
-            "projecting delegate tree edges"
-        );
-
-        // Project edges from the delegate tree
-        for edge in &delegate_tree.edges {
-            let Some(wrapper_parent) = delegate_to_wrapper.get(edge.parent.as_str()) else {
-                continue;
-            };
-            let Some(wrapper_child) = delegate_to_wrapper.get(edge.child.as_str()) else {
-                continue;
-            };
-
-            // Check we don't already have this edge
-            let already_exists = tree
-                .edges
-                .iter()
-                .any(|e| e.parent == *wrapper_parent && e.child == *wrapper_child);
-            if already_exists {
-                continue;
-            }
-
-            tree.edges
-                .push(semver_analyzer_core::types::sd::CompositionEdge {
-                    parent: wrapper_parent.to_string(),
-                    child: wrapper_child.to_string(),
-                    relationship: edge.relationship.clone(),
-                    required: edge.required,
-                    bem_evidence: Some(format!(
-                        "Projected from {} tree: {} extends {}, {} extends {}",
-                        delegate_tree.root, wrapper_parent, edge.parent, wrapper_child, edge.child,
-                    )),
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
-                });
-        }
-    }
-}
+// Note: project_delegate_trees has been superseded by the dependency-aware
+// build loop in run_sd_pipeline (Phase 1/Phase 2). Delegate tree projection
+// now happens inside build_composition_tree_v2 via Step 1.5 (DelegateContext),
+// which runs before Step 10 (drop unconnected), so wrapper family members
+// like DropdownItem are preserved instead of being dropped.
 
 // ── Composition tree diffing ────────────────────────────────────────────
 

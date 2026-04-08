@@ -18,11 +18,27 @@ use tracing::debug;
 
 // ── Evidence-based composition tree builder ─────────────────────────────
 
+/// Context for projecting a delegate family's composition tree edges onto
+/// a wrapper family. Used when a family like Dropdown wraps another family
+/// like Menu — each Dropdown component is a thin wrapper around a Menu
+/// counterpart (DropdownList wraps MenuList, DropdownItem wraps MenuItem).
+///
+/// The delegate tree's edges are projected onto the wrapper family so that
+/// composition constraints (context, DOM nesting, CSS) are inherited.
+pub struct DelegateContext<'a> {
+    /// The delegate family's resolved composition tree.
+    pub delegate_tree: &'a CompositionTree,
+    /// Mapping: wrapper component name → delegate component name.
+    /// E.g., "DropdownList" → "MenuList", "DropdownItem" → "MenuItem".
+    pub wrapper_to_delegate: HashMap<String, String>,
+}
+
 /// Build a composition tree using CSS structure, React patterns, and HTML
 /// semantics instead of BEM-based edge creation.
 ///
 /// BEM determines family membership only. All parent-child edges come from:
 /// 1. Internal rendering (A renders B in JSX)
+/// 1.5. Delegate tree projection (edges from a delegate family's tree)
 /// 2. CSS direct-child selectors (`.A > .B`)
 /// 3. CSS grid parent-child (`A` has grid-template, `B` has grid-column)
 /// 4. CSS flex context (A wraps children in flex container, B is not a grid child)
@@ -38,6 +54,7 @@ pub fn build_composition_tree_v2(
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
     css_profile: Option<&CssBlockProfile>,
+    delegate_contexts: &[DelegateContext<'_>],
 ) -> Option<CompositionTree> {
     if family_exports.is_empty() {
         return None;
@@ -82,6 +99,70 @@ pub fn build_composition_tree_v2(
                         strength: EdgeStrength::Required,
                     });
                 }
+            }
+        }
+    }
+
+    // ── Step 1.5: Delegate tree projection ──────────────────────────
+    // For wrapper families (e.g., Dropdown wraps Menu), project edges
+    // from the delegate family's tree onto this tree. Each edge in the
+    // delegate tree where BOTH parent and child have wrapper mappings
+    // produces a corresponding edge in this tree.
+    //
+    // This runs before Step 10 so projected edges prevent members from
+    // being dropped. Strength is Allowed because the delegation itself
+    // is a design choice — the underlying constraints are Required in
+    // the delegate family but optional at the wrapper level.
+    for ctx in delegate_contexts {
+        // Build reverse map: delegate component → wrapper component
+        let delegate_to_wrapper: HashMap<&str, &str> = ctx
+            .wrapper_to_delegate
+            .iter()
+            .map(|(w, d)| (d.as_str(), w.as_str()))
+            .collect();
+
+        for edge in &ctx.delegate_tree.edges {
+            let Some(&wrapper_parent) = delegate_to_wrapper.get(edge.parent.as_str()) else {
+                continue;
+            };
+            let Some(&wrapper_child) = delegate_to_wrapper.get(edge.child.as_str()) else {
+                continue;
+            };
+
+            // Both must be in this family
+            if !family_set.contains(wrapper_parent) || !family_set.contains(wrapper_child) {
+                continue;
+            }
+            // Skip self-edges
+            if wrapper_parent == wrapper_child {
+                continue;
+            }
+
+            let key = (wrapper_parent.to_string(), wrapper_child.to_string());
+            if edge_set.insert(key) {
+                debug!(
+                    parent = %wrapper_parent,
+                    child = %wrapper_child,
+                    delegate_parent = %edge.parent,
+                    delegate_child = %edge.child,
+                    delegate_family = %ctx.delegate_tree.root,
+                    "delegate tree projection"
+                );
+                tree.edges.push(CompositionEdge {
+                    parent: wrapper_parent.to_string(),
+                    child: wrapper_child.to_string(),
+                    relationship: edge.relationship.clone(),
+                    required: false,
+                    bem_evidence: Some(format!(
+                        "Delegate projection from {} tree: {} wraps {}, {} wraps {}",
+                        ctx.delegate_tree.root,
+                        wrapper_parent,
+                        edge.parent,
+                        wrapper_child,
+                        edge.child,
+                    )),
+                    strength: EdgeStrength::Allowed,
+                });
             }
         }
     }
@@ -1319,7 +1400,7 @@ mod tests {
 
         let family = vec!["Menu".into(), "MenuList".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         let menu_to_list = tree
             .edges
@@ -1360,7 +1441,7 @@ mod tests {
 
         let family = vec!["MenuList".into(), "MenuItem".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         let list_to_item = tree
             .edges
@@ -1563,7 +1644,7 @@ mod tests {
             "DropdownGroup".into(),
         ];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         // All BEM-derived edges should be required=false
         for edge in &tree.edges {
@@ -1613,7 +1694,7 @@ mod tests {
 
         let family = vec!["Label".into(), "LabelGroup".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         // There should be NO edge from Label -> LabelGroup
         let bad_edge = tree
@@ -1655,7 +1736,7 @@ mod tests {
 
         let family = vec!["Alert".into(), "AlertGroup".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         let bad_edge = tree
             .edges
@@ -1708,7 +1789,7 @@ mod tests {
 
         let family = vec!["Modal".into(), "ModalBox".into(), "ModalBoxBody".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         // Name-prefix inference should NOT create Modal → ModalBox because
         // "modalBox" != "modal" (different block). ModalBox → ModalBoxBody
@@ -1763,7 +1844,7 @@ mod tests {
             "JumpLinksItem".into(),
         ];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         // JumpLinksList should be retained as a member (secondary root)
         assert!(
@@ -1814,7 +1895,7 @@ mod tests {
 
         let family = vec!["Root".into(), "Child".into(), "Orphan".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         // Orphan has no edges, should be dropped
         assert!(
@@ -1852,7 +1933,7 @@ mod tests {
 
         let family = vec!["Menu".into(), "MenuToggle".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         let bad_edge = tree
             .edges
@@ -1904,7 +1985,7 @@ mod tests {
 
         let family = vec!["Root".into(), "SubA".into(), "SubB".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         // Step 1 edges Root→SubA and Root→SubB should exist
         assert!(
@@ -1967,7 +2048,7 @@ mod tests {
 
         let family = vec!["Root".into(), "Sub".into()];
 
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         // Root→Sub should exist from Step 1
         assert!(
@@ -2028,7 +2109,7 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
 
         // Signal A: EmptyStateFooter → EmptyStateActions (from layout_children)
         let footer_to_actions = tree
@@ -2116,7 +2197,7 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
 
         // All 3 sub-components should be connected to root
         for child in &["PanelHeader", "PanelMain", "PanelFooter"] {
@@ -2178,7 +2259,7 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
 
         // Label → LabelGroup should NOT exist (independent BEM block)
         let bad_edge = tree
@@ -2219,7 +2300,7 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
 
         // MenuList should have a parent from context nesting (Step 6)
         let context_edge = tree
@@ -2269,7 +2350,7 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
 
         // WidgetBody should NOT be connected (root has no children prop)
         let edge = tree
@@ -2322,7 +2403,7 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
 
         // JumpLinksList → JumpLinksItem from DOM nesting (Step 7)
         let list_to_item = tree
@@ -2405,7 +2486,7 @@ mod tests {
             ..Default::default()
         };
 
-        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof)).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, Some(&css_prof), &[]).unwrap();
 
         // Expected tree:
         // EmptyState
@@ -2465,7 +2546,7 @@ mod tests {
         let family = vec!["Panel".into(), "PanelHeader".into()];
 
         // No CSS profile — Signal B should not fire
-        let tree = build_composition_tree_v2(&profiles, &family, None).unwrap();
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[]).unwrap();
 
         // PanelHeader should be dropped (no edges, no CSS profile)
         assert!(
@@ -2473,5 +2554,256 @@ mod tests {
             "PanelHeader should be dropped without CSS profile. Members: {:?}",
             tree.family_members
         );
+    }
+
+    // ── Step 1.5: Delegate tree projection tests ────────────────────
+
+    #[test]
+    fn test_delegate_projection_dropdown_menu() {
+        // Dropdown wraps Menu. Menu tree has Menu → MenuList → MenuItem.
+        // Projection should produce Dropdown → DropdownList → DropdownItem.
+
+        // Build the Menu "delegate" tree
+        let menu_tree = CompositionTree {
+            root: "Menu".into(),
+            family_members: vec![
+                "Menu".into(),
+                "MenuList".into(),
+                "MenuItem".into(),
+                "MenuGroup".into(),
+            ],
+            edges: vec![
+                CompositionEdge {
+                    parent: "Menu".into(),
+                    child: "MenuList".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("context nesting".into()),
+                    strength: EdgeStrength::Required,
+                },
+                CompositionEdge {
+                    parent: "MenuList".into(),
+                    child: "MenuItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("DOM nesting: ul → li".into()),
+                    strength: EdgeStrength::Required,
+                },
+                CompositionEdge {
+                    parent: "Menu".into(),
+                    child: "MenuGroup".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("CSS descendant".into()),
+                    strength: EdgeStrength::Allowed,
+                },
+            ],
+        };
+
+        // Dropdown family profiles (thin wrappers, no CSS)
+        let mut dropdown = make_profile("Dropdown");
+        dropdown.has_children_prop = true;
+
+        let mut dropdown_list = make_profile("DropdownList");
+        dropdown_list.has_children_prop = true;
+
+        let mut dropdown_item = make_profile("DropdownItem");
+        dropdown_item.has_children_prop = true;
+
+        let mut dropdown_group = make_profile("DropdownGroup");
+        dropdown_group.has_children_prop = true;
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Dropdown".into(), dropdown);
+        profiles.insert("DropdownList".into(), dropdown_list);
+        profiles.insert("DropdownItem".into(), dropdown_item);
+        profiles.insert("DropdownGroup".into(), dropdown_group);
+
+        let family = vec![
+            "Dropdown".into(),
+            "DropdownList".into(),
+            "DropdownItem".into(),
+            "DropdownGroup".into(),
+        ];
+
+        // Wrapper → delegate mapping
+        let mut wrapper_map = HashMap::new();
+        wrapper_map.insert("Dropdown".into(), "Menu".into());
+        wrapper_map.insert("DropdownList".into(), "MenuList".into());
+        wrapper_map.insert("DropdownItem".into(), "MenuItem".into());
+        wrapper_map.insert("DropdownGroup".into(), "MenuGroup".into());
+
+        let ctx = DelegateContext {
+            delegate_tree: &menu_tree,
+            wrapper_to_delegate: wrapper_map,
+        };
+
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[ctx]).unwrap();
+
+        // Dropdown → DropdownList (from Menu → MenuList)
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "Dropdown" && e.child == "DropdownList"),
+            "Expected Dropdown → DropdownList. Edges: {:?}",
+            tree.edges
+        );
+
+        // DropdownList → DropdownItem (from MenuList → MenuItem)
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "DropdownList" && e.child == "DropdownItem"),
+            "Expected DropdownList → DropdownItem. Edges: {:?}",
+            tree.edges
+        );
+
+        // Dropdown → DropdownGroup (from Menu → MenuGroup)
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "Dropdown" && e.child == "DropdownGroup"),
+            "Expected Dropdown → DropdownGroup. Edges: {:?}",
+            tree.edges
+        );
+
+        // All edges should be Allowed (delegation is optional)
+        for edge in &tree.edges {
+            assert_eq!(
+                edge.strength,
+                EdgeStrength::Allowed,
+                "Projected edge {} → {} should be Allowed",
+                edge.parent,
+                edge.child
+            );
+        }
+
+        // All 4 members retained (not dropped by Step 10)
+        assert_eq!(
+            tree.family_members.len(),
+            4,
+            "All 4 members should be retained. Members: {:?}",
+            tree.family_members
+        );
+
+        // Evidence should reference delegate projection
+        let dd_to_dl = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Dropdown" && e.child == "DropdownList")
+            .unwrap();
+        assert!(
+            dd_to_dl
+                .bem_evidence
+                .as_ref()
+                .unwrap()
+                .contains("Delegate projection"),
+            "Evidence should reference delegate projection: {:?}",
+            dd_to_dl.bem_evidence
+        );
+    }
+
+    #[test]
+    fn test_delegate_projection_no_edge_for_unmapped_members() {
+        // If a delegate tree edge has one side unmapped, no edge is created.
+        let delegate_tree = CompositionTree {
+            root: "Menu".into(),
+            family_members: vec!["Menu".into(), "MenuList".into(), "MenuItem".into()],
+            edges: vec![
+                CompositionEdge {
+                    parent: "Menu".into(),
+                    child: "MenuList".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Required,
+                },
+                CompositionEdge {
+                    parent: "MenuList".into(),
+                    child: "MenuItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Required,
+                },
+            ],
+        };
+
+        // Only map root and list, NOT item
+        let mut wrapper_map = HashMap::new();
+        wrapper_map.insert("Wrapper".into(), "Menu".into());
+        wrapper_map.insert("WrapperList".into(), "MenuList".into());
+        // WrapperItem is NOT mapped
+
+        let ctx = DelegateContext {
+            delegate_tree: &delegate_tree,
+            wrapper_to_delegate: wrapper_map,
+        };
+
+        let wrapper = make_profile("Wrapper");
+        let wrapper_list = make_profile("WrapperList");
+        let wrapper_item = make_profile("WrapperItem");
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Wrapper".into(), wrapper);
+        profiles.insert("WrapperList".into(), wrapper_list);
+        profiles.insert("WrapperItem".into(), wrapper_item);
+
+        let family = vec!["Wrapper".into(), "WrapperList".into(), "WrapperItem".into()];
+
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[ctx]).unwrap();
+
+        // Wrapper → WrapperList should exist (both mapped)
+        assert!(tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Wrapper" && e.child == "WrapperList"));
+
+        // WrapperList → WrapperItem should NOT exist (WrapperItem not mapped)
+        assert!(
+            !tree
+                .edges
+                .iter()
+                .any(|e| e.parent == "WrapperList" && e.child == "WrapperItem"),
+            "WrapperList → WrapperItem should not exist (unmapped). Edges: {:?}",
+            tree.edges
+        );
+
+        // WrapperItem should be dropped (no edges)
+        assert!(
+            !tree.family_members.contains(&"WrapperItem".to_string()),
+            "WrapperItem should be dropped. Members: {:?}",
+            tree.family_members
+        );
+    }
+
+    #[test]
+    fn test_delegate_projection_empty_delegate_tree() {
+        // If the delegate tree has no edges (e.g., Button), nothing is projected.
+        let delegate_tree = CompositionTree {
+            root: "Button".into(),
+            family_members: vec!["Button".into()],
+            edges: vec![],
+        };
+
+        let mut wrapper_map = HashMap::new();
+        wrapper_map.insert("MyButton".into(), "Button".into());
+
+        let ctx = DelegateContext {
+            delegate_tree: &delegate_tree,
+            wrapper_to_delegate: wrapper_map,
+        };
+
+        let my_button = make_profile("MyButton");
+        let mut profiles = HashMap::new();
+        profiles.insert("MyButton".into(), my_button);
+
+        let family = vec!["MyButton".into()];
+
+        let tree = build_composition_tree_v2(&profiles, &family, None, &[ctx]).unwrap();
+
+        // No edges projected (Button has no edges)
+        assert!(tree.edges.is_empty());
+        assert_eq!(tree.family_members.len(), 1);
     }
 }
