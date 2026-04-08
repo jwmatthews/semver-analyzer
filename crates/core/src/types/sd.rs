@@ -221,6 +221,25 @@ pub struct SourceLevelChange {
     /// Test-specific description, if different from the main description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_description: Option<String>,
+
+    /// The DOM element this change pertains to (e.g., "button", "div").
+    /// Set for element-specific changes (role, aria, dom structure, data attributes).
+    /// Used in rule ID generation to disambiguate changes on different elements
+    /// within the same component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element: Option<String>,
+
+    /// When set, this change is from a cross-component migration diff
+    /// (e.g., deprecated Select → new Select). The value is the source
+    /// file path of the removed component that this change migrates away
+    /// from. Downstream rule generation can use this to separate
+    /// deprecated-migration rules from same-component evolution rules.
+    ///
+    /// Example: `"packages/react-core/src/deprecated/components/Select/Select.tsx"`
+    /// means this change describes a behavioral difference between the
+    /// deprecated Select and its non-deprecated replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_from: Option<String>,
 }
 
 /// Categories of source-level changes.

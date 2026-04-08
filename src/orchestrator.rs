@@ -2656,6 +2656,8 @@ mod deprecated_replacement_tests {
             new_value: None,
             has_test_implications: false,
             test_description: None,
+            element: None,
+            migration_from: None,
         }
     }
 
@@ -2669,6 +2671,8 @@ mod deprecated_replacement_tests {
             new_value: Some(component.to_string()),
             has_test_implications: false,
             test_description: None,
+            element: None,
+            migration_from: None,
         }
     }
 
@@ -2682,6 +2686,8 @@ mod deprecated_replacement_tests {
             new_value: None,
             has_test_implications: false,
             test_description: None,
+            element: None,
+            migration_from: None,
         }
     }
 

@@ -151,6 +151,33 @@ fn pkg_for(component: &str, map: &HashMap<String, String>) -> String {
         .unwrap_or_else(|| "@patternfly/react-core".to_string())
 }
 
+/// Resolve the deprecated import package from a `migration_from` path.
+///
+/// Example: `"packages/react-core/src/deprecated/components/Select/Select.tsx"`
+///        → `"@patternfly/react-core/deprecated"`
+fn deprecated_pkg_from_migration_path(path: &str) -> String {
+    // Extract the package directory name (e.g., "react-core" from "packages/react-core/...")
+    if let Some(pkg_dir) = path
+        .strip_prefix("packages/")
+        .and_then(|s| s.split('/').next())
+    {
+        format!("@patternfly/{}/deprecated", pkg_dir)
+    } else {
+        "@patternfly/react-core/deprecated".to_string()
+    }
+}
+
+/// Return a rule ID prefix based on whether this is a migration change.
+/// Migration changes use "sd-migration-" to avoid colliding with
+/// same-component evolution rules.
+fn rule_prefix(migration_from: &Option<String>) -> &'static str {
+    if migration_from.is_some() {
+        "sd-migration"
+    } else {
+        "sd"
+    }
+}
+
 // ── Composition change rules ────────────────────────────────────────────
 
 fn generate_composition_change_rules(
@@ -665,11 +692,21 @@ fn generate_context_rules(
         };
 
         let pkg = pkg_for(&change.component, component_packages);
+        let prefix = rule_prefix(&change.migration_from);
         let rule_id = format!(
-            "sd-context-{}-{}",
+            "{}-context-{}-{}",
+            prefix,
             sanitize(&change.component),
             sanitize(ctx_name),
         );
+
+        // For migration changes, match imports from the deprecated path.
+        // For evolution changes, match imports from the current package.
+        let from_pkg = if let Some(ref mf) = change.migration_from {
+            deprecated_pkg_from_migration_path(mf)
+        } else {
+            pkg.clone()
+        };
 
         // Fire on import of the context — consumers who directly import
         // and use the context are affected.
@@ -678,7 +715,7 @@ fn generate_context_rules(
             labels: vec![
                 "source=semver-analyzer".into(),
                 "change-type=context-dependency".into(),
-                format!("package={}", pkg),
+                format!("package={}", from_pkg),
                 format!("component={}", change.component),
             ],
             effort: 3,
@@ -702,7 +739,7 @@ fn generate_context_rules(
                     child: None,
                     not_child: None,
                     value: None,
-                    from: Some(pkg.to_string()),
+                    from: Some(from_pkg),
                     file_pattern: None,
                 },
             },
@@ -2136,10 +2173,18 @@ fn generate_test_impact_rules(
                         continue;
                     }
 
+                    let prefix = rule_prefix(&change.migration_from);
+                    let elem_part = change
+                        .element
+                        .as_deref()
+                        .map(|e| format!("-{}", sanitize(e)))
+                        .unwrap_or_default();
                     let rule_id = format!(
-                        "sd-test-{}-role-{}-{}",
+                        "{}-test-{}-role-{}{}-{}",
+                        prefix,
                         sanitize(&change.component),
                         sanitize(old_val),
+                        elem_part,
                         if change.new_value.is_some() {
                             "changed"
                         } else {
@@ -2226,10 +2271,18 @@ fn generate_test_impact_rules(
                         continue;
                     }
 
+                    let prefix = rule_prefix(&change.migration_from);
+                    let elem_part = change
+                        .element
+                        .as_deref()
+                        .map(|e| format!("-{}", sanitize(e)))
+                        .unwrap_or_default();
                     let rule_id = format!(
-                        "sd-test-{}-aria-label-{}-{}",
+                        "{}-test-{}-aria-label-{}{}-{}",
+                        prefix,
                         sanitize(&change.component),
                         sanitize(old_val),
+                        elem_part,
                         if change.new_value.is_some() {
                             "changed"
                         } else {
@@ -2318,8 +2371,10 @@ fn generate_test_impact_rules(
                         .trim();
 
                     if let Some(role) = implicit_aria_role(element) {
+                        let prefix = rule_prefix(&change.migration_from);
                         let rule_id = format!(
-                            "sd-test-{}-dom-{}-removed",
+                            "{}-test-{}-dom-{}-removed",
+                            prefix,
                             sanitize(&change.component),
                             sanitize(element),
                         );
@@ -2588,6 +2643,14 @@ fn generate_prop_attribute_override_rules(
         }
 
         let pkg = pkg_for(&change.component, component_packages);
+        let prefix = rule_prefix(&change.migration_from);
+
+        // For migration changes, match imports from the deprecated path.
+        let from_pkg = if let Some(ref mf) = change.migration_from {
+            deprecated_pkg_from_migration_path(mf)
+        } else {
+            pkg.clone()
+        };
 
         // Parse the new_value to extract overridden attribute names.
         // Format is "propName → attr1, attr2, attr3"
@@ -2608,8 +2671,10 @@ fn generate_prop_attribute_override_rules(
         // Generate one rule per overridden attribute
         for attr in &overridden_attrs {
             let rule_id = format!(
-                "sd-prop-override-{}-{}",
+                "{}-prop-override-{}-{}-{}",
+                prefix,
                 sanitize(&change.component),
+                sanitize(&prop_name),
                 sanitize(attr),
             );
 
@@ -2652,8 +2717,8 @@ fn generate_prop_attribute_override_rules(
                         not_child: None,
                         parent_from: None,
                         value: None,
-                        from: if pkg != "unknown" {
-                            Some(pkg.clone())
+                        from: if from_pkg != "unknown" {
+                            Some(from_pkg.clone())
                         } else {
                             None
                         },
@@ -3310,6 +3375,8 @@ mod tests {
             new_value: Some("<AccordionItemContext.Provider>".into()),
             has_test_implications: true,
             test_description: None,
+            element: None,
+            migration_from: None,
         }];
 
         let rules = generate_context_rules(&changes, &test_pkg_map());
@@ -3323,5 +3390,235 @@ mod tests {
         } else {
             panic!("Expected FrontendReferenced condition");
         }
+    }
+
+    // ── Migration-aware rule generation tests ───────────────────────
+
+    #[test]
+    fn test_migration_test_impact_rules_have_distinct_ids() {
+        // Simulate: deprecated SelectOption had role='presentation' on 3 elements,
+        // new SelectOption has none. This produces 3 migration-tagged changes.
+        // They should all produce rules with "sd-migration-" prefix and
+        // NOT collide with each other or with evolution rules.
+        // The `element` field disambiguates rule IDs for same-role different-element.
+        let changes = vec![
+            SourceLevelChange {
+                component: "SelectOption".into(),
+                category: SourceLevelCategory::RoleChange,
+                description: "role='presentation' removed from <button> in SelectOption".into(),
+                old_value: Some("presentation".into()),
+                new_value: None,
+                has_test_implications: true,
+                test_description: None,
+                element: Some("button".into()),
+                migration_from: Some(
+                    "packages/react-core/src/deprecated/components/Select/SelectOption.tsx".into(),
+                ),
+            },
+            SourceLevelChange {
+                component: "SelectOption".into(),
+                category: SourceLevelCategory::RoleChange,
+                description: "role='presentation' removed from <div> in SelectOption".into(),
+                old_value: Some("presentation".into()),
+                new_value: None,
+                has_test_implications: true,
+                test_description: None,
+                element: Some("div".into()),
+                migration_from: Some(
+                    "packages/react-core/src/deprecated/components/Select/SelectOption.tsx".into(),
+                ),
+            },
+            // Also add a non-migration change for the same component
+            SourceLevelChange {
+                component: "SelectOption".into(),
+                category: SourceLevelCategory::RoleChange,
+                description: "role='option' removed from <li> in SelectOption".into(),
+                old_value: Some("option".into()),
+                new_value: None,
+                has_test_implications: true,
+                test_description: None,
+                element: Some("li".into()),
+                migration_from: None, // evolution change
+            },
+        ];
+
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("SelectOption".into(), "@patternfly/react-core".into());
+
+        let rules = generate_test_impact_rules(&changes, &pkgs);
+
+        // Migration rules should have "sd-migration-" prefix
+        let migration_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.starts_with("sd-migration-"))
+            .collect();
+        assert!(
+            !migration_rules.is_empty(),
+            "Should produce migration-prefixed rules"
+        );
+
+        // Evolution rules should have "sd-" prefix (not "sd-migration-")
+        let evolution_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| r.rule_id.starts_with("sd-test-"))
+            .collect();
+        assert!(
+            !evolution_rules.is_empty(),
+            "Should produce evolution-prefixed rules"
+        );
+
+        // All rule IDs should be unique
+        let mut seen = std::collections::HashSet::new();
+        for r in &rules {
+            assert!(seen.insert(&r.rule_id), "Duplicate rule ID: {}", r.rule_id);
+        }
+    }
+
+    #[test]
+    fn test_migration_context_rules_use_deprecated_from_path() {
+        let changes = vec![SourceLevelChange {
+            component: "Select".into(),
+            category: SourceLevelCategory::ContextDependency,
+            description: "Select no longer uses useContext(SelectContext)".into(),
+            old_value: Some("useContext(SelectContext)".into()),
+            new_value: None,
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: Some(
+                "packages/react-core/src/deprecated/components/Select/Select.tsx".into(),
+            ),
+        }];
+
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Select".into(), "@patternfly/react-core".into());
+
+        let rules = generate_context_rules(&changes, &pkgs);
+
+        assert_eq!(rules.len(), 1);
+
+        // Rule ID should have migration prefix
+        assert!(
+            rules[0].rule_id.starts_with("sd-migration-context-"),
+            "Expected migration prefix, got: {}",
+            rules[0].rule_id
+        );
+
+        // from should be the deprecated package path
+        if let KonveyorCondition::FrontendReferenced { referenced } = &rules[0].when {
+            assert_eq!(
+                referenced.from.as_deref(),
+                Some("@patternfly/react-core/deprecated"),
+                "Migration context rule should match deprecated import path"
+            );
+        } else {
+            panic!("Expected FrontendReferenced condition");
+        }
+    }
+
+    #[test]
+    fn test_migration_prop_override_rules_use_deprecated_from_path() {
+        let changes = vec![SourceLevelChange {
+            component: "Dropdown".into(),
+            category: SourceLevelCategory::PropAttributeOverride,
+            description: "Dropdown's `ouiaId` prop overrides HTML attributes".into(),
+            old_value: None,
+            new_value: Some("ouiaId → data-ouia-component-id".into()),
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: Some(
+                "packages/react-core/src/deprecated/components/Dropdown/Dropdown.tsx".into(),
+            ),
+        }];
+
+        let pkgs = test_pkg_map();
+
+        let rules =
+            generate_prop_attribute_override_rules(&changes, &SdPipelineResult::default(), &pkgs);
+
+        assert_eq!(rules.len(), 1);
+
+        // Rule ID should have migration prefix
+        assert!(
+            rules[0].rule_id.starts_with("sd-migration-prop-override-"),
+            "Expected migration prefix, got: {}",
+            rules[0].rule_id
+        );
+
+        // from should be the deprecated package path
+        if let KonveyorCondition::FrontendReferenced { referenced } = &rules[0].when {
+            assert_eq!(
+                referenced.from.as_deref(),
+                Some("@patternfly/react-core/deprecated"),
+                "Migration prop-override rule should match deprecated import path"
+            );
+        } else {
+            panic!("Expected FrontendReferenced condition");
+        }
+    }
+
+    #[test]
+    fn test_evolution_rules_unchanged_by_migration_support() {
+        // Verify that non-migration changes still produce "sd-" prefixed rules
+        // with the normal package in `from`.
+        let changes = vec![SourceLevelChange {
+            component: "Dropdown".into(),
+            category: SourceLevelCategory::PropAttributeOverride,
+            description: "Dropdown's `ouiaId` prop overrides HTML attributes".into(),
+            old_value: None,
+            new_value: Some("ouiaId → data-ouia-component-id".into()),
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            migration_from: None, // evolution, not migration
+        }];
+
+        let rules = generate_prop_attribute_override_rules(
+            &changes,
+            &SdPipelineResult::default(),
+            &test_pkg_map(),
+        );
+
+        assert_eq!(rules.len(), 1);
+
+        // Rule ID should NOT have migration prefix
+        assert!(
+            rules[0].rule_id.starts_with("sd-prop-override-"),
+            "Expected sd- prefix, got: {}",
+            rules[0].rule_id
+        );
+
+        // from should be the normal package
+        if let KonveyorCondition::FrontendReferenced { referenced } = &rules[0].when {
+            assert_eq!(
+                referenced.from.as_deref(),
+                Some("@patternfly/react-core"),
+                "Evolution prop-override rule should match normal import path"
+            );
+        } else {
+            panic!("Expected FrontendReferenced condition");
+        }
+    }
+
+    #[test]
+    fn test_deprecated_pkg_from_migration_path() {
+        assert_eq!(
+            deprecated_pkg_from_migration_path(
+                "packages/react-core/src/deprecated/components/Select/Select.tsx"
+            ),
+            "@patternfly/react-core/deprecated"
+        );
+        assert_eq!(
+            deprecated_pkg_from_migration_path(
+                "packages/react-table/src/deprecated/components/Table/Table.tsx"
+            ),
+            "@patternfly/react-table/deprecated"
+        );
+        // Fallback for unexpected format
+        assert_eq!(
+            deprecated_pkg_from_migration_path("some/random/path.tsx"),
+            "@patternfly/react-core/deprecated"
+        );
     }
 }

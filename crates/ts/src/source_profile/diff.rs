@@ -72,6 +72,8 @@ fn diff_portal_usage(
             new_value: Some(format!("uses_portal: {}", new.uses_portal)),
             has_test_implications: true,
             test_description: test_desc,
+            element: None,
+            migration_from: None,
         });
     }
 }
@@ -98,6 +100,8 @@ fn diff_context_dependencies(
                 new_value: Some(format!("useContext({ctx})")),
                 has_test_implications: false,
                 test_description: None,
+                element: None,
+                migration_from: None,
             });
         }
     }
@@ -116,6 +120,8 @@ fn diff_context_dependencies(
                 new_value: None,
                 has_test_implications: false,
                 test_description: None,
+                element: None,
+                migration_from: None,
             });
         }
     }
@@ -146,6 +152,8 @@ fn diff_context_providers(
                     "Tests rendering children of {component} may need to account for \
                      the new {ctx} context provider."
                 )),
+                element: None,
+                migration_from: None,
             });
         }
     }
@@ -168,6 +176,8 @@ fn diff_context_providers(
                     "Tests for child components of {component} that depend on {ctx} \
                      context will need to provide their own context wrapper."
                 )),
+                element: None,
+                migration_from: None,
             });
         }
     }
@@ -196,6 +206,8 @@ fn diff_forward_ref(
             new_value: Some(format!("is_forward_ref: {}", new.is_forward_ref)),
             has_test_implications: false,
             test_description: None,
+            element: None,
+            migration_from: None,
         });
     }
 }
@@ -223,6 +235,8 @@ fn diff_memo(
             new_value: Some(format!("is_memo: {}", new.is_memo)),
             has_test_implications: false,
             test_description: None,
+            element: None,
+            migration_from: None,
         });
     }
 }
@@ -249,6 +263,8 @@ fn diff_prop_defaults(
                     new_value: Some(new_val.clone()),
                     has_test_implications: false,
                     test_description: None,
+                    element: None,
+                    migration_from: None,
                 });
             }
             None => {
@@ -263,6 +279,8 @@ fn diff_prop_defaults(
                     new_value: Some(new_val.clone()),
                     has_test_implications: false,
                     test_description: None,
+                    element: None,
+                    migration_from: None,
                 });
             }
             _ => {} // Same value, no change
@@ -282,6 +300,8 @@ fn diff_prop_defaults(
                 new_value: None,
                 has_test_implications: false,
                 test_description: None,
+                element: None,
+                migration_from: None,
             });
         }
     }
@@ -305,6 +325,8 @@ fn diff_rendered_components(
                 new_value: Some(comp.clone()),
                 has_test_implications: false,
                 test_description: None,
+                element: None,
+                migration_from: None,
             });
         }
     }
@@ -319,6 +341,8 @@ fn diff_rendered_components(
                 new_value: None,
                 has_test_implications: false,
                 test_description: None,
+                element: None,
+                migration_from: None,
             });
         }
     }
@@ -345,6 +369,8 @@ fn diff_dom_structure(
                 test_description: Some(format!(
                     "New <{elem}> element may affect snapshot tests and DOM query selectors"
                 )),
+                element: Some(elem.clone()),
+                migration_from: None,
             });
         }
     }
@@ -362,6 +388,8 @@ fn diff_dom_structure(
                 test_description: Some(format!(
                     "Removed <{elem}> element will break queries using this element type"
                 )),
+                element: Some(elem.clone()),
+                migration_from: None,
             });
         }
     }
@@ -391,6 +419,8 @@ fn diff_aria_attributes(
                 test_description: Some(format!(
                     "New {attr} on <{elem}> may affect getByRole/getByLabelText queries"
                 )),
+                element: Some(elem.clone()),
+                migration_from: None,
             });
         } else if let Some(old_val) = old.aria_attributes.get(&(elem.clone(), attr.clone())) {
             if old_val != val {
@@ -406,6 +436,8 @@ fn diff_aria_attributes(
                     test_description: Some(format!(
                         "Changed {attr} value will affect accessibility queries"
                     )),
+                    element: Some(elem.clone()),
+                    migration_from: None,
                 });
             }
         }
@@ -427,6 +459,8 @@ fn diff_aria_attributes(
                 test_description: Some(format!(
                     "Removed {attr} from <{elem}> will break queries using this attribute"
                 )),
+                element: Some(elem.clone()),
+                migration_from: None,
             });
         }
     }
@@ -455,6 +489,8 @@ fn diff_role_attributes(
                     test_description: Some(format!(
                         "getByRole('{old_role}') must change to getByRole('{new_role}')"
                     )),
+                    element: Some(elem.clone()),
+                    migration_from: None,
                 });
             }
             None => {
@@ -468,6 +504,8 @@ fn diff_role_attributes(
                     test_description: Some(format!(
                         "New role='{new_role}' on <{elem}> enables getByRole('{new_role}') queries"
                     )),
+                    element: Some(elem.clone()),
+                    migration_from: None,
                 });
             }
             _ => {}
@@ -486,6 +524,8 @@ fn diff_role_attributes(
                 test_description: Some(format!(
                     "getByRole('{old_role}') will no longer find this element"
                 )),
+                element: Some(elem.clone()),
+                migration_from: None,
             });
         }
     }
@@ -514,6 +554,8 @@ fn diff_data_attributes(
                 test_description: Some(format!(
                     "New {attr} on <{elem}> may affect getByTestId or OUIA selectors"
                 )),
+                element: Some(elem.clone()),
+                migration_from: None,
             });
         }
     }
@@ -533,6 +575,8 @@ fn diff_data_attributes(
                 test_description: Some(format!(
                     "Removed {attr} from <{elem}> will break selectors using this attribute"
                 )),
+                element: Some(elem.clone()),
+                migration_from: None,
             });
         }
     }
@@ -557,6 +601,8 @@ fn diff_css_tokens(
             test_description: Some(format!(
                 "New CSS class from {token} may affect toHaveClass assertions"
             )),
+            element: None,
+            migration_from: None,
         });
     }
 
@@ -571,6 +617,8 @@ fn diff_css_tokens(
             test_description: Some(format!(
                 "Removed CSS class from {token} will break toHaveClass assertions"
             )),
+            element: None,
+            migration_from: None,
         });
     }
 }
@@ -609,6 +657,8 @@ fn diff_prop_style_bindings(
                     test_description: Some(format!(
                         "Tests relying on `{prop}` to apply CSS class from `{token}` will no longer see that class"
                     )),
+                    element: None,
+                    migration_from: None,
                 });
             } else if prop_still_exists && token_still_used && !still_bound {
                 // The token still exists but the prop no longer controls it
@@ -625,6 +675,8 @@ fn diff_prop_style_bindings(
                     test_description: Some(format!(
                         "Tests toggling `{prop}` to control `{token}` may need updating"
                     )),
+                    element: None,
+                    migration_from: None,
                 });
             }
         }
@@ -652,6 +704,8 @@ fn diff_prop_style_bindings(
                     test_description: Some(format!(
                         "Setting `{prop}` will now apply CSS class from `{token}`"
                     )),
+                    element: None,
+                    migration_from: None,
                 });
             }
         }
@@ -714,6 +768,8 @@ fn diff_managed_attributes(
                         .unwrap_or(&"the managed attribute".to_string()),
                     binding.prop_name,
                 )),
+                element: None,
+                migration_from: None,
             });
         }
     }
@@ -739,6 +795,8 @@ fn diff_managed_attributes(
                 new_value: None,
                 has_test_implications: false,
                 test_description: None,
+                element: None,
+                migration_from: None,
             });
         }
     }
@@ -768,6 +826,8 @@ fn diff_children_slot(
             new_value: Some(new.children_slot_path.join(" > ")),
             has_test_implications: false,
             test_description: None,
+            element: None,
+            migration_from: None,
         });
     }
 
@@ -780,6 +840,8 @@ fn diff_children_slot(
             new_value: None,
             has_test_implications: false,
             test_description: None,
+            element: None,
+            migration_from: None,
         });
     }
 
@@ -792,6 +854,8 @@ fn diff_children_slot(
             new_value: Some("children: React.ReactNode".into()),
             has_test_implications: false,
             test_description: None,
+            element: None,
+            migration_from: None,
         });
     }
 }

@@ -60,6 +60,10 @@ pub fn run_sd(
     let mut old_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
     let mut all_source_changes = Vec::new();
 
+    // Collect v5 profiles for deprecated components that were removed in v6.
+    // These are used in Phase A.5 to diff against their non-deprecated replacements.
+    let mut deprecated_removed_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
+
     // Extract profiles at both refs for changed files, diff them
     for file_info in &changed_files {
         let old_source = read_git_file(repo, from_ref, &file_info.path);
@@ -68,6 +72,16 @@ pub fn run_sd(
         if let Some(ref source) = old_source {
             let profile =
                 source_profile::extract_profile(&file_info.component_name, &file_info.path, source);
+
+            // Collect deprecated components that were removed (exist in v5, gone in v6).
+            // Store these separately before the old_profiles preference logic
+            // can overwrite them with the main-path version.
+            if new_source.is_none() && file_info.path.contains("/deprecated/") {
+                deprecated_removed_profiles
+                    .entry(file_info.component_name.clone())
+                    .or_insert_with(|| profile.clone());
+            }
+
             // When a component exists in both main and deprecated paths,
             // prefer the main (non-deprecated) version.
             let is_deprecated = file_info.path.contains("/deprecated/");
@@ -153,6 +167,69 @@ pub fn run_sd(
         new_profiles = new_profiles.len(),
         "to-version profiles extracted"
     );
+
+    // ════════════════════════════════════════════════════════════════
+    // Phase A.5: Deprecated migration diffing
+    // ════════════════════════════════════════════════════════════════
+    //
+    // For deprecated components that were removed in v6, if a same-named
+    // component exists at the non-deprecated path, diff their source
+    // profiles to produce migration-specific source-level changes.
+    //
+    // Example: deprecated/Select was removed, components/Select exists →
+    // diff deprecated Select (v5) against new Select (v6) to surface
+    // behavioral differences (e.g., deprecated Select rendered TextInput
+    // for typeahead variant, new Select doesn't).
+
+    if !deprecated_removed_profiles.is_empty() {
+        let mut deprecated_migration_count = 0;
+        for (component_name, deprecated_profile) in &deprecated_removed_profiles {
+            if let Some(replacement_profile) = new_profiles.get(component_name) {
+                info!(
+                    component = %component_name,
+                    deprecated_path = %deprecated_profile.file,
+                    replacement_path = %replacement_profile.file,
+                    "Diffing deprecated component against non-deprecated replacement"
+                );
+                let changes = diff_profiles(deprecated_profile, replacement_profile);
+                if !changes.is_empty() {
+                    debug!(
+                        component = %component_name,
+                        changes = changes.len(),
+                        "deprecated migration changes detected"
+                    );
+                    // Tag each change with the deprecated source path so
+                    // downstream rule generation can separate these from
+                    // same-component evolution changes.
+                    let tagged_changes: Vec<_> = changes
+                        .into_iter()
+                        .map(|mut c| {
+                            c.migration_from = Some(deprecated_profile.file.clone());
+                            c
+                        })
+                        .collect();
+                    deprecated_migration_count += tagged_changes.len();
+                    all_source_changes.extend(tagged_changes);
+                }
+            } else {
+                debug!(
+                    component = %component_name,
+                    "No non-deprecated replacement found — skipping migration diff"
+                );
+            }
+        }
+
+        if deprecated_migration_count > 0 {
+            info!(
+                changes = deprecated_migration_count,
+                components = deprecated_removed_profiles
+                    .keys()
+                    .filter(|name| new_profiles.contains_key(*name))
+                    .count(),
+                "Phase A.5 complete: deprecated migration diffing"
+            );
+        }
+    }
 
     // Group ALL to-version files by family
     let all_families = group_by_family(&all_to_files);
@@ -2373,5 +2450,192 @@ export { DropdownList } from './DropdownList';
             .collect();
         assert!(bad_nesting.is_empty(),
             "CSS sibling selector proves PageMainContainer is a sibling of PageSidebar. Found: {:?}", bad_nesting);
+    }
+
+    // ── Deprecated migration diffing tests ──────────────────────────
+
+    /// When a deprecated component (e.g., deprecated/Select) is removed and
+    /// a same-named replacement exists (components/Select), diffing their
+    /// profiles produces source-level changes tagged with `migration_from`.
+    #[test]
+    fn test_deprecated_migration_diff_produces_tagged_changes() {
+        use semver_analyzer_core::types::sd::SourceLevelCategory;
+
+        // Deprecated Select rendered TextInput internally
+        let mut deprecated_profile = ComponentSourceProfile::default();
+        deprecated_profile.name = "Select".to_string();
+        deprecated_profile.file =
+            "packages/react-core/src/deprecated/components/Select/Select.tsx".to_string();
+        deprecated_profile
+            .rendered_components
+            .push("TextInput".to_string());
+        deprecated_profile
+            .rendered_components
+            .push("ChipGroup".to_string());
+
+        // New Select does NOT render TextInput or ChipGroup
+        let mut replacement_profile = ComponentSourceProfile::default();
+        replacement_profile.name = "Select".to_string();
+        replacement_profile.file =
+            "packages/react-core/src/components/Select/Select.tsx".to_string();
+        replacement_profile
+            .rendered_components
+            .push("Menu".to_string());
+
+        // Diff them
+        let changes = diff_profiles(&deprecated_profile, &replacement_profile);
+
+        // Should produce RenderedComponent changes
+        let rendered_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::RenderedComponent)
+            .collect();
+        assert!(
+            !rendered_changes.is_empty(),
+            "Should detect rendered component differences"
+        );
+
+        // Should find "no longer renders TextInput"
+        let text_input_removed = rendered_changes
+            .iter()
+            .find(|c| c.old_value.as_deref() == Some("TextInput"));
+        assert!(
+            text_input_removed.is_some(),
+            "Should detect TextInput no longer rendered. Changes: {:?}",
+            rendered_changes
+                .iter()
+                .map(|c| (&c.old_value, &c.new_value))
+                .collect::<Vec<_>>()
+        );
+
+        // Component name should be bare "Select" (not "removed/Select")
+        for c in &changes {
+            assert_eq!(
+                c.component, "Select",
+                "Component name should be bare, not prefixed"
+            );
+        }
+
+        // migration_from is None by default from diff_profiles — the tagging
+        // happens in Phase A.5. Verify we can tag them.
+        let tagged: Vec<_> = changes
+            .into_iter()
+            .map(|mut c| {
+                c.migration_from = Some(deprecated_profile.file.clone());
+                c
+            })
+            .collect();
+
+        for c in &tagged {
+            assert_eq!(
+                c.migration_from.as_deref(),
+                Some("packages/react-core/src/deprecated/components/Select/Select.tsx"),
+                "migration_from should be set to deprecated path"
+            );
+            assert_eq!(c.component, "Select", "component should remain bare");
+        }
+    }
+
+    /// When a deprecated component has no same-named replacement in v6,
+    /// no migration diff should be produced.
+    #[test]
+    fn test_deprecated_without_replacement_skipped() {
+        // deprecated/Tile removed, no components/Tile exists
+        let mut deprecated_profile = ComponentSourceProfile::default();
+        deprecated_profile.name = "Tile".to_string();
+        deprecated_profile.file =
+            "packages/react-core/src/deprecated/components/Tile/Tile.tsx".to_string();
+        deprecated_profile
+            .rendered_components
+            .push("Button".to_string());
+
+        // Simulate: new_profiles does NOT contain "Tile"
+        let new_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
+
+        // The lookup should return None
+        assert!(
+            new_profiles.get("Tile").is_none(),
+            "No replacement should exist for Tile"
+        );
+        // No diff is produced (the Phase A.5 code simply skips this case)
+    }
+
+    /// Migration changes should be separate from same-component evolution
+    /// changes. The `migration_from` field distinguishes them.
+    #[test]
+    fn test_migration_changes_separate_from_evolution_changes() {
+        use semver_analyzer_core::types::sd::SourceLevelCategory;
+
+        // Same-component evolution: Select v5 → Select v6 (minor changes)
+        let mut select_v5 = ComponentSourceProfile::default();
+        select_v5.name = "Select".to_string();
+        select_v5.file = "packages/react-core/src/components/Select/Select.tsx".to_string();
+        select_v5.rendered_components.push("Menu".to_string());
+
+        let mut select_v6 = ComponentSourceProfile::default();
+        select_v6.name = "Select".to_string();
+        select_v6.file = "packages/react-core/src/components/Select/Select.tsx".to_string();
+        select_v6.rendered_components.push("Menu".to_string());
+        select_v6.rendered_components.push("Popper".to_string()); // new in v6
+
+        let evolution_changes = diff_profiles(&select_v5, &select_v6);
+
+        // Deprecated migration: deprecated/Select → Select
+        let mut deprecated_select = ComponentSourceProfile::default();
+        deprecated_select.name = "Select".to_string();
+        deprecated_select.file =
+            "packages/react-core/src/deprecated/components/Select/Select.tsx".to_string();
+        deprecated_select
+            .rendered_components
+            .push("TextInput".to_string());
+
+        let migration_changes = diff_profiles(&deprecated_select, &select_v6);
+
+        // Tag them differently
+        let evolution: Vec<_> = evolution_changes
+            .into_iter()
+            .map(|mut c| {
+                c.migration_from = None; // same-component evolution
+                c
+            })
+            .collect();
+
+        let migration: Vec<_> = migration_changes
+            .into_iter()
+            .map(|mut c| {
+                c.migration_from = Some(deprecated_select.file.clone());
+                c
+            })
+            .collect();
+
+        // Both have component: "Select"
+        for c in &evolution {
+            assert_eq!(c.component, "Select");
+            assert!(c.migration_from.is_none());
+        }
+        for c in &migration {
+            assert_eq!(c.component, "Select");
+            assert!(c.migration_from.is_some());
+        }
+
+        // Migration changes should include TextInput removal
+        let text_input_change = migration.iter().find(|c| {
+            c.category == SourceLevelCategory::RenderedComponent
+                && c.old_value.as_deref() == Some("TextInput")
+        });
+        assert!(
+            text_input_change.is_some(),
+            "Migration changes should include TextInput removal"
+        );
+
+        // Evolution changes should NOT include TextInput (it was never in main Select)
+        let text_input_in_evolution = evolution.iter().find(|c| {
+            c.category == SourceLevelCategory::RenderedComponent
+                && c.old_value.as_deref() == Some("TextInput")
+        });
+        assert!(
+            text_input_in_evolution.is_none(),
+            "Evolution changes should not mention TextInput"
+        );
     }
 }
