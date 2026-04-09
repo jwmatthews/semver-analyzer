@@ -43,6 +43,9 @@ tracing-appender = "0.2"
 # Progress reporting
 indicatif = "0.17"
 
+# Colored CLI output
+owo-colors = "4"
+
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 

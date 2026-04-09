@@ -965,4 +965,8 @@ pub struct AnalysisResult<L: Language> {
     /// Source-level changes from the SD pipeline.
     /// Empty when running the v1 (BU) pipeline.
     pub sd_result: Option<super::sd::SdPipelineResult>,
+
+    /// Non-fatal issues that degraded analysis quality.
+    /// Populated by the orchestrator and rendered at end of run.
+    pub degradation: std::sync::Arc<crate::diagnostics::DegradationTracker>,
 }

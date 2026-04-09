@@ -589,6 +589,188 @@ cargo test -p semver-analyzer-ts          # + integration tests
 cargo test                                # full suite
 ```
 
+### Error Handling & Diagnostics (CRITICAL)
+
+The project uses a three-layer error reporting architecture. **Every error the
+user sees must answer: What happened? Why? What can I do about it?**
+
+#### Three Layers
+
+1. **Fatal errors** — propagate via `anyhow::Result` with tips attached via
+   the `Diagnosed` wrapper. Rendered by `src/diagnostics.rs::render_error()`
+   with colored output (red error, dimmed chain, cyan tips).
+2. **Non-fatal degradation** — recorded via `DegradationTracker` on
+   `SharedFindings`, summarized at end of run with `print_degradation_summary()`.
+3. **Best-effort operations** — logged at `trace` level, return
+   `None`/default (e.g., `read_git_file()` in `crates/ts/src/git_utils.rs`).
+
+#### ErrorTip Trait and Diagnosed Wrapper
+
+`ErrorTip` (in `crates/core/src/error.rs`) is the contract for errors that
+carry user-facing remediation tips. `Diagnosed` is a marker type that carries
+tips through the `anyhow` error chain. The CLI extracts tips via a single
+`downcast_ref::<Diagnosed>()` — no per-language-type dispatch needed.
+
+**When adding a new error type:**
+
+1. Define the error enum with `thiserror::Error`
+2. Implement `ErrorTip` — every variant that a user can trigger MUST have
+   a tip explaining what to do
+3. At the boundary where the error enters `anyhow::Result`, call
+   `.diagnose()` (from `DiagnoseWithTip`) to capture the tip
+
+**Extension traits for tip attachment:**
+
+- `DiagnoseWithTip` — for `Result<T, E: ErrorTip>`: `.diagnose()` auto-extracts
+  the tip from the error's `tip()` method
+- `DiagnoseExt` — for any `Result`: `.with_diagnosis("tip text")` attaches
+  an explicit tip string
+
+**Never:**
+
+- Return a bare `anyhow::bail!()` for errors caused by user input or
+  environment issues — always attach a tip via `.with_diagnosis()` or
+  `.diagnose()`
+- Add `downcast_ref` calls in the CLI's `extract_tip()` — the `Diagnosed`
+  wrapper handles dispatch for all languages automatically
+- Use `eprintln!` directly for error output in production code — all
+  user-facing errors flow through `render_error()` or
+  `print_degradation_summary()`
+
+**Example — Language implementor:**
+
+```rust
+// Define error type with thiserror
+#[derive(Debug, thiserror::Error)]
+pub enum GoBuildError {
+    #[error("go build failed: {reason}")]
+    BuildFailed { reason: String },
+}
+
+// Implement ErrorTip
+impl ErrorTip for GoBuildError {
+    fn tip(&self) -> Option<String> {
+        Some(match self {
+            Self::BuildFailed { .. } =>
+                "Try running 'go build ./...' manually in the repo.".to_string(),
+        })
+    }
+}
+
+// At boundary — .diagnose() captures the tip into Diagnosed
+fn extract(&self, repo: &Path, git_ref: &str) -> Result<ApiSurface> {
+    let guard = WorktreeGuard::new(repo, git_ref, cmd).diagnose()?;
+    // ...
+}
+
+// For non-ErrorTip errors — .with_diagnosis() attaches explicit tip
+fs::read(path)
+    .with_context(|| format!("Failed to read {}", path.display()))
+    .with_diagnosis("Check the file exists and you have read permissions.")?;
+```
+
+#### DegradationTracker
+
+`DegradationTracker` (in `crates/core/src/diagnostics.rs`) collects non-fatal
+issues during the pipeline run. It lives on `SharedFindings` and is accessible
+to all pipeline phases and Language implementations via
+`shared.degradation()`.
+
+**When to record a degradation:**
+
+- A pipeline phase fails but execution can continue with empty/partial results
+- An external tool (LLM, CSS extraction, dep repo build) fails
+- Multiple per-item failures occur (batch into a single summary entry)
+
+**When NOT to record:**
+
+- Best-effort operations where failure is a normal code path (e.g.,
+  `read_git_file` returning `None` for a file that may not exist)
+- Cleanup/teardown failures (Drop impls, worktree removal)
+
+Each `DegradationIssue` has three fields:
+
+- `phase`: short tag ("TD", "SD", "BU", "CSS", "LLM")
+- `message`: what happened (technical, concise)
+- `impact`: what the user is missing (user-facing, actionable)
+
+The tracker is surfaced to the CLI via `AnalysisResult::degradation` and
+rendered by `diagnostics::print_degradation_summary()`.
+
+#### Progress Reporter: Success vs Failure Icons
+
+Use `phase.finish_failed()` (shows ✗) for phases that failed but were
+non-fatal. Use `phase.finish()` / `phase.finish_with_detail()` (shows ✓)
+for successful completion. **Never** show ✓ for a failed phase.
+
+#### Silent Error Swallowing Rules
+
+| Pattern | When to use | Must log? |
+|---------|-------------|-----------|
+| `.ok()?` returning `None` | File may legitimately not exist (git show, package.json) | `trace!` level |
+| `.unwrap_or_default()` | Mutex poisoning in cleanup, broadcast send | No |
+| `let _ =` | Drop/RAII cleanup, broadcast channels | No |
+| `if let Ok(...)` | Optional enrichment that doesn't affect correctness | `trace!` level |
+| `warn!` + fallback | Phase failure with graceful degradation | Yes + record degradation |
+
+**Never** use `.ok()`, `.unwrap_or_default()`, or `if let Ok(...)` to swallow
+errors from operations the user explicitly requested (git checkout, build
+commands, file writes). These must propagate as fatal errors with tips.
+
+#### Partial Extraction Warnings (WorktreeGuard)
+
+When `WorktreeGuard::new()` succeeds but encountered non-fatal issues
+(partial tsc success, fallback to project build), it stores
+`ExtractionWarning` entries accessible via `guard.warnings()`.
+
+The `Language::extract()` method accepts an optional `&DegradationTracker`.
+`extract_at_ref()` inspects `guard.warnings()` after successful creation
+and records them as degradation. This ensures partial-success scenarios
+appear in the end-of-run summary rather than scrolling by as raw
+`tracing::warn!` lines.
+
+**Warning types (`ExtractionWarning` in `crates/ts/src/worktree/mod.rs`):**
+
+| Variant | When |
+|---------|------|
+| `PartialTscBuildFailed` | Some packages compiled, project build also failed — API surface may be incomplete |
+| `TscFailedBuildSucceeded` | tsc failed entirely, project build succeeded as fallback |
+
+Per-package `tsc failed for package X` messages stay as `tracing::warn!`
+(visible in `--log-file`). Only the aggregate outcome is captured as a
+structured `ExtractionWarning`.
+
+#### `read_git_file()` / `git_diff_file()` (Shared Utilities)
+
+Single implementations in `crates/ts/src/git_utils.rs`. Return
+`Option<String>`. Log at `trace!` level on failure. **Do not duplicate
+these functions** — there were previously 4+ copies across the codebase.
+
+#### Error Display at CLI Level
+
+The CLI renderer (`src/diagnostics.rs::render_error()`) handles all error
+formatting. It:
+
+1. Walks the `anyhow` chain for `Diagnosed` markers (single downcast)
+2. Renders colored output: red `error:`, dimmed `caused by:`, cyan `tip:`
+3. Falls back to pattern-matching on error text for undiagnosed errors
+
+The `main()` function catches the `anyhow::Error` and passes it to
+`render_error()` — it does NOT use the default `anyhow::Result` return
+from `main()`.
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `crates/core/src/error.rs` | `ErrorTip` trait, `Diagnosed` wrapper, `DiagnoseWithTip` / `DiagnoseExt` |
+| `crates/core/src/diagnostics.rs` | `DegradationTracker`, `DegradationIssue` |
+| `crates/core/src/shared.rs` | `SharedFindings::degradation()` accessor |
+| `crates/ts/src/worktree/error.rs` | `WorktreeError` + `ErrorTip` impl with tips for all variants |
+| `crates/ts/src/git_utils.rs` | Shared `read_git_file()`, `git_diff_file()` with trace logging |
+| `src/diagnostics.rs` | `render_error()`, `print_degradation_summary()` |
+| `src/progress.rs` | `PhaseGuard::finish_failed()` for ✗ indicator |
+
 ## PatternFly v5 → v6 Reference
 
 The primary test case is PatternFly React v5.4.0 → v6.4.1. Key stats:

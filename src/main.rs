@@ -1,4 +1,5 @@
 mod cli;
+mod diagnostics;
 mod orchestrator;
 mod progress;
 
@@ -29,26 +30,34 @@ use semver_analyzer_ts::report::{count_unique_files, extract_suffix_renames};
 use semver_analyzer_ts::TypeScript;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
 
     // Initialise progress reporter + tracing subscriber
     let reporter = ProgressReporter::new();
-    init_tracing(cli.logging_args(), &reporter);
+
+    if let Err(err) = run(cli, &reporter).await {
+        diagnostics::render_error(&err);
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli, reporter: &ProgressReporter) -> Result<()> {
+    init_tracing(cli.logging_args(), reporter)?;
 
     match cli.command {
         Command::Extract { language } => match language {
-            ExtractLanguage::Typescript(args) => cmd_extract_ts(args, &reporter)?,
+            ExtractLanguage::Typescript(args) => cmd_extract_ts(args, reporter)?,
         },
 
-        Command::Diff(args) => cmd_diff(args, &reporter)?,
+        Command::Diff(args) => cmd_diff(args, reporter)?,
 
         Command::Analyze { language } => match language {
-            AnalyzeLanguage::Typescript(args) => cmd_analyze_ts(args, &reporter).await?,
+            AnalyzeLanguage::Typescript(args) => cmd_analyze_ts(args, reporter).await?,
         },
 
         Command::Konveyor { language } => match language {
-            KonveyorLanguage::Typescript(args) => cmd_konveyor_ts(args, &reporter).await?,
+            KonveyorLanguage::Typescript(args) => cmd_konveyor_ts(args, reporter).await?,
         },
 
         Command::Serve => {
@@ -61,7 +70,9 @@ async fn main() -> Result<()> {
 
 // ─── Tracing initialisation ────────────────────────────────────────────
 
-fn init_tracing(logging: &LoggingArgs, reporter: &ProgressReporter) {
+fn init_tracing(logging: &LoggingArgs, reporter: &ProgressReporter) -> Result<()> {
+    use semver_analyzer_core::error::DiagnoseExt;
+
     // Stderr: only warnings and errors reach the console.
     // All user-facing progress is handled by progress bars and
     // reporter.println() — tracing events would just bury them.
@@ -83,7 +94,11 @@ fn init_tracing(logging: &LoggingArgs, reporter: &ProgressReporter) {
         let file_filter =
             EnvFilter::try_new(&logging.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
-        let file = fs::File::create(path).expect("cannot open log file");
+        let file = fs::File::create(path)
+            .with_context(|| format!("Cannot create log file '{}'", path.display()))
+            .with_diagnosis(
+                "Check that the directory exists and you have write permissions.",
+            )?;
         let file_layer = fmt::layer()
             .with_writer(file)
             .with_ansi(false)
@@ -93,6 +108,8 @@ fn init_tracing(logging: &LoggingArgs, reporter: &ProgressReporter) {
     } else {
         registry.init();
     }
+
+    Ok(())
 }
 
 // ─── Extract command (TypeScript) ───────────────────────────────────────
@@ -111,7 +128,7 @@ fn cmd_extract_ts(args: TsExtractArgs, reporter: &ProgressReporter) -> Result<()
 
     let ts = TypeScript::new(args.build_command);
     let surface = ts
-        .extract(&common.repo, &common.git_ref)
+        .extract(&common.repo, &common.git_ref, None)
         .context("Failed to extract API surface")?;
 
     let sym_count = surface.symbols.len();
@@ -313,11 +330,11 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
                     }
                     Ok(Err(e)) => {
                         warn!(%e, "LLM suffix inference failed");
-                        suffix_phase.finish("[Suffix] Inference failed");
+                        suffix_phase.finish_failed("[Suffix] Inference failed");
                     }
                     Err(e) => {
                         warn!(%e, "spawn_blocking failed for suffix inference");
-                        suffix_phase.finish("[Suffix] Inference failed");
+                        suffix_phase.finish_failed("[Suffix] Inference failed");
                     }
                 }
             }
@@ -345,6 +362,9 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
             "breaking changes detected"
         );
     }
+
+    // Print degradation summary if any non-fatal issues were recorded
+    diagnostics::print_degradation_summary(&result.degradation, reporter);
 
     write_json_output(&report, common.output.as_deref(), reporter)?;
     Ok(())
@@ -436,6 +456,9 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
                 )
                 .await?
         };
+
+        // Print degradation summary if any non-fatal issues were recorded
+        diagnostics::print_degradation_summary(&result.degradation, reporter);
 
         <TypeScript as Language>::build_report(&result, repo, from, to)
     };

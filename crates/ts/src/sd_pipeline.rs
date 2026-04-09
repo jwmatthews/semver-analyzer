@@ -28,7 +28,7 @@ use semver_analyzer_core::types::sd::{
     ConformanceCheck, ConformanceCheckType, SdPipelineResult,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
@@ -142,6 +142,12 @@ pub fn run_sd(
     // the main (non-deprecated) version takes priority — it represents the
     // canonical v6 API surface that consumers should migrate to.
     let mut new_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
+    // Secondary map for deprecated profiles that lost name collisions.
+    // When a component name exists in both main and deprecated paths
+    // (e.g., ModalContent), the main version wins in new_profiles.
+    // The deprecated version is preserved here so deprecated families
+    // can use the correct profile for composition tree building.
+    let mut deprecated_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
     for file_info in &all_to_files {
         if let Some(source) = read_git_file(repo, to_ref, &file_info.path) {
             let profile = source_profile::extract_profile(
@@ -154,7 +160,14 @@ pub fn run_sd(
                 let existing_is_deprecated = existing.file.contains("/deprecated/");
                 // Main path wins over deprecated path
                 if existing_is_deprecated && !is_deprecated {
-                    new_profiles.insert(file_info.component_name.clone(), profile);
+                    // Preserve the deprecated profile before overwriting
+                    let evicted = new_profiles.insert(file_info.component_name.clone(), profile);
+                    if let Some(dep_prof) = evicted {
+                        deprecated_profiles.insert(file_info.component_name.clone(), dep_prof);
+                    }
+                } else if is_deprecated {
+                    // Non-deprecated already in map; stash the deprecated version
+                    deprecated_profiles.insert(file_info.component_name.clone(), profile);
                 }
                 // else: keep the existing (non-deprecated or first-seen)
             } else {
@@ -278,7 +291,12 @@ pub fn run_sd(
             .map(|f| f.component_name.clone())
             .collect();
 
-        let all_family_profiles = collect_family_profiles(&new_profiles, &all_member_names);
+        let all_family_profiles = collect_family_profiles(
+            &new_profiles,
+            &deprecated_profiles,
+            &all_member_names,
+            family_name,
+        );
 
         let mut all_members_for_tree = new_exports.clone();
         for name in &all_member_names {
@@ -366,16 +384,13 @@ pub fn run_sd(
         &HashMap<String, crate::css_profile::CssBlockProfile>,
     >|
      -> Option<(CompositionTree, Vec<String>)> {
-        let family_css_profile = info
-            .family_css_profile_key
-            .as_ref()
-            .and_then(|key| css_profiles?.get(key.as_str()));
-
         let full_tree = build_composition_tree_v2(
             &info.all_family_profiles,
             &info.all_members_for_tree,
-            family_css_profile,
+            css_profiles,
+            info.family_css_profile_key.as_deref(),
             delegate_ctxs,
+            Some(&info.new_exports),
         );
 
         full_tree.map(|mut tree| {
@@ -535,8 +550,14 @@ pub fn run_sd(
                     read_family_exports_from_dir(repo, from_ref, family_name, family_files);
                 let old_family_profiles =
                     extract_family_profiles_at_ref(repo, from_ref, &old_exports, family_files);
-                let old_tree =
-                    build_composition_tree_v2(&old_family_profiles, &old_exports, None, &[]);
+                let old_tree = build_composition_tree_v2(
+                    &old_family_profiles,
+                    &old_exports,
+                    None,
+                    None,
+                    &[],
+                    None,
+                );
 
                 let changes = diff_composition_trees(
                     family_name,
@@ -654,7 +675,8 @@ fn find_changed_component_files(
             "--",
             "*.tsx",
         ])
-        .output()?;
+        .output()
+        .context("Failed to run 'git diff' for changed component discovery")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -680,7 +702,8 @@ fn find_all_component_files(repo: &Path, git_ref: &str) -> Result<Vec<ComponentF
             "--name-only",
             git_ref,
         ])
-        .output()?;
+        .output()
+        .context("Failed to run 'git ls-tree' for component file listing")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -794,13 +817,31 @@ fn group_by_family(files: &[ComponentFile]) -> BTreeMap<String, Vec<&ComponentFi
 }
 
 /// Collect profiles from an existing profile map for a given family's exports.
+///
+/// For deprecated families (family name starts with `"deprecated/"`), prefer
+/// the deprecated profile when a component name exists in both maps. This
+/// ensures that deprecated families use their own version of shared component
+/// names (e.g., deprecated/Modal uses the deprecated ModalContent profile,
+/// not the v6 ModalContent profile).
 fn collect_family_profiles(
     all_profiles: &HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile>,
+    deprecated_profiles: &HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile>,
     family_exports: &[String],
+    family_name: &str,
 ) -> HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile> {
+    let is_deprecated_family = family_name.starts_with("deprecated/");
     family_exports
         .iter()
-        .filter_map(|name| all_profiles.get(name).map(|p| (name.clone(), p.clone())))
+        .filter_map(|name| {
+            // For deprecated families, prefer the deprecated version of a profile
+            // when it exists (handles name collisions like ModalContent).
+            if is_deprecated_family {
+                if let Some(dep_prof) = deprecated_profiles.get(name) {
+                    return Some((name.clone(), dep_prof.clone()));
+                }
+            }
+            all_profiles.get(name).map(|p| (name.clone(), p.clone()))
+        })
         .collect()
 }
 
@@ -989,123 +1030,132 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
         return;
     }
 
-    // Build adjacency: parent → [children]
-    let mut parent_to_children: HashMap<String, Vec<String>> = HashMap::new();
-    for edge in &tree.edges {
-        parent_to_children
-            .entry(edge.parent.clone())
-            .or_default()
-            .push(edge.child.clone());
-    }
-
-    // Iteratively collapse internal nodes. Each pass resolves one level
-    // of internal chain (e.g., first pass: ModalBox → ModalBody becomes
-    // ModalContent → ModalBody; second pass: ModalContent → ModalBody
-    // becomes Modal → ModalBody).
+    // Collapse one internal node at a time. Each iteration picks a node
+    // that has both incoming and outgoing edges, creates transitive edges
+    // that bypass it, then removes all edges touching that specific node.
     //
-    // We iterate until no more edges reference internal nodes.
+    // Processing one node at a time ensures that multi-level internal
+    // chains (e.g., Modal → ModalContent → ModalBox → ModalBody) are
+    // resolved correctly: collapsing ModalBox first produces
+    // ModalContent → ModalBody, then collapsing ModalContent produces
+    // Modal → ModalBody.
     //
-    // Cycle detection: track which internal nodes have already been
-    // collapsed. When creating a transitive edge, if the target child
-    // has already been collapsed in a prior iteration, skip it — the
-    // edge would re-enter a cycle among internal nodes and never reach
-    // an exported surface. This causes the loop to make no progress
-    // and break naturally.
+    // Nodes are processed leaf-first (prefer nodes whose children are
+    // all non-internal or already collapsed) to minimize iterations.
+    let mut remaining: HashSet<String> = internal_nodes.clone();
     let mut collapsed_set: HashSet<String> = HashSet::new();
     let mut iteration = 0usize;
+
     loop {
         iteration += 1;
-        let mut new_edges = Vec::new();
-        let mut made_progress = false;
 
-        if iteration.is_multiple_of(10) || iteration <= 3 {
-            tracing::debug!(
-                root = %tree.root,
-                iteration,
-                edge_count = tree.edges.len(),
-                internal_count = internal_nodes.len(),
-                "collapse_internal_nodes iteration"
-            );
-        }
-
-        if iteration > 100 {
+        if iteration > 200 {
             tracing::warn!(
                 root = %tree.root,
                 iteration,
-                edge_count = tree.edges.len(),
-                "collapse_internal_nodes: exceeded 100 iterations, breaking"
+                remaining = remaining.len(),
+                "collapse_internal_nodes: exceeded 200 iterations, breaking"
             );
             break;
         }
 
-        for internal in &internal_nodes {
-            // Find parent edges INTO this internal node
-            let parent_edges: Vec<&semver_analyzer_core::types::sd::CompositionEdge> =
-                tree.edges.iter().filter(|e| e.child == *internal).collect();
+        // Pick the next internal node to collapse. Prefer one whose
+        // outgoing edges all point to non-remaining nodes (a "leaf"
+        // in the internal subgraph). This resolves chains inside-out.
+        let next = remaining
+            .iter()
+            .find(|node| {
+                let all_children_resolved = tree
+                    .edges
+                    .iter()
+                    .filter(|e| e.parent == **node)
+                    .all(|e| !remaining.contains(&e.child) || **node == e.child);
+                let has_edges = tree
+                    .edges
+                    .iter()
+                    .any(|e| e.child == **node || e.parent == **node);
+                // Prefer leaf internals, but also pick nodes that have
+                // edges at all (skip orphan internals)
+                all_children_resolved && has_edges
+            })
+            .cloned();
 
-            // Find child edges OUT OF this internal node
-            let child_edges: Vec<&semver_analyzer_core::types::sd::CompositionEdge> = tree
-                .edges
+        // If no leaf found, try any remaining node with both parent and
+        // child edges (handles cycles)
+        let next = next.or_else(|| {
+            remaining
                 .iter()
-                .filter(|e| e.parent == *internal)
-                .collect();
+                .find(|node| {
+                    let has_parent = tree.edges.iter().any(|e| e.child == **node);
+                    let has_child = tree.edges.iter().any(|e| e.parent == **node);
+                    has_parent && has_child
+                })
+                .cloned()
+        });
 
-            if !parent_edges.is_empty() && !child_edges.is_empty() {
-                made_progress = true;
-                collapsed_set.insert(internal.clone());
-            }
-
-            for parent_edge in &parent_edges {
-                for child_edge in &child_edges {
-                    if parent_edge.parent == child_edge.child {
-                        continue;
-                    }
-                    // Skip transitive edges to already-collapsed internal
-                    // nodes — this breaks cycles among internals (e.g.,
-                    // TreeViewList → TreeViewRoot → TreeViewListItem →
-                    // TreeViewList). The target was already processed and
-                    // its edges removed; re-creating an edge to it would
-                    // just restart the cycle.
-                    if collapsed_set.contains(&child_edge.child) {
-                        continue;
-                    }
-                    // Inherit the STRONGER strength of the two edges in the chain.
-                    // Required > Allowed. If either hop is Required, the
-                    // transitive edge is Required.
-                    let strength =
-                        std::cmp::max(parent_edge.strength.clone(), child_edge.strength.clone());
-                    new_edges.push(semver_analyzer_core::types::sd::CompositionEdge {
-                        parent: parent_edge.parent.clone(),
-                        child: child_edge.child.clone(),
-                        relationship: child_edge.relationship.clone(),
-                        required: child_edge.required,
-                        bem_evidence: Some(format!(
-                            "Collapsed through internal {}: {} → {} → {}",
-                            internal, parent_edge.parent, internal, child_edge.child
-                        )),
-                        strength,
-                    });
-                }
-            }
-        }
-
-        // Remove edges that have an internal node as parent OR child
-        tree.edges
-            .retain(|e| !internal_nodes.contains(&e.parent) && !internal_nodes.contains(&e.child));
-
-        // Add transitive edges (some may still reference internals — next iteration handles)
-        tree.edges.extend(new_edges);
-
-        if !made_progress {
+        let Some(node) = next else {
+            // No collapsible node found — remaining nodes are orphans
+            // (no parent or no child edges). Remove their edges and break.
+            tree.edges
+                .retain(|e| !remaining.contains(&e.parent) && !remaining.contains(&e.child));
             break;
-        }
+        };
 
-        // Check if any edges still reference internal nodes
-        let still_has_internal = tree
+        // Collect parent and child edges for this node
+        let parent_edges: Vec<semver_analyzer_core::types::sd::CompositionEdge> = tree
             .edges
             .iter()
-            .any(|e| internal_nodes.contains(&e.parent) || internal_nodes.contains(&e.child));
-        if !still_has_internal {
+            .filter(|e| e.child == node)
+            .cloned()
+            .collect();
+        let child_edges: Vec<semver_analyzer_core::types::sd::CompositionEdge> = tree
+            .edges
+            .iter()
+            .filter(|e| e.parent == node)
+            .cloned()
+            .collect();
+
+        // Create transitive edges: for each (A → node) × (node → B),
+        // create A → B
+        let mut new_edges = Vec::new();
+        for parent_edge in &parent_edges {
+            for child_edge in &child_edges {
+                if parent_edge.parent == child_edge.child {
+                    continue;
+                }
+                // Skip transitive edges to already-collapsed internal
+                // nodes — this breaks cycles among internals.
+                if collapsed_set.contains(&child_edge.child) {
+                    continue;
+                }
+                // Inherit the STRONGER strength of the two edges.
+                let strength =
+                    std::cmp::max(parent_edge.strength.clone(), child_edge.strength.clone());
+                new_edges.push(semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: parent_edge.parent.clone(),
+                    child: child_edge.child.clone(),
+                    relationship: child_edge.relationship.clone(),
+                    required: child_edge.required,
+                    bem_evidence: Some(format!(
+                        "Collapsed through internal {}: {} → {} → {}",
+                        node, parent_edge.parent, node, child_edge.child
+                    )),
+                    strength,
+                    prop_name: child_edge.prop_name.clone(),
+                });
+            }
+        }
+
+        // Remove all edges touching this specific node
+        tree.edges.retain(|e| e.parent != node && e.child != node);
+
+        // Add transitive edges
+        tree.edges.extend(new_edges);
+
+        collapsed_set.insert(node.clone());
+        remaining.remove(&node);
+
+        if remaining.is_empty() {
             break;
         }
     }
@@ -1442,20 +1492,7 @@ fn resolve_component_package(file_path: &str) -> Option<String> {
 
 // ── Git helpers ─────────────────────────────────────────────────────────
 
-/// Read a file from a git ref.
-fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args(["show", &format!("{}:{}", git_ref, file_path)])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        None
-    }
-}
+use crate::git_utils::read_git_file;
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
@@ -1599,6 +1636,7 @@ export { DropdownList } from './DropdownList';
                     required: true,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 CompositionEdge {
                     parent: "DropdownList".to_string(),
@@ -1607,6 +1645,7 @@ export { DropdownList } from './DropdownList';
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
             ],
         };
@@ -1651,6 +1690,7 @@ export { DropdownList } from './DropdownList';
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
                 // Back-edge: Tab → Tabs (for nested tabs)
                 CompositionEdge {
@@ -1660,6 +1700,7 @@ export { DropdownList } from './DropdownList';
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
                 },
             ],
         };
@@ -1719,6 +1760,7 @@ export { DropdownList } from './DropdownList';
                 required: false,
                 bem_evidence: None,
                 strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                prop_name: None,
             }],
         };
 
@@ -1737,6 +1779,7 @@ export { DropdownList } from './DropdownList';
                     required: false,
                     bem_evidence: None,
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
                 },
                 // New internal edge (collapsed from Tab → OverflowTab → TabTitleText)
                 CompositionEdge {
@@ -1749,6 +1792,7 @@ export { DropdownList } from './DropdownList';
                             .to_string(),
                     ),
                     strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
                 },
             ],
         };
@@ -2018,5 +2062,426 @@ export { DropdownList } from './DropdownList';
             text_input_in_evolution.is_none(),
             "Evolution changes should not mention TextInput"
         );
+    }
+
+    /// Test that collapse_internal_nodes correctly handles the real Modal
+    /// family which has a 3-level internal chain:
+    ///   Modal → ModalContent → ModalBox → {ModalBody, ModalFooter, ModalHeader}
+    ///
+    /// Plus additional internal branches:
+    ///   ModalContent → ModalBoxCloseButton (leaf, no outgoing)
+    ///   ModalHeader → ModalBoxTitle (leaf, no outgoing)
+    ///   ModalHeader → ModalBoxDescription (leaf, no outgoing)
+    ///
+    /// The collapse must process one node at a time, leaf-first, to
+    /// correctly propagate the 3-level chain into Modal → ModalBody, etc.
+    #[test]
+    fn test_collapse_three_level_internal_chain() {
+        use semver_analyzer_core::types::sd::{
+            ChildRelationship, CompositionEdge, CompositionTree, EdgeStrength,
+        };
+
+        let mut tree = CompositionTree {
+            root: "Modal".into(),
+            family_members: vec![
+                // Exports (from index.ts)
+                "Modal".into(),
+                "ModalBody".into(),
+                "ModalFooter".into(),
+                "ModalHeader".into(),
+                // Internal (non-exported)
+                "ModalBox".into(),
+                "ModalBoxCloseButton".into(),
+                "ModalBoxDescription".into(),
+                "ModalBoxTitle".into(),
+                "ModalContent".into(),
+            ],
+            edges: vec![
+                // Step 1: Modal internally renders ModalContent
+                CompositionEdge {
+                    parent: "Modal".into(),
+                    child: "ModalContent".into(),
+                    relationship: ChildRelationship::Internal,
+                    required: true,
+                    bem_evidence: Some("internally rendered".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Step 1: ModalContent internally renders ModalBox
+                CompositionEdge {
+                    parent: "ModalContent".into(),
+                    child: "ModalBox".into(),
+                    relationship: ChildRelationship::Internal,
+                    required: true,
+                    bem_evidence: Some("internally rendered".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Step 1: ModalContent internally renders ModalBoxCloseButton
+                CompositionEdge {
+                    parent: "ModalContent".into(),
+                    child: "ModalBoxCloseButton".into(),
+                    relationship: ChildRelationship::Internal,
+                    required: true,
+                    bem_evidence: Some("internally rendered".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Step 1: ModalHeader internally renders ModalBoxTitle
+                CompositionEdge {
+                    parent: "ModalHeader".into(),
+                    child: "ModalBoxTitle".into(),
+                    relationship: ChildRelationship::Internal,
+                    required: true,
+                    bem_evidence: Some("internally rendered".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Step 1: ModalHeader internally renders ModalBoxDescription
+                CompositionEdge {
+                    parent: "ModalHeader".into(),
+                    child: "ModalBoxDescription".into(),
+                    relationship: ChildRelationship::Internal,
+                    required: true,
+                    bem_evidence: Some("internally rendered".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Step 8.6: ModalBox → ModalBody (secondary block fallback)
+                CompositionEdge {
+                    parent: "ModalBox".into(),
+                    child: "ModalBody".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("secondary block fallback".into()),
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+                // Step 8.6: ModalBox → ModalFooter (secondary block fallback)
+                CompositionEdge {
+                    parent: "ModalBox".into(),
+                    child: "ModalFooter".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("secondary block fallback".into()),
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+                // Step 8.6: ModalBox → ModalHeader (secondary block fallback)
+                CompositionEdge {
+                    parent: "ModalBox".into(),
+                    child: "ModalHeader".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("secondary block fallback".into()),
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        let exports: HashSet<&str> = ["Modal", "ModalBody", "ModalFooter", "ModalHeader"]
+            .iter()
+            .copied()
+            .collect();
+
+        collapse_internal_nodes(&mut tree, &exports);
+
+        // After collapse: Modal → ModalBody, Modal → ModalFooter, Modal → ModalHeader
+        let modal_to_body = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Modal" && e.child == "ModalBody");
+        let modal_to_footer = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Modal" && e.child == "ModalFooter");
+        let modal_to_header = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Modal" && e.child == "ModalHeader");
+
+        assert!(
+            modal_to_body,
+            "Expected Modal → ModalBody after collapse. Edges: {:?}",
+            tree.edges
+        );
+        assert!(
+            modal_to_footer,
+            "Expected Modal → ModalFooter after collapse. Edges: {:?}",
+            tree.edges
+        );
+        assert!(
+            modal_to_header,
+            "Expected Modal → ModalHeader after collapse. Edges: {:?}",
+            tree.edges
+        );
+
+        // Should have exactly 4 exported members
+        assert_eq!(
+            tree.family_members.len(),
+            4,
+            "Expected 4 exported members. Members: {:?}",
+            tree.family_members
+        );
+
+        // All internal nodes should be removed
+        let internal = [
+            "ModalContent",
+            "ModalBox",
+            "ModalBoxCloseButton",
+            "ModalBoxTitle",
+            "ModalBoxDescription",
+        ];
+        for name in &internal {
+            assert!(
+                !tree.family_members.contains(&name.to_string()),
+                "{} should be removed from family_members. Members: {:?}",
+                name,
+                tree.family_members
+            );
+        }
+
+        // No edges should reference any internal node
+        for name in &internal {
+            assert!(
+                !tree
+                    .edges
+                    .iter()
+                    .any(|e| e.parent == *name || e.child == *name),
+                "No edges should reference internal node {}. Edges: {:?}",
+                name,
+                tree.edges
+            );
+        }
+    }
+
+    /// Integration test for the Modal family using real PatternFly source
+    /// files and CSS. Exercises the full pipeline:
+    ///   1. Extract source profiles from real .tsx files
+    ///   2. Parse real CSS profile from modal-box.css
+    ///   3. Build composition tree (Steps 1-10 including Step 8.6)
+    ///   4. Run collapse_internal_nodes
+    ///   5. Verify final tree has Modal → ModalBody, ModalFooter, ModalHeader
+    ///
+    /// This test requires the PatternFly repos at /tmp/semver-pipeline-v2/.
+    #[test]
+    #[ignore] // Requires /tmp/semver-pipeline-v2/repos/
+    fn test_modal_family_integration_real_files() {
+        use crate::composition::build_composition_tree_v2;
+        use crate::css_profile::parse_css_for_test;
+        use crate::source_profile;
+
+        let modal_dir = "/tmp/semver-pipeline-v2/repos/patternfly-react/packages/react-core/src/components/Modal";
+        let css_file =
+            "/tmp/semver-pipeline-v2/repos/patternfly/dist/components/ModalBox/modal-box.css";
+
+        // ── 1. Read all source files and extract profiles ──────────
+        let component_files = [
+            ("Modal", "Modal.tsx"),
+            ("ModalBody", "ModalBody.tsx"),
+            ("ModalBox", "ModalBox.tsx"),
+            ("ModalBoxCloseButton", "ModalBoxCloseButton.tsx"),
+            ("ModalBoxDescription", "ModalBoxDescription.tsx"),
+            ("ModalBoxTitle", "ModalBoxTitle.tsx"),
+            ("ModalContent", "ModalContent.tsx"),
+            ("ModalFooter", "ModalFooter.tsx"),
+            ("ModalHeader", "ModalHeader.tsx"),
+        ];
+
+        let mut profiles = HashMap::new();
+        for (name, file) in &component_files {
+            let path = format!("{}/{}", modal_dir, file);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {}", path, e));
+            let profile = source_profile::extract_profile(name, file, &source);
+            eprintln!(
+                "Profile {}: bem_block={:?}, rendered={:?}, css_tokens={:?}, has_children={}",
+                name,
+                profile.bem_block,
+                profile.rendered_components,
+                profile.css_tokens_used,
+                profile.has_children_prop,
+            );
+            profiles.insert(name.to_string(), profile);
+        }
+
+        // ── 2. Parse CSS profile ───────────────────────────────────
+        let css_source = std::fs::read_to_string(css_file)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {}", css_file, e));
+        let modal_box_css =
+            parse_css_for_test(&css_source, "ModalBox").expect("Failed to parse modal-box.css");
+        eprintln!(
+            "CSS profile: block={}, elements={:?}",
+            modal_box_css.block,
+            modal_box_css.elements.keys().collect::<Vec<_>>()
+        );
+
+        let css_profiles = HashMap::from([(modal_box_css.block.clone(), modal_box_css)]);
+
+        // ── 3. Build family_exports (exports first, then internals) ─
+        // Barrel file exports: Modal, ModalBody, ModalHeader, ModalFooter
+        let exports = vec![
+            "Modal".to_string(),
+            "ModalBody".to_string(),
+            "ModalHeader".to_string(),
+            "ModalFooter".to_string(),
+        ];
+        let mut all_members = exports.clone();
+        for (name, _) in &component_files {
+            if !all_members.contains(&name.to_string()) {
+                all_members.push(name.to_string());
+            }
+        }
+
+        eprintln!("all_members: {:?}", all_members);
+
+        // ── 4. Determine primary CSS block key ─────────────────────
+        // Root (Modal) has bem_block = "backdrop", which is NOT in
+        // css_profiles. Fallback to dominant block = "modalBox".
+        let root_block = profiles.get("Modal").and_then(|p| p.bem_block.as_deref());
+        let primary_key = if root_block.is_some_and(|b| css_profiles.contains_key(b)) {
+            root_block.map(|s| s.to_string())
+        } else {
+            // Dominant block by vote
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for p in profiles.values() {
+                if let Some(ref b) = p.bem_block {
+                    *counts.entry(b.as_str()).or_default() += 1;
+                }
+            }
+            counts
+                .into_iter()
+                .filter(|(b, _)| css_profiles.contains_key(*b))
+                .max_by_key(|(_, c)| *c)
+                .map(|(b, _)| b.to_string())
+        };
+
+        eprintln!("primary_css_block: {:?}", primary_key);
+
+        // ── 5. Build composition tree ──────────────────────────────
+        let tree = build_composition_tree_v2(
+            &profiles,
+            &all_members,
+            Some(&css_profiles),
+            primary_key.as_deref(),
+            &[],
+            Some(&exports),
+        )
+        .expect("Tree should be built");
+
+        eprintln!("Pre-collapse members: {:?}", tree.family_members);
+        eprintln!("Pre-collapse edges:");
+        for e in &tree.edges {
+            eprintln!(
+                "  {} -> {} ({:?} / {:?}) {}",
+                e.parent,
+                e.child,
+                e.relationship,
+                e.strength,
+                e.bem_evidence.as_deref().unwrap_or("")
+            );
+        }
+
+        // Verify Step 8.6 created edges from ModalBox to the sub-block orphans
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "ModalBox" && e.child == "ModalBody"),
+            "Pre-collapse: expected ModalBox → ModalBody. Edges: {:?}",
+            tree.edges
+        );
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "ModalBox" && e.child == "ModalFooter"),
+            "Pre-collapse: expected ModalBox → ModalFooter. Edges: {:?}",
+            tree.edges
+        );
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "ModalBox" && e.child == "ModalHeader"),
+            "Pre-collapse: expected ModalBox → ModalHeader. Edges: {:?}",
+            tree.edges
+        );
+
+        // ── 6. Run collapse ────────────────────────────────────────
+        let mut tree = tree;
+        let exports_set: HashSet<&str> = exports.iter().map(|s| s.as_str()).collect();
+        collapse_internal_nodes(&mut tree, &exports_set);
+        tree.root = "Modal".to_string();
+
+        eprintln!("\nPost-collapse members: {:?}", tree.family_members);
+        eprintln!("Post-collapse edges:");
+        for e in &tree.edges {
+            eprintln!(
+                "  {} -> {} ({:?} / {:?}) {}",
+                e.parent,
+                e.child,
+                e.relationship,
+                e.strength,
+                e.bem_evidence.as_deref().unwrap_or("")
+            );
+        }
+
+        // ── 7. Verify final tree ───────────────────────────────────
+        // Must have exactly 4 exported members
+        assert_eq!(
+            tree.family_members.len(),
+            4,
+            "Expected 4 members after collapse. Members: {:?}",
+            tree.family_members
+        );
+
+        // Must have edges Modal → ModalBody, ModalFooter, ModalHeader
+        let modal_to_body = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Modal" && e.child == "ModalBody");
+        let modal_to_footer = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Modal" && e.child == "ModalFooter");
+        let modal_to_header = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Modal" && e.child == "ModalHeader");
+
+        assert!(
+            modal_to_body,
+            "Expected Modal → ModalBody after collapse. Edges: {:?}",
+            tree.edges
+        );
+        assert!(
+            modal_to_footer,
+            "Expected Modal → ModalFooter after collapse. Edges: {:?}",
+            tree.edges
+        );
+        assert!(
+            modal_to_header,
+            "Expected Modal → ModalHeader after collapse. Edges: {:?}",
+            tree.edges
+        );
+
+        // No edges should reference internal nodes
+        let internals = [
+            "ModalContent",
+            "ModalBox",
+            "ModalBoxCloseButton",
+            "ModalBoxTitle",
+            "ModalBoxDescription",
+        ];
+        for name in &internals {
+            assert!(
+                !tree
+                    .edges
+                    .iter()
+                    .any(|e| e.parent == *name || e.child == *name),
+                "No edges should reference internal node {}. Edges: {:?}",
+                name,
+                tree.edges
+            );
+        }
     }
 }

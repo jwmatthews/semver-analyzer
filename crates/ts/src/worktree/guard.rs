@@ -6,6 +6,7 @@
 use super::error::WorktreeError;
 use super::package_manager::PackageManager;
 use super::tsc;
+use super::ExtractionWarning;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -28,6 +29,10 @@ pub struct WorktreeGuard {
 
     /// Whether the worktree was successfully created (controls cleanup).
     created: bool,
+
+    /// Non-fatal issues encountered during setup (partial tsc, fallbacks).
+    /// Inspected by the caller to record degradation.
+    warnings: Vec<ExtractionWarning>,
 }
 
 impl WorktreeGuard {
@@ -77,6 +82,7 @@ impl WorktreeGuard {
             worktree_path: worktree_path.clone(),
             git_ref: git_ref.to_string(),
             created: false,
+            warnings: Vec::new(),
         };
 
         // Ensure parent directory exists
@@ -124,6 +130,13 @@ impl WorktreeGuard {
                     Err(e) => {
                         // Project build also failed — proceed with partial tsc output
                         tracing::warn!(error = %e, succeeded = succeeded, "Project build fallback failed, proceeding with partial tsc output");
+                        guard
+                            .warnings
+                            .push(ExtractionWarning::PartialTscBuildFailed {
+                                succeeded,
+                                failed,
+                                build_error: e.to_string(),
+                            });
                     }
                 }
             }
@@ -132,10 +145,15 @@ impl WorktreeGuard {
                 tracing::warn!(error = %e, "tsc failed completely, trying project build as fallback");
                 match tsc::run_project_build(&worktree_path, None) {
                     Ok(()) => {
-                        // Project build succeeded
+                        // Project build succeeded as fallback
+                        guard
+                            .warnings
+                            .push(ExtractionWarning::TscFailedBuildSucceeded {
+                                tsc_error: e.to_string(),
+                            });
                     }
                     Err(build_err) => {
-                        // Both tsc and project build failed
+                        // Both tsc and project build failed — fatal
                         tracing::warn!(error = %build_err, "Project build also failed");
                         return Err(e);
                     }
@@ -170,6 +188,7 @@ impl WorktreeGuard {
             worktree_path: worktree_path.clone(),
             git_ref: git_ref.to_string(),
             created: false,
+            warnings: Vec::new(),
         };
 
         let parent = worktree_path
@@ -181,6 +200,14 @@ impl WorktreeGuard {
         guard.created = true;
 
         Ok(guard)
+    }
+
+    /// Non-fatal issues encountered during worktree setup.
+    ///
+    /// The caller should inspect these after a successful `new()` and
+    /// record them on the `DegradationTracker` for the end-of-run summary.
+    pub fn warnings(&self) -> &[ExtractionWarning] {
+        &self.warnings
     }
 
     /// Path to the worktree directory.

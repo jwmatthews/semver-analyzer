@@ -51,6 +51,7 @@ impl ProgressReporter {
             pb,
             start: Instant::now(),
             finish_message: None,
+            failed: false,
         }
     }
 
@@ -92,15 +93,19 @@ impl ProgressReporter {
 ///
 /// While alive the spinner animates. Call [`finish`](PhaseGuard::finish)
 /// with a completion message, or let it drop to auto-finish.
+///
+/// Use [`finish_failed`](PhaseGuard::finish_failed) to show a failure
+/// indicator (✗) instead of the default success indicator (✓).
 pub struct PhaseGuard {
     pb: ProgressBar,
     start: Instant,
     finish_message: Option<String>,
+    failed: bool,
 }
 
 impl PhaseGuard {
     /// Finish the spinner with a custom completion message.
-    /// The elapsed time is appended automatically.
+    /// The elapsed time is appended automatically. Shows ✓.
     pub fn finish(mut self, message: &str) {
         self.finish_message = Some(message.to_string());
         // Drop will handle the actual finish
@@ -112,6 +117,16 @@ impl PhaseGuard {
         self.finish_message = Some(format!("{} ({})", message, detail));
     }
 
+    /// Finish the spinner with a failure indicator (✗).
+    ///
+    /// Use this for phases that failed but were non-fatal (the pipeline
+    /// continues with degraded results). Fatal errors don't need this
+    /// because the process exits via `render_error()`.
+    pub fn finish_failed(mut self, message: &str) {
+        self.failed = true;
+        self.finish_message = Some(message.to_string());
+    }
+
     fn do_finish(&self) {
         let elapsed = self.start.elapsed();
         let elapsed_str = format_duration(elapsed);
@@ -120,8 +135,10 @@ impl PhaseGuard {
 
         let default_msg = self.pb.message();
         let msg = self.finish_message.as_deref().unwrap_or(&default_msg);
+
+        let icon = if self.failed { "✗" } else { "✓" };
         self.pb
-            .finish_with_message(format!("✓ {} ({})", msg, elapsed_str));
+            .finish_with_message(format!("{} {} ({})", icon, msg, elapsed_str));
     }
 }
 

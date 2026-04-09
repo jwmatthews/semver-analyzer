@@ -205,11 +205,43 @@ impl OxcExtractor {
         repo: &Path,
         git_ref: &str,
         build_command: Option<&str>,
+        degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
     ) -> Result<ApiSurface> {
-        use crate::worktree::WorktreeGuard;
+        use crate::worktree::{ExtractionWarning, WorktreeGuard};
+        use semver_analyzer_core::error::DiagnoseWithTip;
 
         // Create worktree, install deps, run tsc --declaration (with fallback)
-        let guard = WorktreeGuard::new(repo, git_ref, build_command)?;
+        let guard = WorktreeGuard::new(repo, git_ref, build_command).diagnose()?;
+
+        // Record any extraction warnings as degradation
+        if let Some(tracker) = degradation {
+            for warning in guard.warnings() {
+                match warning {
+                    ExtractionWarning::PartialTscBuildFailed {
+                        succeeded, failed, ..
+                    } => {
+                        tracker.record(
+                            "TD",
+                            format!(
+                                "tsc partially succeeded ({} packages ok, {} failed) \
+                                 and project build also failed at ref {}",
+                                succeeded, failed, git_ref
+                            ),
+                            "API surface may be incomplete — some package \
+                             declarations could not be generated",
+                        );
+                    }
+                    ExtractionWarning::TscFailedBuildSucceeded { .. } => {
+                        tracker.record(
+                            "TD",
+                            format!("tsc failed at ref {}, fell back to project build", git_ref),
+                            "API surface was extracted via project build — \
+                             coverage should be complete",
+                        );
+                    }
+                }
+            }
+        }
 
         // Extract from the generated .d.ts files
         self.extract_from_dir(guard.path())

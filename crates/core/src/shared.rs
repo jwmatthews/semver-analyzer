@@ -21,6 +21,7 @@
 //!    b. Broadcast qualified_name          c. If not found: analyze
 //! ```
 
+use crate::diagnostics::DegradationTracker;
 use crate::traits::Language;
 use crate::types::{ApiSurface, BehavioralBreak, StructuralChange};
 use dashmap::DashMap;
@@ -66,6 +67,10 @@ pub struct SharedFindings<L: Language> {
 
     /// API surface from the NEW ref (set by TD after extraction).
     new_surface: tokio::sync::OnceCell<Arc<ApiSurface>>,
+
+    /// Non-fatal issues that degraded analysis quality.
+    /// Accessible to all pipeline phases via `degradation()`.
+    degradation: Arc<DegradationTracker>,
 }
 
 impl<L: Language> SharedFindings<L> {
@@ -78,6 +83,7 @@ impl<L: Language> SharedFindings<L> {
             td_broadcast_tx: tx,
             old_surface: tokio::sync::OnceCell::new(),
             new_surface: tokio::sync::OnceCell::new(),
+            degradation: Arc::new(DegradationTracker::new()),
         }
     }
 
@@ -177,6 +183,24 @@ impl<L: Language> SharedFindings<L> {
     pub fn try_get_new_surface(&self) -> Option<&Arc<ApiSurface>> {
         self.new_surface.get()
     }
+
+    // ── Degradation tracking ────────────────────────────────────────
+
+    /// Access the degradation tracker to record or query non-fatal issues.
+    ///
+    /// Available to all pipeline phases and Language implementations.
+    pub fn degradation(&self) -> &DegradationTracker {
+        &self.degradation
+    }
+
+    /// Get a clone of the Arc-wrapped degradation tracker.
+    ///
+    /// Useful when you need to pass the tracker to a spawned task.
+    pub fn degradation_arc(&self) -> Arc<DegradationTracker> {
+        self.degradation.clone()
+    }
+
+    // ── Read operations (post-analysis merge) ───────────────────────
 
     /// Count of structural breaks found so far.
     pub fn structural_break_count(&self) -> usize {

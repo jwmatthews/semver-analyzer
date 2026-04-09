@@ -239,9 +239,14 @@ impl Language for TypeScript {
     const MANIFEST_FILES: &'static [&'static str] = &["package.json"];
     const SOURCE_FILE_PATTERNS: &'static [&'static str] = &["*.ts", "*.tsx"];
 
-    fn extract(&self, repo: &Path, git_ref: &str) -> Result<ApiSurface> {
+    fn extract(
+        &self,
+        repo: &Path,
+        git_ref: &str,
+        degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
+    ) -> Result<ApiSurface> {
         let extractor = crate::extract::OxcExtractor::new();
-        extractor.extract_at_ref(repo, git_ref, self.build_command.as_deref())
+        extractor.extract_at_ref(repo, git_ref, self.build_command.as_deref(), degradation)
     }
 
     fn parse_changed_functions(
@@ -745,20 +750,7 @@ fn extract_family_from_path(path: &str) -> Option<String> {
     None
 }
 
-/// Read a file from a git ref.
-fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["show", &format!("{}:{}", git_ref, file_path)])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        None
-    }
-}
+use crate::git_utils::read_git_file;
 
 // ── Extracted helper functions ──────────────────────────────────────────
 

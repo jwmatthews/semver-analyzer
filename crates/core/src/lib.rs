@@ -7,7 +7,9 @@
 //! - The structural diff engine (`diff_surfaces_with_semantics`)
 
 pub mod cli;
+pub mod diagnostics;
 pub mod diff;
+pub mod error;
 pub mod shared;
 pub mod traits;
 pub mod types;
@@ -67,7 +69,12 @@ pub(crate) mod test_support {
         const MANIFEST_FILES: &'static [&'static str] = &[];
         const SOURCE_FILE_PATTERNS: &'static [&'static str] = &[];
 
-        fn extract(&self, _repo: &Path, _git_ref: &str) -> anyhow::Result<ApiSurface> {
+        fn extract(
+            &self,
+            _repo: &Path,
+            _git_ref: &str,
+            _degradation: Option<&crate::diagnostics::DegradationTracker>,
+        ) -> anyhow::Result<ApiSurface> {
             Ok(ApiSurface::default())
         }
         fn parse_changed_functions(

@@ -12,6 +12,7 @@ pub mod cli;
 pub mod css_scan;
 pub mod diff_parser;
 pub mod extract;
+pub mod git_utils;
 pub mod jsx_diff;
 pub mod konveyor;
 pub mod language;
@@ -30,4 +31,4 @@ pub mod source_profile;
 // Re-export key types for convenience
 pub use extract::OxcExtractor;
 pub use language::{TsCategory, TsEvidence, TsManifestChangeType, TsReportData, TypeScript};
-pub use worktree::WorktreeGuard;
+pub use worktree::{ExtractionWarning, WorktreeGuard};

@@ -195,6 +195,7 @@ mod tests {
             &self,
             _repo: &Path,
             _git_ref: &str,
+            _degradation: Option<&crate::diagnostics::DegradationTracker>,
         ) -> anyhow::Result<crate::types::ApiSurface> {
             Ok(crate::types::ApiSurface::default())
         }

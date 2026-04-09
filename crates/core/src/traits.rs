@@ -811,7 +811,16 @@ pub trait Language: LanguageSemantics + MessageFormatter + Send + Sync + 'static
     /// The implementation is responsible for checking out the ref,
     /// running any required build steps, parsing the output, and
     /// cleaning up temporary files.
-    fn extract(&self, repo: &Path, git_ref: &str) -> Result<ApiSurface>;
+    ///
+    /// An optional `DegradationTracker` can be provided to record non-fatal
+    /// extraction issues (e.g., partial tsc success). These appear in the
+    /// end-of-run summary.
+    fn extract(
+        &self,
+        repo: &Path,
+        git_ref: &str,
+        degradation: Option<&crate::diagnostics::DegradationTracker>,
+    ) -> Result<ApiSurface>;
 
     /// Parse the diff between two git refs and identify all functions
     /// whose bodies changed (public AND private).

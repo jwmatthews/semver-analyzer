@@ -306,6 +306,7 @@ impl<L: Language> Analyzer<L> {
             hierarchy_deltas,
             new_hierarchies,
             sd_result: None,
+            degradation: shared.degradation_arc(),
         })
     }
     /// Run the v2 concurrent TD+SD analysis pipeline.
@@ -354,6 +355,7 @@ impl<L: Language> Analyzer<L> {
         let dep_to_sd = dep_to.map(|s| s.to_string());
         let dep_build_cmd_sd = dep_build_command.map(|s| s.to_string());
         let progress_sd = progress.clone();
+        let shared_sd = shared.clone();
 
         // ── Owned clones for rename inference ────────────────────────
         // Note: hierarchy inference is skipped in v2 — the SD pipeline
@@ -371,6 +373,8 @@ impl<L: Language> Analyzer<L> {
         let (td_inference_result, sd_result) = tokio::join!(
             // TD branch: structural diff → rename inference → hierarchy inference
             async move {
+                // Clone shared for use after spawn_blocking
+                let shared_td_outer = shared_td.clone();
                 // TD: blocking (extract surfaces, structural diff)
                 let td = tokio::task::spawn_blocking(move || {
                     Self::run_td(
@@ -425,7 +429,15 @@ impl<L: Language> Analyzer<L> {
                         result
                     })
                     .await
-                    .unwrap_or(None)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(%e, "Rename inference task panicked");
+                        shared_td_outer.degradation().record(
+                            "LLM",
+                            "Rename inference task panicked",
+                            "Inferred rename patterns may be incomplete",
+                        );
+                        None
+                    })
                 } else {
                     None
                 };
@@ -444,6 +456,8 @@ impl<L: Language> Analyzer<L> {
             // SD branch: source-level analysis (independent of TD)
             async move {
                 let sd_phase = progress_sd.start_phase("[SD] Source-level analysis ...");
+                // Clone shared for use after spawn_blocking
+                let shared_sd_outer = shared_sd.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     // If a dep CSS repo is provided with a ref and build command,
                     // create a worktree, build it, and use the built path for CSS
@@ -481,9 +495,19 @@ impl<L: Language> Analyzer<L> {
                                                 stderr = %tail,
                                                 "Dep repo build failed"
                                             );
+                                            shared_sd.degradation().record(
+                                                "CSS",
+                                                format!("Dep repo build command failed (exit {})", output.status.code().unwrap_or(-1)),
+                                                "CSS class removal detection may be incomplete",
+                                            );
                                         }
                                         Err(e) => {
                                             tracing::warn!(%e, "Failed to run dep repo build command");
+                                            shared_sd.degradation().record(
+                                                "CSS",
+                                                format!("Failed to run dep repo build command: {}", e),
+                                                "CSS class removal detection may be incomplete",
+                                            );
                                         }
                                     }
                                 }
@@ -497,6 +521,11 @@ impl<L: Language> Analyzer<L> {
                             }
                             Err(e) => {
                                 tracing::warn!(%e, "Failed to create dep repo worktree, using raw dir");
+                                shared_sd.degradation().record(
+                                    "CSS",
+                                    format!("Dep repo worktree creation failed: {}", e),
+                                    "CSS profiles unavailable — some CSS-based rules may be missing",
+                                );
                                 None
                             }
                         }
@@ -552,7 +581,12 @@ impl<L: Language> Analyzer<L> {
                     }
                     Err(e) => {
                         warn!(%e, "SD pipeline failed");
-                        sd_phase.finish("[SD] Source-level analysis failed");
+                        shared_sd_outer.degradation().record(
+                            "SD",
+                            format!("Source-level analysis failed: {}", e),
+                            "Composition trees and conformance rules are unavailable",
+                        );
+                        sd_phase.finish_failed("[SD] Source-level analysis failed");
                     }
                 }
 
@@ -574,6 +608,11 @@ impl<L: Language> Analyzer<L> {
             Ok(sd) => sd,
             Err(e) => {
                 warn!(%e, "SD pipeline failed, continuing with empty results");
+                shared.degradation().record(
+                    "SD",
+                    format!("Source-level analysis failed: {}", e),
+                    "Composition trees and conformance rules are unavailable",
+                );
                 semver_analyzer_core::SdPipelineResult::default()
             }
         };
@@ -695,6 +734,7 @@ impl<L: Language> Analyzer<L> {
             hierarchy_deltas,
             new_hierarchies,
             sd_result: Some(sd),
+            degradation: shared.degradation_arc(),
         })
     }
 } // end impl Analyzer<L> (public API)
@@ -773,7 +813,7 @@ impl<L: Language> Analyzer<L> {
         let old_surface =
             {
                 let _extract_span = info_span!("extract_surface", git_ref = %from_ref).entered();
-                Arc::new(lang.extract(repo, from_ref).with_context(|| {
+                Arc::new(lang.extract(repo, from_ref, Some(shared.degradation())).with_context(|| {
                     format!("Failed to extract API surface at ref {}", from_ref)
                 })?)
             };
@@ -792,7 +832,7 @@ impl<L: Language> Analyzer<L> {
         let new_surface = {
             let _extract_span = info_span!("extract_surface", git_ref = %to_ref).entered();
             Arc::new(
-                lang.extract(repo, to_ref)
+                lang.extract(repo, to_ref, Some(shared.degradation()))
                     .with_context(|| format!("Failed to extract API surface at ref {}", to_ref))?,
             )
         };
@@ -1532,6 +1572,7 @@ impl<L: Language> Analyzer<L> {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let llm_calls = Arc::new(AtomicUsize::new(0));
         let llm_breaks = Arc::new(AtomicUsize::new(0));
+        let llm_failures = Arc::new(AtomicUsize::new(0));
         let composition_entries: Arc<Mutex<Vec<(String, Vec<ContainerChange>)>>> =
             Arc::new(Mutex::new(Vec::new()));
 
@@ -1546,6 +1587,7 @@ impl<L: Language> Analyzer<L> {
             let api_entries = llm_api_entries.clone();
             let calls = llm_calls.clone();
             let breaks = llm_breaks.clone();
+            let failures = llm_failures.clone();
             let comp_entries = composition_entries.clone();
             let cmd = cmd.clone();
             let file_path = task.file_path.clone();
@@ -1665,9 +1707,11 @@ impl<L: Language> Analyzer<L> {
                     }
                     Ok(Err(e)) => {
                         error!(file = %file_path, %e, "LLM analysis failed after retry");
+                        failures.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
                         error!(%e, "LLM analysis panicked");
+                        failures.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             });
@@ -1681,6 +1725,16 @@ impl<L: Language> Analyzer<L> {
             bar.inc();
         }
         bar.finish();
+
+        // Record LLM failure summary as degradation if any failed
+        let failure_count = llm_failures.load(Ordering::Relaxed);
+        if failure_count > 0 {
+            shared.degradation().record(
+                "LLM",
+                format!("{} of {} file analyses failed", failure_count, total),
+                "Some behavioral changes may be missing from the report",
+            );
+        }
 
         let comp_results = match Arc::try_unwrap(composition_entries) {
             Ok(mutex) => mutex.into_inner().unwrap_or_default(),
@@ -1815,27 +1869,7 @@ impl<L: Language> Analyzer<L> {
 } // end impl Analyzer<L> (private methods, part 1)
 
 fn git_diff_file(repo: &Path, from_ref: &str, to_ref: &str, file_path: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            &repo.to_string_lossy(),
-            "diff",
-            &format!("{}..{}", from_ref, to_ref),
-            "--",
-            file_path,
-        ])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let content = String::from_utf8_lossy(&output.stdout).to_string();
-        if content.is_empty() {
-            None
-        } else {
-            Some(content)
-        }
-    } else {
-        None
-    }
+    semver_analyzer_ts::git_utils::git_diff_file(repo, from_ref, to_ref, file_path)
 }
 
 fn fetch_test_diff<L: Language>(
@@ -1857,17 +1891,7 @@ fn fetch_test_diff<L: Language>(
 }
 
 fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args(["show", &format!("{}:{}", git_ref, file_path)])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        None
-    }
+    semver_analyzer_ts::git_utils::read_git_file(repo, git_ref, file_path)
 }
 
 // ── Component Hierarchy Inference ────────────────────────────────────────

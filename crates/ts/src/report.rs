@@ -2266,6 +2266,7 @@ mod tests {
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
             sd_result: None,
+            degradation: Arc::new(semver_analyzer_core::diagnostics::DegradationTracker::new()),
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v1.0.0", "v2.0.0");
         assert_eq!(report.summary.total_breaking_changes, 0);
@@ -2328,6 +2329,7 @@ mod tests {
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
             sd_result: None,
+            degradation: Arc::new(semver_analyzer_core::diagnostics::DegradationTracker::new()),
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v1", "v2");
         assert_eq!(report.summary.breaking_api_changes, 1);
@@ -2364,6 +2366,7 @@ mod tests {
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
             sd_result: None,
+            degradation: Arc::new(semver_analyzer_core::diagnostics::DegradationTracker::new()),
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v1", "v2");
         assert_eq!(report.summary.breaking_api_changes, 0);
@@ -2448,6 +2451,7 @@ mod tests {
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
             sd_result: None,
+            degradation: Arc::new(semver_analyzer_core::diagnostics::DegradationTracker::new()),
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v5", "v6");
 
@@ -2563,6 +2567,7 @@ mod tests {
             hierarchy_deltas: vec![],
             new_hierarchies: HashMap::new(),
             sd_result: None,
+            degradation: Arc::new(semver_analyzer_core::diagnostics::DegradationTracker::new()),
         };
         let report = build_report(&results, Path::new("/tmp/repo"), "v5", "v6");
 

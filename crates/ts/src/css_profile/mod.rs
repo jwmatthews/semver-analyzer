@@ -14,7 +14,7 @@
 //! 3. **Descendant selectors**: Nesting relationships between BEM elements
 //!    (e.g., `.menu__breadcrumb .menu__content` → content inside breadcrumb)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use lightningcss::properties::display::{Display, DisplayKeyword};
 use lightningcss::properties::Property;
 use lightningcss::rules::CssRule;
@@ -253,10 +253,16 @@ fn find_component_css_files(repo: &Path, git_ref: &str) -> Result<Vec<(String, S
             "--name-only",
             git_ref,
         ])
-        .output()?;
+        .output()
+        .context("Failed to run 'git ls-tree' for CSS file discovery")?;
 
     if !output.status.success() {
-        anyhow::bail!("git ls-tree failed");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "git ls-tree failed for CSS file discovery at ref {}: {}",
+            git_ref,
+            stderr
+        );
     }
 
     // Collect ALL CSS files per component directory — each one may contribute
@@ -936,20 +942,7 @@ fn kebab_to_camel(s: &str) -> String {
     result
 }
 
-/// Read a file from a git ref.
-fn read_git_file(repo: &Path, git_ref: &str, file_path: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args(["show", &format!("{}:{}", git_ref, file_path)])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        None
-    }
-}
+use crate::git_utils::read_git_file;
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
