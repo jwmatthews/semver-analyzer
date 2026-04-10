@@ -588,7 +588,7 @@ two constraint dimensions (CHP = child-must-have-parent, PMC =
 parent-must-have-child), verified against upstream PF6 documentation at
 v6.4.1. This is the definitive reference for conformance rule correctness.
 
-**Category A: Both Required (CHP=YES, PMC=YES) — 37 edges**
+**Category A: Both Required (CHP=YES, PMC=YES) — 38 edges**
 
 Both `notParent` and `requiresChild` rules are valid for these edges.
 
@@ -611,6 +611,7 @@ Both `notParent` and `requiresChild` rules are valid for these edges.
 | Masthead | Masthead | MastheadContent | CSS grid; docs explicitly required |
 | Masthead | Masthead | MastheadMain | CSS grid; docs explicitly required |
 | MultipleFileUpload | MultipleFileUploadStatus | MultipleFileUploadStatusItem | CSS + status list purpose |
+| List | List | ListItem | DOM `<li>` in `<ul>` + list purpose; `children` optional but empty list is not meaningful |
 | Nav | NavList | NavItem | DOM `<li>` in `<ul>` + list purpose |
 | Nav | NavGroup | NavItem | Context + group purpose |
 | NotificationDrawer | NotificationDrawerList | NotificationDrawerListItem | CSS + list purpose |
@@ -632,7 +633,7 @@ Both `notParent` and `requiresChild` rules are valid for these edges.
 | deprecated/DualListSelector | DualListSelectorPane | DualListSelectorControl | Same as v6 |
 | deprecated/Wizard | WizardNav | WizardNavItem | Same as v6 |
 
-**Category B: CHP-only (CHP=YES, PMC=NO) — 37 edges**
+**Category B: CHP-only (CHP=YES, PMC=NO) — 36 edges**
 
 Only `notParent` is valid. `requiresChild` is **wrong** for these edges.
 The child must be inside the parent IF used, but the parent does NOT
@@ -660,7 +661,6 @@ require the child.
 | DescriptionList | DescriptionList | DescriptionListTermHelpText | CSS `>` | SPURIOUS: should only be inside DLGroup |
 | DualListSelector | DualListSelectorPane | DualListSelectorTree | CSS | Tree is alternative to List |
 | FormSelect | FormSelect | FormSelectOptionGroup | DOM `<optgroup>` | Grouping optional; options go directly in FormSelect |
-| List | List | ListItem | DOM `<li>` in `<ul>` | Empty list is valid HTML |
 | Menu | MenuItem | MenuItemAction | Prop-passed (`actions`) | Actions are optional on MenuItem |
 | Modal | Modal | ModalBody | Step 8.6 (cross-block BEM) | PF docs: "ModalBody...are not required" |
 | Modal | Modal | ModalHeader | Step 8.6 (cross-block BEM) | PF docs: "ModalHeader...are not required" |
@@ -703,8 +703,8 @@ should be generated.
 
 | Category | Count | % | Current Status |
 |----------|-------|---|----------------|
-| A: Both Required (correct) | 37 | 46% | Correct — both rules valid |
-| B: CHP-only (needs split) | 37 | 46% | Wrong for root parents — false `requiresChild` |
+| A: Both Required (correct) | 38 | 48% | Correct — both rules valid |
+| B: CHP-only (needs split) | 36 | 45% | Wrong for root parents — false `requiresChild` |
 | C: PMC-only (needs split) | 1 | 1% | Wrong — false `notParent` |
 | D: Both Allowed (wrong strength) | 5 | 6% | Wrong — should not be Required |
 | **Total** | **80** | | **43 edges (54%) need correction** |

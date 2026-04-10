@@ -1641,10 +1641,10 @@ fn html_expected_children(parent_tag: &str) -> Vec<&'static str> {
 /// Pure containers produce Required (both directions) DOM nesting edges.
 /// Non-pure containers produce Structural (child→parent only) edges.
 fn is_pure_container_tag(tag: &str) -> bool {
-    // Only tags that are truly meaningless without children.
-    // Excluded: ul/ol (empty list is valid HTML), select (empty is valid),
-    // optgroup (option can exist directly in select without optgroup).
-    matches!(tag, "tbody" | "thead" | "tfoot" | "tr" | "dl")
+    // Tags whose only purpose is to hold specific children.
+    // Excluded: select (empty is valid), optgroup (option can exist
+    // directly in select without optgroup).
+    matches!(tag, "ul" | "ol" | "tbody" | "thead" | "tfoot" | "tr" | "dl")
 }
 
 /// Infer the root HTML element from a component's rendered_elements
