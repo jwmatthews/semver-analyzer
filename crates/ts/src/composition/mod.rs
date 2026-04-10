@@ -1053,6 +1053,14 @@ pub fn build_composition_tree_v2(
         }
     }
 
+    // ── Step 8.8: Downgrade bidirectional CHP cycles ──────────────
+    // When A→B and B→A both have CHP=YES (Required or Structural),
+    // this represents recursive nesting (e.g., WizardNavItem contains
+    // a nested WizardNav for sub-navigation). The weaker direction
+    // (lower EdgeStrength ordinal) is downgraded to Allowed — recursive
+    // nesting is optional, not a structural constraint.
+    downgrade_bidirectional_chp_cycles(&mut tree);
+
     // ── Step 9: Dedup ──────────────────────────────────────────────
     deduplicate_edges(&mut tree);
 
@@ -1938,6 +1946,90 @@ fn infer_root_element(profile: &ComponentSourceProfile) -> Option<String> {
 /// Suppress root→child BEM edges when a more specific intermediate→child
 /// edge exists from DOM nesting, context, or delegation projection.
 ///
+/// Downgrade the weaker edge in bidirectional CHP cycles to Allowed.
+///
+/// When A→B and B→A both have CHP=YES (Required or Structural), this
+/// represents recursive nesting (e.g., WizardNavItem→WizardNav for
+/// sub-navigation plus WizardNav→WizardNavItem for list items). The
+/// weaker direction (lower EdgeStrength ordinal) is optional recursive
+/// nesting and should be Allowed, not Structural.
+///
+/// If both edges have equal strength, the one where the child has more
+/// incoming CHP edges is kept (it's the "hub" — the real parent).
+fn downgrade_bidirectional_chp_cycles(tree: &mut CompositionTree) {
+    // Build a set of (parent, child) pairs with CHP=YES
+    let chp_edges: HashSet<(String, String)> = tree
+        .edges
+        .iter()
+        .filter(|e| e.strength.child_requires_parent())
+        .map(|e| (e.parent.clone(), e.child.clone()))
+        .collect();
+
+    // Find bidirectional pairs
+    let mut to_downgrade: HashSet<(String, String)> = HashSet::new();
+
+    for (parent, child) in &chp_edges {
+        let reverse = (child.clone(), parent.clone());
+        if chp_edges.contains(&reverse) && !to_downgrade.contains(&reverse) {
+            // Both directions exist with CHP=YES. Find the weaker one.
+            let forward_strength = tree
+                .edges
+                .iter()
+                .find(|e| e.parent == *parent && e.child == *child)
+                .map(|e| e.strength.clone())
+                .unwrap_or(EdgeStrength::Allowed);
+            let reverse_strength = tree
+                .edges
+                .iter()
+                .find(|e| e.parent == *child && e.child == *parent)
+                .map(|e| e.strength.clone())
+                .unwrap_or(EdgeStrength::Allowed);
+
+            if forward_strength < reverse_strength {
+                // Forward is weaker — downgrade it
+                to_downgrade.insert((parent.clone(), child.clone()));
+            } else if reverse_strength < forward_strength {
+                // Reverse is weaker — downgrade it
+                to_downgrade.insert((child.clone(), parent.clone()));
+            } else {
+                // Equal strength — downgrade the one where the child has
+                // more incoming CHP edges (the "hub" is the real parent)
+                let forward_child_incoming = tree
+                    .edges
+                    .iter()
+                    .filter(|e| e.child == *child && e.strength.child_requires_parent())
+                    .count();
+                let reverse_child_incoming = tree
+                    .edges
+                    .iter()
+                    .filter(|e| e.child == *parent && e.strength.child_requires_parent())
+                    .count();
+
+                if forward_child_incoming >= reverse_child_incoming {
+                    // child has more/equal incoming → it's the hub → keep
+                    // forward (parent→child), downgrade reverse
+                    to_downgrade.insert((child.clone(), parent.clone()));
+                } else {
+                    to_downgrade.insert((parent.clone(), child.clone()));
+                }
+            }
+        }
+    }
+
+    // Apply downgrades
+    for edge in &mut tree.edges {
+        if to_downgrade.contains(&(edge.parent.clone(), edge.child.clone())) {
+            tracing::debug!(
+                parent = %edge.parent,
+                child = %edge.child,
+                old_strength = ?edge.strength,
+                "downgrading bidirectional CHP cycle edge to Allowed"
+            );
+            edge.strength = EdgeStrength::Allowed;
+        }
+    }
+}
+
 /// BEM analysis creates edges from the block owner to every component
 /// that uses its CSS tokens. But DOM/context/projection analysis discovers
 /// the actual JSX nesting, which may have an intermediate wrapper between
@@ -2859,6 +2951,115 @@ mod tests {
             4,
             "Should have 4 edges remaining (1 root→Group + 3 Group→children)"
         );
+    }
+
+    /// Wizard scenario: WizardNav ↔ WizardNavItem have a bidirectional
+    /// CHP cycle. WizardNav→WizardNavItem is Required (DOM nesting ol→li),
+    /// WizardNavItem→WizardNav is Structural (CSS > .nav-item > .nav-list).
+    /// Step 8.8 should downgrade the weaker direction (Structural) to Allowed.
+    #[test]
+    fn test_bidirectional_chp_cycle_downgrades_weaker_edge() {
+        let mut tree = CompositionTree {
+            root: "Wizard".into(),
+            family_members: vec!["Wizard".into(), "WizardNav".into(), "WizardNavItem".into()],
+            edges: vec![
+                // Forward: WizardNav → WizardNavItem (Required, DOM nesting)
+                CompositionEdge {
+                    parent: "WizardNav".into(),
+                    child: "WizardNavItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: Some("DOM nesting: ol→li".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Reverse: WizardNavItem → WizardNav (Structural, CSS >)
+                CompositionEdge {
+                    parent: "WizardNavItem".into(),
+                    child: "WizardNav".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("CSS direct child: .nav-item > .nav-list".into()),
+                    strength: EdgeStrength::Structural,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        downgrade_bidirectional_chp_cycles(&mut tree);
+
+        // Required direction should be unchanged
+        let forward = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "WizardNav" && e.child == "WizardNavItem")
+            .unwrap();
+        assert_eq!(
+            forward.strength,
+            EdgeStrength::Required,
+            "WizardNav→WizardNavItem (Required) should be unchanged"
+        );
+
+        // Structural direction should be downgraded to Allowed
+        let reverse = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "WizardNavItem" && e.child == "WizardNav")
+            .unwrap();
+        assert_eq!(
+            reverse.strength,
+            EdgeStrength::Allowed,
+            "WizardNavItem→WizardNav (Structural) should be downgraded to Allowed"
+        );
+    }
+
+    /// When one direction is Allowed (CHP=NO) and the other is Required
+    /// (CHP=YES), there is no bidirectional CHP cycle — no downgrade needed.
+    #[test]
+    fn test_no_downgrade_when_one_direction_is_allowed() {
+        let mut tree = CompositionTree {
+            root: "Menu".into(),
+            family_members: vec!["Menu".into(), "MenuItem".into()],
+            edges: vec![
+                // Forward: Menu → MenuItem (Required, CHP=YES)
+                CompositionEdge {
+                    parent: "Menu".into(),
+                    child: "MenuItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Reverse: MenuItem → Menu (Allowed, CHP=NO)
+                CompositionEdge {
+                    parent: "MenuItem".into(),
+                    child: "Menu".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        downgrade_bidirectional_chp_cycles(&mut tree);
+
+        // Both should be unchanged — no CHP cycle (Allowed has CHP=NO)
+        let forward = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Menu" && e.child == "MenuItem")
+            .unwrap();
+        assert_eq!(forward.strength, EdgeStrength::Required);
+
+        let reverse = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "MenuItem" && e.child == "Menu")
+            .unwrap();
+        assert_eq!(reverse.strength, EdgeStrength::Allowed);
     }
 
     /// Verify that BEM edges are created with required=false.

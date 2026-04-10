@@ -899,8 +899,8 @@ are present). These are not false positives but misleading guidance.
 | Family | Issue | Severity |
 |--------|-------|----------|
 | deprecated/Table | Self-loop: `Header → Header` (wrapper, internal) | Bug — parser confusion on component name collision |
-| Wizard | Bidirectional cycle: `WizardNav ↔ WizardNavItem` (required + structural) | Bug — recursive direction should be Allowed |
-| deprecated/Wizard | Same cycle as Wizard | Same |
+| Wizard | Bidirectional cycle: `WizardNav ↔ WizardNavItem` | ✓ FIXED — Step 8.8 downgrades weaker direction (Structural) to Allowed |
+| deprecated/Wizard | Same cycle as Wizard | ✓ FIXED — same |
 | Form | Orphan exports: FormFieldGroup, FormFieldGroupExpandable have zero edges | Missing edges — consumer-placed components with no composition signal |
 
 **Wizard/deprecated duplicate `when` clauses:**
