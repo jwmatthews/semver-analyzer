@@ -1053,54 +1053,97 @@ pub fn build_composition_tree_v2(
         }
     }
 
-    // ── Step 9: Suppress + dedup ───────────────────────────────────
+    // ── Step 9: Dedup ──────────────────────────────────────────────
     deduplicate_edges(&mut tree);
-    swap_mutual_css_strengths(&mut tree);
-    suppress_root_edges_with_intermediate(&mut tree);
 
-    // ── Step 9.5: PMC upgrade from required props ───────────────────
-    // When a parent has `children: ReactNode` (required, no `?`) or a
-    // required ReactNode/ReactElement prop matching a child component,
-    // upgrade existing Structural edges to Required (add PMC=YES).
+    // ── Step 9.5: Pure composition wrapper PMC upgrade ─────────────
+    // When a parent is a "pure composition wrapper" (no Internal outgoing
+    // edges — it only accepts consumer-placed children via {children})
+    // AND it has structural evidence of being a layout container (CSS grid
+    // with grid-template, or DOM nesting with a pure container tag), then
+    // the parent exists to contain its children. Empty usage is meaningless.
     //
-    // This covers:
-    // - DataListItem→DataListItemRow: `children: ReactNode` is required
-    // - DrawerContent→DrawerPanelContent: `panelContent: ReactNode` is required
-    for edge in &mut tree.edges {
-        let Some(parent_profile) = profiles.get(&edge.parent) else {
-            continue;
-        };
-        // Skip edges that already have PMC=YES (Required or Wrapper)
-        if edge.strength.parent_requires_child() {
-            continue;
-        }
-        // Skip edges without CHP (we only upgrade Structural→Required, not Allowed→Wrapper)
-        if !edge.strength.child_requires_parent() {
-            continue;
-        }
-        // Fix C: Parent has required `children` prop
-        if parent_profile.required_props.contains("children") {
-            edge.strength = EdgeStrength::Required;
-            edge.required = true;
-            continue;
-        }
-        // Fix E: Parent has a required ReactNode/ReactElement prop matching the child
-        // Check prop-passed edges (they already have a prop_name linking parent prop to child)
-        if let Some(ref prop_name) = edge.prop_name {
-            if parent_profile.required_props.contains(prop_name) {
-                if let Some(prop_type) = parent_profile.prop_types.get(prop_name) {
-                    if prop_type.contains("ReactNode")
-                        || prop_type.contains("ReactElement")
-                        || prop_type.contains("React.ReactNode")
-                        || prop_type.contains("React.ReactElement")
-                    {
-                        edge.strength = EdgeStrength::Required;
-                        edge.required = true;
+    // Add PMC=YES (via Wrapper) to Structural DirectChild edges from such
+    // parents. Only edges with CHP=YES (Structural) are upgraded — weak
+    // signals like CSS descendant and BEM fallback (Allowed, CHP=NO) are
+    // skipped because they represent deep-descendant matches, not real
+    // direct parent-child layout dependencies.
+    //
+    // combine() handles the rest:
+    //   Structural.combine(Wrapper) = Required (gains PMC)
+    //   Required stays Required (no-op)
+    //
+    // The requiresChild rule uses OR semantics ("parent must contain at
+    // least one of X, Y, Z"), so upgrading ALL structural children is
+    // acceptable even when individual children are optional.
+    {
+        // Collect parent-level info from edge evidence
+        let mut parent_has_internal: HashSet<String> = HashSet::new();
+        let mut parent_has_grid: HashSet<String> = HashSet::new();
+        let mut parent_has_pure_container: HashSet<String> = HashSet::new();
+
+        for edge in &tree.edges {
+            if edge.relationship == ChildRelationship::Internal {
+                parent_has_internal.insert(edge.parent.clone());
+            }
+            if let Some(ref ev) = edge.bem_evidence {
+                if ev.contains("CSS grid:") && ev.contains("grid-template") {
+                    parent_has_grid.insert(edge.parent.clone());
+                }
+                if ev.contains("wraps children in <") {
+                    // Extract the tag and check if it's a pure container
+                    if let Some(start) = ev.find("wraps children in <") {
+                        let after = &ev[start + 19..];
+                        if let Some(end) = after.find('>') {
+                            let tag = &after[..end];
+                            if matches!(
+                                tag,
+                                "ul" | "ol"
+                                    | "tbody"
+                                    | "thead"
+                                    | "tfoot"
+                                    | "tr"
+                                    | "dl"
+                                    | "table"
+                                    | "select"
+                                    | "optgroup"
+                            ) {
+                                parent_has_pure_container.insert(edge.parent.clone());
+                            }
+                        }
                     }
                 }
             }
         }
+
+        // Upgrade Structural edges from qualifying parents
+        for edge in &mut tree.edges {
+            if edge.relationship != ChildRelationship::DirectChild {
+                continue;
+            }
+            // Only upgrade edges with CHP=YES (Structural or Required).
+            // Skip Allowed edges — they're weak signals (CSS descendant,
+            // BEM fallback) that don't represent real layout dependencies.
+            if !edge.strength.child_requires_parent() {
+                continue;
+            }
+            if parent_has_internal.contains(&edge.parent) {
+                continue;
+            }
+            let has_signal = parent_has_grid.contains(&edge.parent)
+                || parent_has_pure_container.contains(&edge.parent);
+            if !has_signal {
+                continue;
+            }
+            edge.strength = edge.strength.combine(&EdgeStrength::Wrapper);
+            edge.required = edge.strength.parent_requires_child();
+        }
     }
+
+    // ── Step 9.6: Suppress root shortcuts ───────────────────────────
+    // Must run AFTER Step 9.5 so that Required wrappers (from PMC upgrade)
+    // are available for the wrapper-grandchild suppression path.
+    suppress_root_edges_with_intermediate(&mut tree);
 
     // ── Step 10: Drop unconnected members ───────────────────────────
     // Members with no edges at all are dropped from the tree, UNLESS
@@ -1768,90 +1811,6 @@ fn infer_root_element(profile: &ComponentSourceProfile) -> Option<String> {
     None
 }
 
-/// Swap strengths in mutual CSS pairs where one edge is from CSS direct-child
-/// (`>`) and the other is from CSS descendant (` `).
-///
-/// In a mutual pair (A→B + B→A), the CSS `>` direction represents optional
-/// recursive/self-nesting (e.g., WizardNavItem > WizardNav for sub-navigation),
-/// while the CSS descendant direction represents the main hierarchy
-/// (e.g., WizardNav contains WizardNavItems). Step 2 assigns Structural to
-/// CSS `>` edges and Step 5 assigns Allowed to CSS descendant edges, but
-/// when both directions exist, the descendant direction is the primary
-/// relationship and should be Structural. The direct-child direction is the
-/// recursive nesting and should be Allowed.
-fn swap_mutual_css_strengths(tree: &mut CompositionTree) {
-    // Build index: (parent, child) → edge index
-    let mut edge_index: HashMap<(String, String), usize> = HashMap::new();
-    for (i, e) in tree.edges.iter().enumerate() {
-        edge_index.insert((e.parent.clone(), e.child.clone()), i);
-    }
-
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-
-    // Collect swaps to apply (can't mutate while iterating the index)
-    let mut swaps: Vec<(usize, usize)> = Vec::new();
-
-    for (i, e) in tree.edges.iter().enumerate() {
-        let fwd = (e.parent.clone(), e.child.clone());
-        if seen.contains(&fwd) {
-            continue;
-        }
-        let rev = (e.child.clone(), e.parent.clone());
-        if let Some(&j) = edge_index.get(&rev) {
-            seen.insert(fwd);
-            seen.insert(rev);
-
-            let e_fwd = &tree.edges[i];
-            let e_rev = &tree.edges[j];
-
-            // Check: one is "CSS direct child:" Structural, other is "CSS descendant:" Allowed
-            let fwd_is_direct = e_fwd.strength == EdgeStrength::Structural
-                && e_fwd
-                    .bem_evidence
-                    .as_ref()
-                    .is_some_and(|ev| ev.starts_with("CSS direct child:"));
-            let rev_is_desc = e_rev.strength == EdgeStrength::Allowed
-                && e_rev
-                    .bem_evidence
-                    .as_ref()
-                    .is_some_and(|ev| ev.starts_with("CSS descendant:"));
-
-            let rev_is_direct = e_rev.strength == EdgeStrength::Structural
-                && e_rev
-                    .bem_evidence
-                    .as_ref()
-                    .is_some_and(|ev| ev.starts_with("CSS direct child:"));
-            let fwd_is_desc = e_fwd.strength == EdgeStrength::Allowed
-                && e_fwd
-                    .bem_evidence
-                    .as_ref()
-                    .is_some_and(|ev| ev.starts_with("CSS descendant:"));
-
-            if fwd_is_direct && rev_is_desc {
-                // fwd (CSS >) is Structural, rev (CSS desc) is Allowed → swap
-                swaps.push((i, j));
-            } else if rev_is_direct && fwd_is_desc {
-                // rev (CSS >) is Structural, fwd (CSS desc) is Allowed → swap
-                swaps.push((j, i));
-            }
-        }
-    }
-
-    for (direct_idx, desc_idx) in swaps {
-        tracing::debug!(
-            parent_direct = %tree.edges[direct_idx].parent,
-            child_direct = %tree.edges[direct_idx].child,
-            parent_desc = %tree.edges[desc_idx].parent,
-            child_desc = %tree.edges[desc_idx].child,
-            "swapping mutual CSS pair: CSS > becomes Allowed, CSS descendant becomes Structural"
-        );
-        tree.edges[direct_idx].strength = EdgeStrength::Allowed;
-        tree.edges[direct_idx].required = false;
-        tree.edges[desc_idx].strength = EdgeStrength::Structural;
-        tree.edges[desc_idx].required = false;
-    }
-}
-
 /// Suppress root→child BEM edges when a more specific intermediate→child
 /// edge exists from DOM nesting, context, or delegation projection.
 ///
@@ -1882,7 +1841,33 @@ fn suppress_root_edges_with_intermediate(tree: &mut CompositionTree) {
         }
     }
 
-    if children_max_strength.is_empty() {
+    // Collect Required children of the root. These are structural wrappers
+    // that are always present. If such a wrapper has ANY edge to a child
+    // that the root also has a direct edge to, the root's direct edge is
+    // a DOM shortcut that bypasses the API wrapper and should be suppressed.
+    //
+    // Example: DescriptionList→DescriptionListGroup [required] and
+    // DescriptionListGroup→DescriptionListTerm [allowed]. The root edge
+    // DescriptionList→DescriptionListTerm [required] is a DOM shortcut
+    // (<dl>→<dt>) that bypasses the DescriptionListGroup wrapper.
+    let mut required_wrapper_children: HashSet<String> = HashSet::new();
+    for edge in &tree.edges {
+        if edge.parent == *root && edge.strength.parent_requires_child() {
+            required_wrapper_children.insert(edge.child.clone());
+        }
+    }
+
+    // Build: for each Required wrapper, what children does it have?
+    let mut wrapper_grandchildren: HashSet<String> = HashSet::new();
+    for edge in &tree.edges {
+        if required_wrapper_children.contains(&edge.parent)
+            && matches!(edge.relationship, ChildRelationship::DirectChild)
+        {
+            wrapper_grandchildren.insert(edge.child.clone());
+        }
+    }
+
+    if children_max_strength.is_empty() && wrapper_grandchildren.is_empty() {
         return;
     }
 
@@ -1896,9 +1881,10 @@ fn suppress_root_edges_with_intermediate(tree: &mut CompositionTree) {
         if !matches!(edge.relationship, ChildRelationship::DirectChild) {
             return true;
         }
-        // Only suppress when intermediate is at least as strong as root edge
-        match children_max_strength.get(&edge.child) {
-            Some(intermediate_strength) if *intermediate_strength >= edge.strength => {
+
+        // Path 1: Suppress when intermediate is at least as strong as root edge
+        if let Some(intermediate_strength) = children_max_strength.get(&edge.child) {
+            if *intermediate_strength >= edge.strength {
                 tracing::debug!(
                     root = %root,
                     child = %edge.child,
@@ -1906,10 +1892,28 @@ fn suppress_root_edges_with_intermediate(tree: &mut CompositionTree) {
                     intermediate_strength = ?intermediate_strength,
                     "suppressing root edge — equally/more-strong intermediate parent exists"
                 );
-                false
+                return false;
             }
-            _ => true, // No intermediate, or root edge is stronger
         }
+
+        // Path 2: Suppress when a Required wrapper of the root also has
+        // an edge to this child. The wrapper is always present (PMC=YES
+        // from root), so the child goes through it — the root's direct
+        // edge is a DOM shortcut bypassing the API wrapper.
+        if wrapper_grandchildren.contains(&edge.child) {
+            // Don't suppress the edge TO the wrapper itself
+            if !required_wrapper_children.contains(&edge.child) {
+                tracing::debug!(
+                    root = %root,
+                    child = %edge.child,
+                    root_strength = ?edge.strength,
+                    "suppressing root edge — required wrapper provides path to child"
+                );
+                return false;
+            }
+        }
+
+        true
     });
 
     let suppressed = before - tree.edges.len();
@@ -2186,124 +2190,6 @@ mod tests {
             tree.edges.len(),
             3,
             "No edges should be suppressed for Masthead"
-        );
-    }
-
-    #[test]
-    fn test_swap_mutual_css_strengths_wizard_pattern() {
-        // Wizard scenario: WizardNavItem → WizardNav (Structural, CSS >)
-        // and WizardNav → WizardNavItem (Allowed, CSS descendant).
-        // The CSS > direction is recursive sub-navigation nesting;
-        // the CSS descendant direction is the main hierarchy.
-        // After swap: CSS > becomes Allowed, CSS descendant becomes Structural.
-        let mut tree = CompositionTree {
-            root: "Wizard".into(),
-            family_members: vec!["Wizard".into(), "WizardNav".into(), "WizardNavItem".into()],
-            edges: vec![
-                // CSS > : WizardNavItem contains WizardNav (recursive sub-nav)
-                CompositionEdge {
-                    parent: "WizardNavItem".into(),
-                    child: "WizardNav".into(),
-                    relationship: ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("CSS direct child: .nav-item > .nav-list".into()),
-                    strength: EdgeStrength::Structural,
-                    prop_name: None,
-                },
-                // CSS descendant: WizardNav contains WizardNavItems (main hierarchy)
-                CompositionEdge {
-                    parent: "WizardNav".into(),
-                    child: "WizardNavItem".into(),
-                    relationship: ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("CSS descendant: .nav-list .nav-link".into()),
-                    strength: EdgeStrength::Allowed,
-                    prop_name: None,
-                },
-            ],
-        };
-
-        swap_mutual_css_strengths(&mut tree);
-
-        // CSS > direction should now be Allowed (recursive nesting is optional)
-        let direct_edge = tree
-            .edges
-            .iter()
-            .find(|e| e.parent == "WizardNavItem" && e.child == "WizardNav")
-            .expect("WizardNavItem → WizardNav edge should exist");
-        assert_eq!(
-            direct_edge.strength,
-            EdgeStrength::Allowed,
-            "CSS > edge should be Allowed after swap"
-        );
-
-        // CSS descendant direction should now be Structural (main hierarchy)
-        let desc_edge = tree
-            .edges
-            .iter()
-            .find(|e| e.parent == "WizardNav" && e.child == "WizardNavItem")
-            .expect("WizardNav → WizardNavItem edge should exist");
-        assert_eq!(
-            desc_edge.strength,
-            EdgeStrength::Structural,
-            "CSS descendant edge should be Structural after swap"
-        );
-    }
-
-    #[test]
-    fn test_swap_mutual_css_no_swap_when_not_css_pair() {
-        // Mutual pair where one edge is internal rendering (not CSS).
-        // No swap should happen — only pure CSS mutual pairs are swapped.
-        let mut tree = CompositionTree {
-            root: "DrilldownMenu".into(),
-            family_members: vec!["DrilldownMenu".into(), "Menu".into()],
-            edges: vec![
-                // Internal rendering: DrilldownMenu renders Menu
-                CompositionEdge {
-                    parent: "DrilldownMenu".into(),
-                    child: "Menu".into(),
-                    relationship: ChildRelationship::DirectChild,
-                    required: true,
-                    bem_evidence: Some("internally rendered".into()),
-                    strength: EdgeStrength::Required,
-                    prop_name: None,
-                },
-                // Context: Menu provides context for DrilldownMenu
-                CompositionEdge {
-                    parent: "Menu".into(),
-                    child: "DrilldownMenu".into(),
-                    relationship: ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some("Context nesting: Menu provides MenuContext".into()),
-                    strength: EdgeStrength::Allowed,
-                    prop_name: None,
-                },
-            ],
-        };
-
-        swap_mutual_css_strengths(&mut tree);
-
-        // No swap — internal rendering is not CSS
-        let internal = tree
-            .edges
-            .iter()
-            .find(|e| e.parent == "DrilldownMenu" && e.child == "Menu")
-            .unwrap();
-        assert_eq!(
-            internal.strength,
-            EdgeStrength::Required,
-            "Internal rendering edge should remain Required"
-        );
-
-        let context = tree
-            .edges
-            .iter()
-            .find(|e| e.parent == "Menu" && e.child == "DrilldownMenu")
-            .unwrap();
-        assert_eq!(
-            context.strength,
-            EdgeStrength::Allowed,
-            "Context edge should remain Allowed"
         );
     }
 

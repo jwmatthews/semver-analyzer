@@ -1128,10 +1128,38 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
                 if collapsed_set.contains(&child_edge.child) {
                     continue;
                 }
-                // Compute collapsed strength: each dimension (CHP, PMC)
-                // is ANDed through the chain — the chain is only as strong
-                // as its weakest link in each direction.
-                let strength = parent_edge.strength.collapse_chain(&child_edge.strength);
+                // Compute collapsed strength for the transitive edge.
+                //
+                // When the outer edge (A→internal) is Wrapper (PMC=YES —
+                // A unconditionally renders the internal node), the internal
+                // node is just a passthrough for {children}. It doesn't make
+                // rendering decisions — it just wraps content. So the
+                // transitive edge inherits the inner edge's strength directly.
+                // The internal node is transparent.
+                //
+                // When the outer edge is Allowed (conditional rendering),
+                // the conditionality is real — the internal node may not be
+                // rendered at all. The transitive edge is Allowed regardless
+                // of the inner edge's strength.
+                //
+                // For other outer strengths (Structural, Required), fall back
+                // to the standard collapse_chain AND logic.
+                let strength = if parent_edge.strength.parent_requires_child()
+                    && !parent_edge.strength.child_requires_parent()
+                {
+                    // Outer is Wrapper (PMC=YES, CHP=NO): passthrough —
+                    // inherit inner edge strength directly
+                    child_edge.strength.clone()
+                } else if !parent_edge.strength.parent_requires_child()
+                    && !parent_edge.strength.child_requires_parent()
+                {
+                    // Outer is Allowed (PMC=NO, CHP=NO): conditional —
+                    // transitive edge is Allowed
+                    semver_analyzer_core::types::sd::EdgeStrength::Allowed
+                } else {
+                    // Structural or Required outer: use standard collapse
+                    parent_edge.strength.collapse_chain(&child_edge.strength)
+                };
                 new_edges.push(semver_analyzer_core::types::sd::CompositionEdge {
                     parent: parent_edge.parent.clone(),
                     child: child_edge.child.clone(),
@@ -1287,13 +1315,45 @@ fn generate_conformance_checks(
             .push(edge.parent.as_str());
     }
 
-    // Compute depth from root via BFS over non-internal edges.
-    // Used to detect back-edges: an edge A → B is a back-edge if B
-    // has a smaller depth than A (i.e., points upward toward root).
+    // Compute depth from root via two-pass BFS.
+    //
+    // Pass 1: Follow non-Internal edges to establish the true consumer-
+    // facing hierarchy depths. This ensures that when A→B is a real
+    // structural edge and both A and B are also reached via Internal
+    // edges from the root, B gets a deeper depth than A.
+    //
+    // Pass 2: Fill in remaining nodes via Internal edges. Nodes reached
+    // only through Internal edges (e.g., WizardNav reached via
+    // Wizard→WizardNav [internal]) get depth values so that back-edge
+    // detection works on their outgoing non-Internal edges.
+    //
+    // For deprecated families, the tree root (e.g., "deprecated/Wizard")
+    // differs from the component name in edges (e.g., "Wizard"). We seed
+    // the BFS from the root member that matches an edge parent/child.
     let mut depth: HashMap<&str, usize> = HashMap::new();
-    depth.insert(tree.root.as_str(), 0);
     let mut queue = std::collections::VecDeque::new();
-    queue.push_back(tree.root.as_str());
+
+    // Seed: try tree.root first, then find the root component name
+    // by looking for a family member that appears as a parent in edges
+    // but shares the family root's base name (handles deprecated/ prefix).
+    let root_name = tree.root.as_str();
+    if tree
+        .edges
+        .iter()
+        .any(|e| e.parent == root_name || e.child == root_name)
+    {
+        depth.insert(root_name, 0);
+        queue.push_back(root_name);
+    } else {
+        // Deprecated family: root is "deprecated/Wizard" but edges use "Wizard"
+        let base = root_name.rsplit('/').next().unwrap_or(root_name);
+        if let Some(member) = tree.family_members.iter().find(|m| m.as_str() == base) {
+            depth.insert(member.as_str(), 0);
+            queue.push_back(member.as_str());
+        }
+    }
+
+    // Pass 1: non-Internal edges only
     while let Some(node) = queue.pop_front() {
         let node_depth = depth[node];
         for edge in &tree.edges {
@@ -1303,6 +1363,53 @@ fn generate_conformance_checks(
             {
                 depth.insert(edge.child.as_str(), node_depth + 1);
                 queue.push_back(edge.child.as_str());
+            }
+        }
+    }
+
+    // Pass 2: Internal edges — fill in nodes not yet reached.
+    let depth_after_pass1: HashSet<&str> = depth.keys().copied().collect();
+    for (node, _) in depth.clone() {
+        queue.push_back(node);
+    }
+    while let Some(node) = queue.pop_front() {
+        let node_depth = depth[node];
+        for edge in &tree.edges {
+            if edge.parent == node && !depth.contains_key(edge.child.as_str()) {
+                depth.insert(edge.child.as_str(), node_depth + 1);
+                queue.push_back(edge.child.as_str());
+            }
+        }
+    }
+
+    // Pass 3: Deepen children of Pass-2-discovered nodes via Required edges.
+    // Nodes discovered in Pass 2 (via Internal edges) may have Required
+    // children that were also discovered in Pass 2 at the same depth.
+    // Example: Wizard→WizardNav [internal] and Wizard→WizardNavItem [internal]
+    // both get depth 1 in Pass 2. But WizardNav→WizardNavItem [required] means
+    // WizardNavItem should be depth 2 (deeper than WizardNav).
+    //
+    // Only Required edges are followed — these represent the true forward
+    // hierarchy. Structural edges in the reverse direction (e.g.,
+    // WizardNavItem→WizardNav for recursive nesting) are skipped to avoid
+    // mutual pairs deepening each other equally.
+    let pass2_nodes: Vec<(&str, usize)> = depth
+        .iter()
+        .filter(|(node, _)| !depth_after_pass1.contains(*node))
+        .map(|(&node, &d)| (node, d))
+        .collect();
+    for (node, node_depth) in pass2_nodes {
+        for edge in &tree.edges {
+            if edge.parent == node
+                && edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Required
+            {
+                let child = edge.child.as_str();
+                let new_depth = node_depth + 1;
+                if let Some(&current) = depth.get(child) {
+                    if new_depth > current {
+                        depth.insert(child, new_depth);
+                    }
+                }
             }
         }
     }
@@ -1320,9 +1427,10 @@ fn generate_conformance_checks(
             continue;
         }
 
-        // Skip back-edges that create cycles (e.g., Tab → Tabs where Tabs
-        // is an ancestor of Tab). These represent optional recursive nesting
-        // (nested tabs), not mandatory containment constraints.
+        // Skip back-edges that create cycles (e.g., WizardNavItem → WizardNav
+        // where WizardNav is an ancestor of WizardNavItem). These represent
+        // optional recursive nesting (sub-navigation), not mandatory
+        // containment constraints.
         //
         // A back-edge is one where the child's depth from root is ≤
         // the parent's depth (i.e., pointing upward or sideways).
