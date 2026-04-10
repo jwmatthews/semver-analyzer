@@ -151,6 +151,19 @@ fn pkg_for(component: &str, map: &HashMap<String, String>) -> String {
         .unwrap_or_else(|| "@patternfly/react-core".to_string())
 }
 
+/// Look up the package for a component in a potentially deprecated family.
+/// If the family root starts with "deprecated/" and the resolved package
+/// doesn't already contain "/deprecated", appends "/deprecated" to scope
+/// the rule to the deprecated import path.
+fn pkg_for_deprecated(component: &str, family_root: &str, map: &HashMap<String, String>) -> String {
+    let base = pkg_for(component, map);
+    if family_root.starts_with("deprecated/") && !base.contains("/deprecated") {
+        format!("{}/deprecated", base)
+    } else {
+        base
+    }
+}
+
 /// Resolve the deprecated import package from a `migration_from` path.
 ///
 /// Example: `"packages/react-core/src/deprecated/components/Select/Select.tsx"`
@@ -431,9 +444,31 @@ fn generate_conformance_rules(
         //     "ToggleGroup must contain ToggleGroupItem" — parent has PMC edge.
         //     Scanner: pattern=ToggleGroup, requiresChild=^(ToggleGroupItem)$
 
+        // Extract the base family name for root comparison.
+        // "deprecated/DualListSelector" → "DualListSelector", "Alert" → "Alert"
+        let base_root = tree.root.rsplit('/').next().unwrap_or(&tree.root);
+
+        // For deprecated families, scope the `from` field to the deprecated
+        // import path (e.g., "@patternfly/react-core/deprecated"). Without
+        // this, deprecated conformance rules share identical `when` clauses
+        // with v6 rules because both families use the same component names
+        // from the same base package.
+        let family_root = &tree.root;
+        let pkg_for_family = |component: &str| -> String {
+            pkg_for_deprecated(component, family_root, component_packages)
+        };
+
         // 4b: Generate notParent rules (child must be inside parent).
         for child in &children_needing_not_parent {
-            let pkg = pkg_for(child, component_packages);
+            // Skip notParent rules for the family root component. A family root
+            // is standalone by definition — it can exist outside any parent.
+            // Examples: Alert does not require AlertGroup, ChartDonutUtilization
+            // does not require ChartDonutThreshold.
+            if *child == base_root {
+                continue;
+            }
+
+            let pkg = pkg_for_family(child);
 
             // Use ALL parents (Required + Allowed) for the notParent regex
             // so valid-but-not-required placements don't trigger false positives.
@@ -523,14 +558,46 @@ fn generate_conformance_rules(
                 }),
             });
 
+            // Build set of CHP parents for this child — parents where the child
+            // has a Required or Structural edge (child_requires_parent = true).
+            //
+            // Used for two purposes:
+            // 1. The grandparent walk only follows CHP parents in the first
+            //    hop. Allowed parents (CSS descendant matches between peer
+            //    components) create false intermediate paths and generate
+            //    noise rules like "DLDescription not-in DLTermHelpText, use
+            //    DLTerm" when Term and TermHelpText are actually peers.
+            // 2. If the grandparent is already a CHP parent, the child IS a
+            //    valid direct child of that grandparent — the invalidDirectChild
+            //    rule would contradict the notParent rule.
+            let chp_parents: HashSet<&str> = tree
+                .edges
+                .iter()
+                .filter(|e| {
+                    e.child == *child
+                        && e.relationship != ChildRelationship::Internal
+                        && e.strength.child_requires_parent()
+                })
+                .map(|e| e.parent.as_str())
+                .collect();
+
             // ── InvalidDirectChild: child inside grandparent, skipping parent.
             //
-            // For each valid parent of this child, look up that parent's own
+            // For each CHP parent of this child, look up that parent's own
             // parents (grandparents of the child). Group by grandparent to
             // merge when multiple parents share the same grandparent (e.g.,
             // Tr in Table needs either Thead or Tbody).
+            //
+            // Only CHP parents are walked (first hop) because Allowed parents
+            // represent weak CSS descendant signals between peer components,
+            // not real parent-child API constraints. The second hop (parent →
+            // grandparent) uses ALL parents to find all valid ancestors.
             let mut grandparent_to_expected: HashMap<&str, Vec<&str>> = HashMap::new();
             for parent in &sorted_parents {
+                // First hop: only follow CHP parents
+                if !chp_parents.contains(parent) {
+                    continue;
+                }
                 if let Some(grandparents) = child_to_all_parents.get(parent) {
                     for grandparent in grandparents {
                         grandparent_to_expected
@@ -542,6 +609,12 @@ fn generate_conformance_rules(
             }
 
             for (grandparent, expected_parents) in &grandparent_to_expected {
+                // Suppress when the child already has a CHP edge to the
+                // grandparent. The child is a valid direct child there, so
+                // "X should not be directly in G" is wrong.
+                if chp_parents.contains(grandparent) {
+                    continue;
+                }
                 let mut unique_parents: Vec<&str> = expected_parents.clone();
                 unique_parents.sort();
                 unique_parents.dedup();
@@ -653,7 +726,7 @@ fn generate_conformance_rules(
         // still only fires on parents that have PMC children (from
         // parent_to_req_children), and the description lists the PMC ones.
         for (parent, children) in &parent_to_req_children {
-            let pkg = pkg_for(parent, component_packages);
+            let pkg = pkg_for_family(parent);
             let mut sorted_children: Vec<&str> = children.clone();
             sorted_children.sort();
             sorted_children.dedup();
@@ -734,7 +807,7 @@ fn generate_conformance_rules(
             allowed_children,
         } = &check.check_type
         {
-            let pkg = pkg_for(parent, component_packages);
+            let pkg = pkg_for_deprecated(parent, &check.family, component_packages);
             let allowed_pattern = format!("^({})$", allowed_children.join("|"));
             let allowed_list = allowed_children.join(" or ");
 
@@ -3972,12 +4045,21 @@ mod tests {
             rule.description
         );
 
-        // InvalidDirectChild rule should also mention both parents
+        // InvalidDirectChild rule should mention only CHP parents.
+        // Thead→Tr is Allowed (not CHP), so the grandparent walk skips it.
+        // Only Tbody (Required/CHP) appears as the suggested intermediate.
         let tr_not_in_table = rules.iter().find(|r| r.rule_id.contains("tr-not-in-table"));
         if let Some(idc_rule) = tr_not_in_table {
             assert!(
-                idc_rule.description.contains("Tbody") && idc_rule.description.contains("Thead"),
-                "InvalidDirectChild description should mention both parents: {}",
+                idc_rule.description.contains("Tbody"),
+                "InvalidDirectChild should mention CHP parent Tbody: {}",
+                idc_rule.description
+            );
+            // Thead is NOT mentioned — it's only an Allowed parent,
+            // excluded from the first-hop grandparent walk.
+            assert!(
+                !idc_rule.description.contains("Thead"),
+                "InvalidDirectChild should NOT mention Allowed parent Thead: {}",
                 idc_rule.description
             );
         }
@@ -4091,6 +4173,218 @@ mod tests {
         );
     }
 
+    /// Family root should never get a notParent rule, even when edges have
+    /// CHP=YES (Structural). The root is standalone by definition. This tests
+    /// the rule-gen filter for the case where the composition builder produces
+    /// Structural edges TO the root (e.g., cloneElement in AlertGroup→Alert).
+    #[test]
+    fn test_family_root_never_gets_not_parent_even_with_structural_edge() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Alert".into(), "@patternfly/react-core".into());
+        pkgs.insert("AlertGroup".into(), "@patternfly/react-core".into());
+
+        let tree = CompositionTree {
+            root: "Alert".into(),
+            family_members: vec!["Alert".into(), "AlertGroup".into()],
+            edges: vec![
+                // Structural edge TO the root: CHP=YES in the edge, but the
+                // root is standalone — the rule-gen filter must suppress this.
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "AlertGroup".into(),
+                    child: "Alert".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // Alert (the family root) must NOT get a notParent rule, even though
+        // the Structural edge has CHP=YES. The root is standalone.
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("alert-in")),
+            "Family root Alert should NOT have a notParent rule even with Structural edge. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // AlertGroup should NOT get a requiresChild rule either (Structural = PMC=NO).
+        assert!(
+            !rules.iter().any(|r| r.rule_id.contains("req-")),
+            "AlertGroup should NOT get requiresChild (Structural = PMC=NO). Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// Same test for deprecated families: the deprecated/ prefix in tree.root
+    /// should not prevent the root filter from matching edge.child.
+    #[test]
+    fn test_family_root_not_parent_filter_handles_deprecated_prefix() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("DualListSelector".into(), "@patternfly/react-core".into());
+        pkgs.insert(
+            "DualListSelectorPane".into(),
+            "@patternfly/react-core".into(),
+        );
+
+        let tree = CompositionTree {
+            root: "deprecated/DualListSelector".into(),
+            family_members: vec!["DualListSelector".into(), "DualListSelectorPane".into()],
+            edges: vec![semver_analyzer_core::types::sd::CompositionEdge {
+                parent: "DualListSelectorPane".into(),
+                child: "DualListSelector".into(),
+                relationship: ChildRelationship::DirectChild,
+                required: false,
+                bem_evidence: None,
+                strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                prop_name: None,
+            }],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // DualListSelector is the root (deprecated/DualListSelector) —
+        // must not get notParent rule.
+        assert!(
+            !rules.iter().any(|r| {
+                r.rule_id.contains("duallistselector-in-") && !r.rule_id.contains("pane-in-")
+            }),
+            "Deprecated family root should NOT get notParent rule. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// Deprecated families should use the deprecated import path in their
+    /// `from` field so they don't produce identical `when` clauses with v6
+    /// rules for the same component names.
+    #[test]
+    fn test_deprecated_conformance_rules_use_deprecated_from_path() {
+        let mut pkgs = test_pkg_map();
+        // Both v6 and deprecated WizardNav resolve to @patternfly/react-core
+        // in the component_packages map (name collision)
+        pkgs.insert("WizardNav".into(), "@patternfly/react-core".into());
+        pkgs.insert("WizardNavItem".into(), "@patternfly/react-core".into());
+
+        let deprecated_tree = CompositionTree {
+            root: "deprecated/Wizard".into(),
+            family_members: vec!["WizardNav".into(), "WizardNavItem".into()],
+            edges: vec![semver_analyzer_core::types::sd::CompositionEdge {
+                parent: "WizardNav".into(),
+                child: "WizardNavItem".into(),
+                relationship: ChildRelationship::DirectChild,
+                required: true,
+                bem_evidence: None,
+                strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                prop_name: None,
+            }],
+        };
+
+        let rules = generate_conformance_rules(&[deprecated_tree], &[], &pkgs);
+
+        // All rules should use @patternfly/react-core/deprecated, not @patternfly/react-core
+        for rule in &rules {
+            if let KonveyorCondition::FrontendReferenced { referenced } = &rule.when {
+                let from = referenced.from.as_deref().unwrap_or("");
+                assert!(
+                    from.contains("/deprecated"),
+                    "Rule {} should use deprecated from path, got: {}",
+                    rule.rule_id,
+                    from
+                );
+            }
+        }
+
+        // Verify at least one rule was generated
+        assert!(
+            !rules.is_empty(),
+            "Expected at least one conformance rule for deprecated/Wizard"
+        );
+    }
+
+    /// V6 families should NOT have /deprecated in their from path.
+    #[test]
+    fn test_v6_conformance_rules_use_normal_from_path() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("WizardNav".into(), "@patternfly/react-core".into());
+        pkgs.insert("WizardNavItem".into(), "@patternfly/react-core".into());
+
+        let v6_tree = CompositionTree {
+            root: "Wizard".into(),
+            family_members: vec!["WizardNav".into(), "WizardNavItem".into()],
+            edges: vec![semver_analyzer_core::types::sd::CompositionEdge {
+                parent: "WizardNav".into(),
+                child: "WizardNavItem".into(),
+                relationship: ChildRelationship::DirectChild,
+                required: true,
+                bem_evidence: None,
+                strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                prop_name: None,
+            }],
+        };
+
+        let rules = generate_conformance_rules(&[v6_tree], &[], &pkgs);
+
+        // All rules should use @patternfly/react-core (no /deprecated)
+        for rule in &rules {
+            if let KonveyorCondition::FrontendReferenced { referenced } = &rule.when {
+                let from = referenced.from.as_deref().unwrap_or("");
+                assert!(
+                    !from.contains("/deprecated"),
+                    "v6 rule {} should NOT use deprecated from path, got: {}",
+                    rule.rule_id,
+                    from
+                );
+            }
+        }
+    }
+
+    /// When the component_packages map already resolves to a deprecated path
+    /// (e.g., Body → @patternfly/react-table/deprecated), don't double-append.
+    #[test]
+    fn test_deprecated_from_path_no_double_append() {
+        let mut pkgs = test_pkg_map();
+        // Body already resolves to the deprecated path in the map
+        pkgs.insert("Body".into(), "@patternfly/react-table/deprecated".into());
+        pkgs.insert("Header".into(), "@patternfly/react-table/deprecated".into());
+
+        let tree = CompositionTree {
+            root: "deprecated/Table".into(),
+            family_members: vec!["Body".into(), "Header".into()],
+            edges: vec![semver_analyzer_core::types::sd::CompositionEdge {
+                parent: "Header".into(),
+                child: "Body".into(),
+                relationship: ChildRelationship::DirectChild,
+                required: false,
+                bem_evidence: None,
+                strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                prop_name: None,
+            }],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        for rule in &rules {
+            if let KonveyorCondition::FrontendReferenced { referenced } = &rule.when {
+                let from = referenced.from.as_deref().unwrap_or("");
+                assert!(
+                    !from.contains("/deprecated/deprecated"),
+                    "Rule {} has double /deprecated in from path: {}",
+                    rule.rule_id,
+                    from
+                );
+                assert!(
+                    from.contains("/deprecated"),
+                    "Rule {} should use deprecated from path: {}",
+                    rule.rule_id,
+                    from
+                );
+            }
+        }
+    }
+
     /// Table-like deep trees: root gets requiresChild, intermediate nodes
     /// get notParent, and invalidDirectChild rules fire for skip-level.
     #[test]
@@ -4178,6 +4472,247 @@ mod tests {
             rules.iter().any(|r| r.rule_id.contains("tbody-in")),
             "Tbody should have notParent (Required edge has CHP=YES). Got: {:?}",
             rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// When a child has a CHP edge (Required or Structural) directly to the
+    /// grandparent, no invalidDirectChild rule should be generated for that
+    /// grandparent because the child IS a valid direct child there. The
+    /// notParent rule already lists the grandparent as a valid parent.
+    ///
+    /// Example: Card family has Card→CardBody (Structural) and
+    /// Card→CardHeader (Structural), plus CardHeader→CardBody (Allowed from
+    /// CSS layout). Without CHP suppression, the grandparent walk would
+    /// generate "CardBody not-in Card, use CardHeader" — but CardBody IS a
+    /// valid direct child of Card.
+    #[test]
+    fn test_invalid_direct_child_suppressed_when_child_has_chp_to_grandparent() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Card".into(), "@patternfly/react-core".into());
+        pkgs.insert("CardHeader".into(), "@patternfly/react-core".into());
+        pkgs.insert("CardBody".into(), "@patternfly/react-core".into());
+        pkgs.insert("CardFooter".into(), "@patternfly/react-core".into());
+
+        let tree = CompositionTree {
+            root: "Card".into(),
+            family_members: vec![
+                "Card".into(),
+                "CardHeader".into(),
+                "CardBody".into(),
+                "CardFooter".into(),
+            ],
+            edges: vec![
+                // Card → CardHeader: Structural (CHP=YES)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Card".into(),
+                    child: "CardHeader".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                    prop_name: None,
+                },
+                // Card → CardBody: Structural (CHP=YES)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Card".into(),
+                    child: "CardBody".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                    prop_name: None,
+                },
+                // Card → CardFooter: Structural (CHP=YES)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "Card".into(),
+                    child: "CardFooter".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                    prop_name: None,
+                },
+                // CardHeader → CardBody: Allowed (CSS layout signal)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "CardHeader".into(),
+                    child: "CardBody".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+                // CardHeader → CardFooter: Allowed (CSS layout signal)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "CardHeader".into(),
+                    child: "CardFooter".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // notParent rules should exist for CardBody, CardFooter, CardHeader
+        // (they all have CHP edges to Card and/or CardHeader).
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("body-in-")),
+            "Expected notParent for CardBody. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("footer-in-")),
+            "Expected notParent for CardFooter. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // invalidDirectChild rules should NOT exist for CardBody/CardFooter
+        // in Card, because they have direct Structural (CHP=YES) edges to
+        // Card. The grandparent walk goes CardBody→CardHeader→Card, but
+        // Card→CardBody is Structural, so it should be suppressed.
+        let invalid_rules: Vec<&KonveyorRule> = rules
+            .iter()
+            .filter(|r| r.rule_id.contains("not-in-card"))
+            .collect();
+        assert!(
+            invalid_rules.is_empty(),
+            "CardBody/CardFooter should NOT get invalidDirectChild for Card \
+             (they have CHP edges to Card). Got: {:?}",
+            invalid_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// The invalidDirectChild grandparent walk should only follow CHP=YES
+    /// parents (Required or Structural) in the first hop. Allowed parents
+    /// (CSS descendant matches between peer components) should NOT be walked
+    /// because they create false intermediate paths.
+    ///
+    /// Example: DescriptionList has Group→Term [Allowed] and Group→Description
+    /// [Structural]. Term→Description [Allowed] from CSS `.term .text`. Without
+    /// CHP filtering, the walk goes Description→Term(Allowed)→TermHelpText
+    /// (Allowed), generating "Description not-in TermHelpText, use Term" — but
+    /// Term and Description are peers, not parent-child.
+    #[test]
+    fn test_invalid_direct_child_skips_allowed_first_hop() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("DL".into(), "@patternfly/react-core".into());
+        pkgs.insert("DLGroup".into(), "@patternfly/react-core".into());
+        pkgs.insert("DLTerm".into(), "@patternfly/react-core".into());
+        pkgs.insert("DLTermHelp".into(), "@patternfly/react-core".into());
+        pkgs.insert("DLDesc".into(), "@patternfly/react-core".into());
+
+        let tree = CompositionTree {
+            root: "DL".into(),
+            family_members: vec![
+                "DL".into(),
+                "DLGroup".into(),
+                "DLTerm".into(),
+                "DLTermHelp".into(),
+                "DLDesc".into(),
+            ],
+            edges: vec![
+                // DL → DLGroup: Required
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "DL".into(),
+                    child: "DLGroup".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // DLGroup → DLDesc: Structural (CHP=YES — real parent)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "DLGroup".into(),
+                    child: "DLDesc".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                    prop_name: None,
+                },
+                // DLGroup → DLTerm: Allowed (CSS noise — peer)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "DLGroup".into(),
+                    child: "DLTerm".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+                // DLGroup → DLTermHelp: Allowed (CSS noise — peer)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "DLGroup".into(),
+                    child: "DLTermHelp".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+                // DLTerm → DLDesc: Allowed (CSS descendant noise — peers!)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "DLTerm".into(),
+                    child: "DLDesc".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+                // DLTermHelp → DLDesc: Allowed (CSS descendant noise — peers!)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "DLTermHelp".into(),
+                    child: "DLDesc".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+                // DLTermHelp → DLTerm: Allowed (CSS descendant noise — peers!)
+                semver_analyzer_core::types::sd::CompositionEdge {
+                    parent: "DLTermHelp".into(),
+                    child: "DLTerm".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+
+        // Should have "DLDesc not-in DL, use DLGroup" (valid — CHP first hop
+        // through DLGroup, then DL as grandparent)
+        assert!(
+            rules.iter().any(|r| r.rule_id.contains("desc-not-in-dl")),
+            "Expected valid invalidDirectChild for DLDesc in DL. Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
+        );
+
+        // Should NOT have "DLDesc not-in DLTermHelp, use DLTerm" — the first
+        // hop DLTerm→DLDesc is Allowed (CSS noise between peers), so the
+        // grandparent walk should skip it.
+        let false_rule = rules.iter().any(|r| {
+            r.rule_id.contains("desc-not-in-dlterm") || r.rule_id.contains("desc-not-in-termhelp")
+        });
+        assert!(
+            !false_rule,
+            "Should NOT generate invalidDirectChild between peer components \
+             (DLDesc not-in DLTermHelp via Allowed first hop). Got: {:?}",
+            rules
+                .iter()
+                .filter(|r| r.rule_id.contains("not-in"))
+                .map(|r| &r.rule_id)
+                .collect::<Vec<_>>()
         );
     }
 

@@ -1461,9 +1461,29 @@ fn generate_conformance_checks(
             });
         }
 
-        // InvalidDirectChild: child should not be a direct child of grandparent
+        // InvalidDirectChild: child should not be a direct child of grandparent.
+        //
+        // Suppress when the child already has a CHP edge (Required or
+        // Structural) to the grandparent. In that case the child IS a
+        // valid direct child of the grandparent, and the notParent rule
+        // already provides correct placement guidance. Emitting an
+        // invalidDirectChild rule would contradict it (e.g., saying
+        // "CardBody should not be directly in Card" when Card→CardBody
+        // is a Structural edge).
         if let Some(grandparents) = child_to_parents.get(edge.parent.as_str()) {
             for grandparent in grandparents {
+                // Check if child has a CHP edge to this grandparent
+                let child_has_chp_to_grandparent = tree.edges.iter().any(|e| {
+                    e.child == edge.child
+                        && e.parent == *grandparent
+                        && e.relationship
+                            != semver_analyzer_core::types::sd::ChildRelationship::Internal
+                        && e.strength.child_requires_parent()
+                });
+                if child_has_chp_to_grandparent {
+                    continue;
+                }
+
                 checks.push(ConformanceCheck {
                     family: family.to_string(),
                     check_type: ConformanceCheckType::InvalidDirectChild {

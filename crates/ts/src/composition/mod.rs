@@ -1096,6 +1096,16 @@ pub fn build_composition_tree_v2(
                         let after = &ev[start + 19..];
                         if let Some(end) = after.find('>') {
                             let tag = &after[..end];
+                            // Note: `select` is intentionally excluded.
+                            // `is_pure_container_tag()` already excludes it
+                            // because `<select>` can be empty and `<option>`
+                            // can appear directly in `<select>` without
+                            // `<optgroup>`. Upgrading edges from `<select>`
+                            // parents would make FormSelectOptionGroup
+                            // Required (PMC=YES) when it should be Structural
+                            // (PMC=NO) — optgroup is an optional wrapper.
+                            // `optgroup` is kept because an `<optgroup>`
+                            // without `<option>` children is meaningless.
                             if matches!(
                                 tag,
                                 "ul" | "ol"
@@ -1105,7 +1115,6 @@ pub fn build_composition_tree_v2(
                                     | "tr"
                                     | "dl"
                                     | "table"
-                                    | "select"
                                     | "optgroup"
                             ) {
                                 parent_has_pure_container.insert(edge.parent.clone());
@@ -1612,6 +1621,67 @@ fn infer_dom_nesting(
 /// `rendered_components`) and another family member calls `useContext(XContext)`
 /// (visible in its `consumed_contexts`), the consumer must be nested somewhere
 /// under the provider.
+/// Check whether `child_name` is prop-passed to a family member OTHER than
+/// `provider_name`. Uses the same name-matching heuristic as Step 8.7:
+/// strip the parent's name prefix from the child, then compare the suffix
+/// against the parent's ReactNode/ReactElement props (bidirectional
+/// starts_with, case-insensitive).
+///
+/// This is used by Step 6 to skip context edges when the child's structural
+/// home is a different component (via a named prop), and the context
+/// dependency is merely ambient (the child sits inside the provider
+/// transitively through the prop parent).
+fn is_prop_passed_to_other_parent(
+    child_name: &str,
+    provider_name: &str,
+    profiles: &HashMap<String, ComponentSourceProfile>,
+    family_exports: &[String],
+) -> bool {
+    let child_lower = child_name.to_lowercase();
+
+    for parent_name in family_exports {
+        if parent_name == child_name || parent_name == provider_name {
+            continue;
+        }
+        let Some(parent_prof) = profiles.get(parent_name) else {
+            continue;
+        };
+
+        let parent_lower = parent_name.to_lowercase();
+
+        // Strip parent name prefix from child to get suffix
+        let suffix = if child_lower.starts_with(&parent_lower) {
+            &child_lower[parent_lower.len()..]
+        } else {
+            continue;
+        };
+
+        if suffix.is_empty() {
+            continue;
+        }
+
+        // Check parent's prop_types for ReactNode/ReactElement props
+        for (prop_name, prop_type) in &parent_prof.prop_types {
+            if prop_name == "children" {
+                continue;
+            }
+            if !prop_type.contains("ReactNode")
+                && !prop_type.contains("ReactElement")
+                && !prop_type.contains("ComponentType")
+            {
+                continue;
+            }
+
+            let prop_lower = prop_name.to_lowercase();
+
+            if suffix.starts_with(&prop_lower) || prop_lower.starts_with(suffix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn infer_context_nesting(
     tree: &mut CompositionTree,
     edge_map: &mut HashMap<(String, String), usize>,
@@ -1696,6 +1766,32 @@ fn infer_context_nesting(
                         .iter()
                         .any(|(p, c, _)| p == provider_name && c == child_name)
                     {
+                        continue;
+                    }
+
+                    // Skip context edges when the child is prop-passed to a
+                    // different parent. The context dependency is ambient —
+                    // the child lives inside the prop parent, which sits
+                    // inside the provider transitively. Creating a direct
+                    // context edge would produce a wrong-parent relationship
+                    // after collapse_internal_nodes.
+                    //
+                    // Example: AlertActionCloseButton consumes AlertGroupContext
+                    // (provided by AlertGroupInline), but its structural home is
+                    // Alert (via actionClose prop). Without this filter, collapse
+                    // creates AlertGroup→AlertActionCloseButton (wrong parent).
+                    if is_prop_passed_to_other_parent(
+                        child_name,
+                        provider_name,
+                        profiles,
+                        family_exports,
+                    ) {
+                        debug!(
+                            provider = %provider_name,
+                            consumer = %child_name,
+                            context = %consumed_ctx,
+                            "skipping context edge — child is prop-passed to another parent"
+                        );
                         continue;
                     }
 
@@ -1829,7 +1925,14 @@ fn suppress_root_edges_with_intermediate(tree: &mut CompositionTree) {
     // Only suppress root edges when the intermediate is at least as
     // strong — a Required root edge (e.g., CSS `>`) should not be
     // suppressed by an Allowed intermediate (e.g., layout_children).
+    //
+    // Also track which non-root parents serve as intermediates for each
+    // child. This is needed to verify that at least one intermediate
+    // has a CHP edge from the root (is structurally required, not
+    // optional). If all intermediates are Allowed from the root, the
+    // child can bypass them and the root→child edge should be preserved.
     let mut children_max_strength: HashMap<String, EdgeStrength> = HashMap::new();
+    let mut children_intermediate_parents: HashMap<String, Vec<String>> = HashMap::new();
     for edge in &tree.edges {
         if edge.parent != *root && matches!(edge.relationship, ChildRelationship::DirectChild) {
             let entry = children_max_strength
@@ -1838,8 +1941,41 @@ fn suppress_root_edges_with_intermediate(tree: &mut CompositionTree) {
             if edge.strength > *entry {
                 *entry = edge.strength.clone();
             }
+            children_intermediate_parents
+                .entry(edge.child.clone())
+                .or_default()
+                .push(edge.parent.clone());
         }
     }
+
+    // Children where the root has a CHP edge (Required or Structural).
+    // These are children the root structurally contains — if an
+    // intermediate parent is among these, it is NOT optional.
+    let root_chp_children: HashSet<String> = tree
+        .edges
+        .iter()
+        .filter(|e| {
+            e.parent == *root
+                && e.relationship != ChildRelationship::Internal
+                && e.strength.child_requires_parent()
+        })
+        .map(|e| e.child.clone())
+        .collect();
+
+    // Children where the root has a PMC edge (Required or Wrapper).
+    // These are children the root REQUIRES — the intermediate is
+    // always present. Used to distinguish mandatory intermediates
+    // (Table→Tbody) from optional ones (FormSelect→FormSelectOptionGroup).
+    let root_pmc_children: HashSet<String> = tree
+        .edges
+        .iter()
+        .filter(|e| {
+            e.parent == *root
+                && e.relationship != ChildRelationship::Internal
+                && e.strength.parent_requires_child()
+        })
+        .map(|e| e.child.clone())
+        .collect();
 
     // Collect Required children of the root. These are structural wrappers
     // that are always present. If such a wrapper has ANY edge to a child
@@ -1883,8 +2019,84 @@ fn suppress_root_edges_with_intermediate(tree: &mut CompositionTree) {
         }
 
         // Path 1: Suppress when intermediate is at least as strong as root edge
+        // AND at least one intermediate parent has a CHP edge from the root
+        // (meaning the intermediate is structurally required, not optional).
+        //
+        // If ALL intermediate parents have only Allowed edges from the root,
+        // the intermediates are optional wrappers — the child can bypass
+        // them and go directly into the root. Preserving the root→child
+        // edge ensures the child appears as a valid direct child.
+        //
+        // Example (suppress): Menu→MenuList [Structural], MenuList→MenuItem
+        // [Required]. MenuList has CHP from root → MenuItem must go through
+        // MenuList → suppress root→MenuItem.
+        //
+        // Example (preserve): SimpleList→SimpleListGroup [Allowed],
+        // SimpleListGroup→SimpleListItem [Required]. SimpleListGroup has NO
+        // CHP from root → SimpleListItem can bypass Group → preserve
+        // root→SimpleListItem.
         if let Some(intermediate_strength) = children_max_strength.get(&edge.child) {
             if *intermediate_strength >= edge.strength {
+                // Check if any intermediate parent is structurally required
+                // from the root (has a CHP edge from root).
+                let any_intermediate_required = children_intermediate_parents
+                    .get(&edge.child)
+                    .map(|parents| parents.iter().any(|p| root_chp_children.contains(p)))
+                    .unwrap_or(false);
+
+                if !any_intermediate_required {
+                    tracing::debug!(
+                        root = %root,
+                        child = %edge.child,
+                        root_strength = ?edge.strength,
+                        intermediate_strength = ?intermediate_strength,
+                        "preserving root edge — all intermediate parents are optional (Allowed from root)"
+                    );
+                    return true;
+                }
+
+                // Preserve DOM nesting edges when the intermediate is NOT
+                // PMC=YES from the root. A DOM nesting edge means the root's
+                // HTML element directly accepts this child type (e.g.,
+                // <select> directly contains <option>). If the intermediate
+                // is optional (not PMC), the child can bypass it.
+                //
+                // Example (preserve): FormSelect wraps children in <select>,
+                // FormSelectOption renders <option>. FormSelectOptionGroup
+                // (<optgroup>) is Structural from root but NOT PMC — options
+                // can go directly in <select> without <optgroup>.
+                //
+                // Example (suppress): Table wraps children in <table>, Tr
+                // renders <tr>. Tbody IS PMC from root (Required) — <tr>
+                // must go through <tbody>.
+                //
+                // Non-DOM edges (context, CSS, BEM) are always suppressed
+                // when an intermediate with CHP exists, because those edges
+                // represent transitive dependencies, not direct containment.
+                let is_dom_nesting = edge
+                    .bem_evidence
+                    .as_ref()
+                    .map(|ev| ev.contains("DOM nesting:"))
+                    .unwrap_or(false);
+
+                if is_dom_nesting {
+                    let any_intermediate_pmc = children_intermediate_parents
+                        .get(&edge.child)
+                        .map(|parents| parents.iter().any(|p| root_pmc_children.contains(p)))
+                        .unwrap_or(false);
+
+                    if !any_intermediate_pmc {
+                        tracing::debug!(
+                            root = %root,
+                            child = %edge.child,
+                            root_strength = ?edge.strength,
+                            intermediate_strength = ?intermediate_strength,
+                            "preserving root DOM nesting edge — intermediate is not PMC from root"
+                        );
+                        return true;
+                    }
+                }
+
                 tracing::debug!(
                     root = %root,
                     child = %edge.child,
@@ -1900,17 +2112,22 @@ fn suppress_root_edges_with_intermediate(tree: &mut CompositionTree) {
         // an edge to this child. The wrapper is always present (PMC=YES
         // from root), so the child goes through it — the root's direct
         // edge is a DOM shortcut bypassing the API wrapper.
+        //
+        // Example: DescriptionList has Required edges to both DLGroup
+        // (the wrapper) and DLTerm (via DOM <dl>→<dt> nesting). DLGroup
+        // also has an edge to DLTerm. The root→DLTerm edge is a DOM
+        // shortcut that bypasses the DLGroup wrapper and should be
+        // suppressed. DLGroup itself is never in wrapper_grandchildren
+        // (no other wrapper has an edge to it), so the root→DLGroup
+        // edge is preserved.
         if wrapper_grandchildren.contains(&edge.child) {
-            // Don't suppress the edge TO the wrapper itself
-            if !required_wrapper_children.contains(&edge.child) {
-                tracing::debug!(
-                    root = %root,
-                    child = %edge.child,
-                    root_strength = ?edge.strength,
-                    "suppressing root edge — required wrapper provides path to child"
-                );
-                return false;
-            }
+            tracing::debug!(
+                root = %root,
+                child = %edge.child,
+                root_strength = ?edge.strength,
+                "suppressing root edge — required wrapper provides path to child"
+            );
+            return false;
         }
 
         true
@@ -1990,6 +2207,157 @@ mod tests {
             .contains("Context nesting"));
     }
 
+    /// AlertActionCloseButton scenario: the child consumes AlertGroupContext
+    /// (provided by AlertGroupInline), but is prop-passed to Alert via the
+    /// `actionClose` prop. The context edge AlertGroupInline→AlertActionCloseButton
+    /// should be skipped because the child's structural home is Alert.
+    #[test]
+    fn test_context_nesting_skipped_for_prop_passed_child() {
+        // AlertGroupInline provides AlertGroupContext
+        let mut alert_group_inline = make_profile("AlertGroupInline");
+        alert_group_inline.rendered_components = vec!["AlertGroupContext.Provider".into()];
+
+        // AlertActionCloseButton consumes AlertGroupContext
+        let mut close_btn = make_profile("AlertActionCloseButton");
+        close_btn.consumed_contexts = vec!["AlertGroupContext".into()];
+
+        // Alert has actionClose: ReactNode prop that matches AlertActionCloseButton
+        let mut alert = make_profile("Alert");
+        alert.has_children_prop = true;
+        alert
+            .prop_types
+            .insert("actionClose".into(), "React.ReactNode".into());
+
+        let mut profiles = HashMap::new();
+        profiles.insert("AlertGroupInline".into(), alert_group_inline);
+        profiles.insert("AlertActionCloseButton".into(), close_btn);
+        profiles.insert("Alert".into(), alert);
+
+        let family = vec![
+            "Alert".into(),
+            "AlertGroupInline".into(),
+            "AlertActionCloseButton".into(),
+        ];
+
+        let mut tree = CompositionTree {
+            root: "Alert".into(),
+            family_members: family.clone(),
+            edges: vec![],
+        };
+        let mut edge_map = HashMap::new();
+
+        infer_context_nesting(&mut tree, &mut edge_map, &profiles, &family);
+
+        // AlertGroupInline → AlertActionCloseButton should NOT exist
+        // (child is prop-passed to Alert via actionClose)
+        assert!(
+            !tree
+                .edges
+                .iter()
+                .any(|e| e.parent == "AlertGroupInline" && e.child == "AlertActionCloseButton"),
+            "Context edge to prop-passed child should be skipped. Got edges: {:?}",
+            tree.edges
+        );
+    }
+
+    /// MenuItem → MenuItemAction scenario: MenuItemAction consumes MenuContext
+    /// (provided by Menu), but is prop-passed to MenuItem via the `actions` prop.
+    /// The context edge Menu→MenuItemAction should be skipped.
+    #[test]
+    fn test_context_nesting_skipped_for_menu_item_action() {
+        // Menu provides MenuContext
+        let mut menu = make_profile("Menu");
+        menu.has_children_prop = true;
+        menu.rendered_components = vec!["MenuContext.Provider".into()];
+
+        // MenuItemAction consumes MenuContext
+        let mut action = make_profile("MenuItemAction");
+        action.consumed_contexts = vec!["MenuContext".into()];
+
+        // MenuItem has actions: ReactNode prop AND consumes MenuContext
+        let mut menu_item = make_profile("MenuItem");
+        menu_item.has_children_prop = true;
+        menu_item.consumed_contexts = vec!["MenuContext".into()];
+        menu_item
+            .prop_types
+            .insert("actions".into(), "React.ReactNode".into());
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Menu".into(), menu);
+        profiles.insert("MenuItemAction".into(), action);
+        profiles.insert("MenuItem".into(), menu_item);
+
+        let family = vec!["Menu".into(), "MenuItem".into(), "MenuItemAction".into()];
+
+        let mut tree = CompositionTree {
+            root: "Menu".into(),
+            family_members: family.clone(),
+            edges: vec![],
+        };
+        let mut edge_map = HashMap::new();
+
+        infer_context_nesting(&mut tree, &mut edge_map, &profiles, &family);
+
+        // Menu → MenuItemAction should NOT exist
+        assert!(
+            !tree
+                .edges
+                .iter()
+                .any(|e| e.parent == "Menu" && e.child == "MenuItemAction"),
+            "Context edge to prop-passed child should be skipped. Got edges: {:?}",
+            tree.edges
+        );
+
+        // Menu → MenuItem should still exist (MenuItem is NOT prop-passed,
+        // it's a regular context consumer)
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "Menu" && e.child == "MenuItem"),
+            "Menu → MenuItem context edge should still exist. Got edges: {:?}",
+            tree.edges
+        );
+    }
+
+    /// Ensure that a regular context consumer (not prop-passed) still gets
+    /// a context edge even when the prop-passed filter is active.
+    #[test]
+    fn test_context_nesting_preserved_for_non_prop_passed_child() {
+        // Tabs provides TabsContext
+        let mut tabs = make_profile("Tabs");
+        tabs.has_children_prop = true;
+        tabs.rendered_components = vec!["TabsContext.Provider".into()];
+
+        // Tab consumes TabsContext (NOT prop-passed — it's a direct child)
+        let mut tab = make_profile("Tab");
+        tab.has_children_prop = true;
+        tab.consumed_contexts = vec!["TabsContext".into()];
+
+        let mut profiles = HashMap::new();
+        profiles.insert("Tabs".into(), tabs);
+        profiles.insert("Tab".into(), tab);
+
+        let family = vec!["Tabs".into(), "Tab".into()];
+
+        let mut tree = CompositionTree {
+            root: "Tabs".into(),
+            family_members: family.clone(),
+            edges: vec![],
+        };
+        let mut edge_map = HashMap::new();
+
+        infer_context_nesting(&mut tree, &mut edge_map, &profiles, &family);
+
+        // Tabs → Tab should exist (Tab is not prop-passed to anything)
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "Tabs" && e.child == "Tab"),
+            "Tabs → Tab context edge should exist. Got edges: {:?}",
+            tree.edges
+        );
+    }
+
     #[test]
     fn test_dom_nesting_ul_li() {
         // MenuList wraps children in <ul>, MenuItem renders <li> as root.
@@ -2035,7 +2403,8 @@ mod tests {
     fn test_suppress_root_edges_with_intermediate() {
         // Simulate Accordion: root has BEM edges to AccordionContent and
         // AccordionToggle, but context nesting proves they go inside
-        // AccordionItem.
+        // AccordionItem. AccordionItem has a Required edge from root
+        // (CHP=YES), making it a structurally required intermediate.
         let mut tree = CompositionTree {
             root: "Accordion".into(),
             family_members: vec![
@@ -2050,28 +2419,28 @@ mod tests {
                     parent: "Accordion".into(),
                     child: "AccordionContent".into(),
                     relationship: ChildRelationship::DirectChild,
-                    required: true,
+                    required: false,
                     bem_evidence: Some("BEM element of accordion block".into()),
-                    strength: EdgeStrength::Allowed,
+                    strength: EdgeStrength::Structural,
                     prop_name: None,
                 },
                 CompositionEdge {
                     parent: "Accordion".into(),
                     child: "AccordionToggle".into(),
                     relationship: ChildRelationship::DirectChild,
-                    required: true,
+                    required: false,
                     bem_evidence: Some("BEM element of accordion block".into()),
-                    strength: EdgeStrength::Allowed,
+                    strength: EdgeStrength::Structural,
                     prop_name: None,
                 },
-                // Correct root edge (no intermediate for AccordionItem)
+                // Correct root edge — AccordionItem is CHP from root
                 CompositionEdge {
                     parent: "Accordion".into(),
                     child: "AccordionItem".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: true,
-                    bem_evidence: Some("BEM element of accordion block".into()),
-                    strength: EdgeStrength::Allowed,
+                    bem_evidence: Some("DOM nesting + context".into()),
+                    strength: EdgeStrength::Required,
                     prop_name: None,
                 },
                 // Context-derived intermediate edges (should be kept)
@@ -2081,7 +2450,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: Some("Context nesting".into()),
-                    strength: EdgeStrength::Allowed,
+                    strength: EdgeStrength::Structural,
                     prop_name: None,
                 },
                 CompositionEdge {
@@ -2090,7 +2459,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: Some("Context nesting".into()),
-                    strength: EdgeStrength::Allowed,
+                    strength: EdgeStrength::Structural,
                     prop_name: None,
                 },
             ],
@@ -2194,10 +2563,12 @@ mod tests {
     }
 
     #[test]
-    fn test_suppress_preserves_stronger_root_edge() {
-        // Card scenario: root→child is Required (CSS `>`), but
-        // intermediate→child is Allowed (layout_children). The root
-        // edge should NOT be suppressed because it's stronger.
+    fn test_suppress_preserves_structural_root_edges_card() {
+        // Card scenario (matches real v6 tree): root→child edges are
+        // Structural (CHP=YES, PMC=NO) from CSS `>` selectors.
+        // CardHeader→CardBody/CardFooter are Allowed from CSS layout.
+        // Path 1 correctly preserves root edges (Structural > Allowed).
+        // Path 2 never fires because no root edge has PMC=YES.
         let mut tree = CompositionTree {
             root: "Card".into(),
             family_members: vec![
@@ -2207,34 +2578,34 @@ mod tests {
                 "CardFooter".into(),
             ],
             edges: vec![
-                // Root → CardHeader (Required, CSS >) — no intermediate, kept
+                // Root → CardHeader (Structural, CSS > + context)
                 CompositionEdge {
                     parent: "Card".into(),
                     child: "CardHeader".into(),
                     relationship: ChildRelationship::DirectChild,
-                    required: true,
+                    required: false,
                     bem_evidence: Some("CSS direct child: > .header".into()),
-                    strength: EdgeStrength::Required,
+                    strength: EdgeStrength::Structural,
                     prop_name: None,
                 },
-                // Root → CardBody (Required, CSS >) — has weaker intermediate
+                // Root → CardBody (Structural, CSS >)
                 CompositionEdge {
                     parent: "Card".into(),
                     child: "CardBody".into(),
                     relationship: ChildRelationship::DirectChild,
-                    required: true,
+                    required: false,
                     bem_evidence: Some("CSS direct child: > .body".into()),
-                    strength: EdgeStrength::Required,
+                    strength: EdgeStrength::Structural,
                     prop_name: None,
                 },
-                // Root → CardFooter (Required, CSS >) — has weaker intermediate
+                // Root → CardFooter (Structural, CSS >)
                 CompositionEdge {
                     parent: "Card".into(),
                     child: "CardFooter".into(),
                     relationship: ChildRelationship::DirectChild,
-                    required: true,
+                    required: false,
                     bem_evidence: Some("CSS direct child: > .footer".into()),
-                    strength: EdgeStrength::Required,
+                    strength: EdgeStrength::Structural,
                     prop_name: None,
                 },
                 // Intermediate: CardHeader → CardBody (Allowed, layout_children)
@@ -2270,20 +2641,20 @@ mod tests {
             "Card → CardHeader should be kept"
         );
 
-        // Card → CardBody should be KEPT (Required root > Allowed intermediate)
+        // Card → CardBody should be KEPT (Structural root > Allowed intermediate)
         assert!(
             tree.edges
                 .iter()
                 .any(|e| e.parent == "Card" && e.child == "CardBody"),
-            "Card → CardBody should be kept (Required root edge is stronger than Allowed intermediate)"
+            "Card → CardBody should be kept (Structural root edge is stronger than Allowed intermediate)"
         );
 
-        // Card → CardFooter should be KEPT (Required root > Allowed intermediate)
+        // Card → CardFooter should be KEPT (Structural root > Allowed intermediate)
         assert!(
             tree.edges
                 .iter()
                 .any(|e| e.parent == "Card" && e.child == "CardFooter"),
-            "Card → CardFooter should be kept (Required root edge is stronger than Allowed intermediate)"
+            "Card → CardFooter should be kept (Structural root edge is stronger than Allowed intermediate)"
         );
 
         // Intermediate edges should also be kept
@@ -2301,6 +2672,165 @@ mod tests {
         );
 
         assert_eq!(tree.edges.len(), 5, "All 5 edges should be preserved");
+    }
+
+    /// DescriptionList scenario: root has Required DOM nesting edges to
+    /// leaf children (<dl>→<dt>, <dl>→<dd>) that bypass the intermediate
+    /// DescriptionListGroup wrapper. The root also has a Required edge to
+    /// the Group wrapper, and the Group has edges to the same leaf children.
+    /// The DOM shortcut edges should be suppressed — the leaf children
+    /// are reachable through the Group wrapper.
+    #[test]
+    fn test_suppress_dom_shortcut_edges_description_list() {
+        let mut tree = CompositionTree {
+            root: "DescriptionList".into(),
+            family_members: vec![
+                "DescriptionList".into(),
+                "DescriptionListGroup".into(),
+                "DescriptionListTerm".into(),
+                "DescriptionListDescription".into(),
+                "DescriptionListTermHelpText".into(),
+            ],
+            edges: vec![
+                // Root → Group (Required, CSS grid) — the API wrapper, must be kept
+                CompositionEdge {
+                    parent: "DescriptionList".into(),
+                    child: "DescriptionListGroup".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: Some("CSS grid".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Root → Term (Required, DOM nesting <dl>→<dt>) — DOM shortcut,
+                // should be suppressed because Group provides path
+                CompositionEdge {
+                    parent: "DescriptionList".into(),
+                    child: "DescriptionListTerm".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Root → Description (Required, DOM nesting <dl>→<dd>) — same
+                CompositionEdge {
+                    parent: "DescriptionList".into(),
+                    child: "DescriptionListDescription".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Root → TermHelpText (Required, DOM nesting <dl>→<dt>) — same
+                CompositionEdge {
+                    parent: "DescriptionList".into(),
+                    child: "DescriptionListTermHelpText".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Group → Term (Allowed, CSS implicit grid child)
+                CompositionEdge {
+                    parent: "DescriptionListGroup".into(),
+                    child: "DescriptionListTerm".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+                // Group → Description (Structural, CSS implicit grid child)
+                CompositionEdge {
+                    parent: "DescriptionListGroup".into(),
+                    child: "DescriptionListDescription".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Structural,
+                    prop_name: None,
+                },
+                // Group → TermHelpText (Allowed, CSS implicit grid child)
+                CompositionEdge {
+                    parent: "DescriptionListGroup".into(),
+                    child: "DescriptionListTermHelpText".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        suppress_root_edges_with_intermediate(&mut tree);
+
+        // Root → Group should be kept (it's the wrapper itself)
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "DescriptionList" && e.child == "DescriptionListGroup"),
+            "DescriptionList → DescriptionListGroup should be kept (API wrapper)"
+        );
+
+        // Root → Term should be suppressed (Group provides path)
+        assert!(
+            !tree
+                .edges
+                .iter()
+                .any(|e| e.parent == "DescriptionList" && e.child == "DescriptionListTerm"),
+            "DescriptionList → DescriptionListTerm should be suppressed (DOM shortcut)"
+        );
+
+        // Root → Description should be suppressed
+        assert!(
+            !tree
+                .edges
+                .iter()
+                .any(|e| e.parent == "DescriptionList" && e.child == "DescriptionListDescription"),
+            "DescriptionList → DescriptionListDescription should be suppressed (DOM shortcut)"
+        );
+
+        // Root → TermHelpText should be suppressed
+        assert!(
+            !tree
+                .edges
+                .iter()
+                .any(|e| e.parent == "DescriptionList" && e.child == "DescriptionListTermHelpText"),
+            "DescriptionList → DescriptionListTermHelpText should be suppressed (DOM shortcut)"
+        );
+
+        // Group's intermediate edges should all be kept
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "DescriptionListGroup" && e.child == "DescriptionListTerm"),
+            "Group → Term intermediate edge should be kept"
+        );
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "DescriptionListGroup"
+                    && e.child == "DescriptionListDescription"),
+            "Group → Description intermediate edge should be kept"
+        );
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "DescriptionListGroup"
+                    && e.child == "DescriptionListTermHelpText"),
+            "Group → TermHelpText intermediate edge should be kept"
+        );
+
+        // 4 edges remaining: 1 root→Group + 3 Group→children
+        assert_eq!(
+            tree.edges.len(),
+            4,
+            "Should have 4 edges remaining (1 root→Group + 3 Group→children)"
+        );
     }
 
     /// Verify that BEM edges are created with required=false.
@@ -3788,6 +4318,334 @@ mod tests {
             5,
             "All members should be retained. Members: {:?}",
             tree.family_members
+        );
+    }
+
+    /// When an intermediate parent has only an Allowed edge from the root
+    /// (meaning it is optional), the root→child edge should be preserved.
+    /// The child can bypass the optional intermediate and go directly into
+    /// the root.
+    ///
+    /// Pattern: SimpleList→SimpleListGroup [Allowed], Group→Item [Required],
+    /// SimpleList→Item [Structural from context]. The Group is optional, so
+    /// the root→Item edge should survive suppress_root_edges_with_intermediate.
+    #[test]
+    fn test_suppress_preserves_root_edge_when_intermediate_is_optional() {
+        use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree, EdgeStrength};
+
+        let mut tree = CompositionTree {
+            root: "SimpleList".into(),
+            family_members: vec![
+                "SimpleList".into(),
+                "SimpleListGroup".into(),
+                "SimpleListItem".into(),
+            ],
+            edges: vec![
+                // Root → Group: Allowed (group is optional)
+                CompositionEdge {
+                    parent: "SimpleList".into(),
+                    child: "SimpleListGroup".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+                // Group → Item: Required (DOM <ul>→<li>)
+                CompositionEdge {
+                    parent: "SimpleListGroup".into(),
+                    child: "SimpleListItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Root → Item: Structural (from context dependency)
+                CompositionEdge {
+                    parent: "SimpleList".into(),
+                    child: "SimpleListItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Structural,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        suppress_root_edges_with_intermediate(&mut tree);
+
+        // Root → Item should be PRESERVED (Group is optional from root)
+        let root_to_item = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "SimpleList" && e.child == "SimpleListItem");
+        assert!(
+            root_to_item,
+            "Root→Item should be preserved when intermediate (Group) is optional. Edges: {:?}",
+            tree.edges
+        );
+
+        // Root → Group should still exist (not affected)
+        let root_to_group = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "SimpleList" && e.child == "SimpleListGroup");
+        assert!(
+            root_to_group,
+            "Root→Group should be preserved. Edges: {:?}",
+            tree.edges
+        );
+    }
+
+    /// When an intermediate parent has a CHP edge from the root (Structural
+    /// or Required), the root→child edge SHOULD be suppressed — the
+    /// intermediate is structurally required and the child must go through it.
+    ///
+    /// Pattern: Menu→MenuList [Structural], MenuList→MenuItem [Required],
+    /// Menu→MenuItem [Structural from context]. MenuList has CHP from root,
+    /// so root→MenuItem should be suppressed.
+    #[test]
+    fn test_suppress_removes_root_edge_when_intermediate_is_required() {
+        use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree, EdgeStrength};
+
+        let mut tree = CompositionTree {
+            root: "Menu".into(),
+            family_members: vec!["Menu".into(), "MenuList".into(), "MenuItem".into()],
+            edges: vec![
+                // Root → MenuList: Structural (CHP=YES, not optional)
+                CompositionEdge {
+                    parent: "Menu".into(),
+                    child: "MenuList".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Structural,
+                    prop_name: None,
+                },
+                // MenuList → MenuItem: Required (DOM <ul>→<li>)
+                CompositionEdge {
+                    parent: "MenuList".into(),
+                    child: "MenuItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Root → MenuItem: Structural (from context)
+                CompositionEdge {
+                    parent: "Menu".into(),
+                    child: "MenuItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: None,
+                    strength: EdgeStrength::Structural,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        suppress_root_edges_with_intermediate(&mut tree);
+
+        // Root → MenuItem should be SUPPRESSED (MenuList is CHP from root)
+        let root_to_item = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Menu" && e.child == "MenuItem");
+        assert!(
+            !root_to_item,
+            "Root→MenuItem should be suppressed when intermediate (MenuList) has CHP from root. Edges: {:?}",
+            tree.edges
+        );
+
+        // Root → MenuList should still exist
+        let root_to_list = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Menu" && e.child == "MenuList");
+        assert!(
+            root_to_list,
+            "Root→MenuList should be preserved. Edges: {:?}",
+            tree.edges
+        );
+    }
+
+    /// DOM nesting edges from the root should be preserved when the
+    /// intermediate parent is NOT PMC=YES from the root (the intermediate
+    /// is an optional wrapper, not a mandatory one).
+    ///
+    /// Pattern: FormSelect→FormSelectOptionGroup [Structural, CHP=YES but
+    /// PMC=NO], FormSelectOptionGroup→FormSelectOption [Required],
+    /// FormSelect→FormSelectOption [Structural, DOM nesting]. The optgroup
+    /// wrapper is optional — options can go directly in <select>.
+    #[test]
+    fn test_suppress_preserves_dom_nesting_edge_when_intermediate_not_pmc() {
+        use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree, EdgeStrength};
+
+        let mut tree = CompositionTree {
+            root: "FormSelect".into(),
+            family_members: vec![
+                "FormSelect".into(),
+                "FormSelectOptionGroup".into(),
+                "FormSelectOption".into(),
+            ],
+            edges: vec![
+                // Root → OptGroup: Structural (CHP=YES, PMC=NO — optional wrapper)
+                CompositionEdge {
+                    parent: "FormSelect".into(),
+                    child: "FormSelectOptionGroup".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some(
+                        "DOM nesting: FormSelect wraps children in <select>, \
+                         FormSelectOptionGroup renders <optgroup> as root"
+                            .into(),
+                    ),
+                    strength: EdgeStrength::Structural,
+                    prop_name: None,
+                },
+                // OptGroup → Option: Required (PMC=YES — optgroup must contain options)
+                CompositionEdge {
+                    parent: "FormSelectOptionGroup".into(),
+                    child: "FormSelectOption".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: Some(
+                        "DOM nesting: FormSelectOptionGroup wraps children in <optgroup>, \
+                         FormSelectOption renders <option> as root"
+                            .into(),
+                    ),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Root → Option: Structural (DOM nesting — <select> directly accepts <option>)
+                CompositionEdge {
+                    parent: "FormSelect".into(),
+                    child: "FormSelectOption".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some(
+                        "DOM nesting: FormSelect wraps children in <select>, \
+                         FormSelectOption renders <option> as root"
+                            .into(),
+                    ),
+                    strength: EdgeStrength::Structural,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        suppress_root_edges_with_intermediate(&mut tree);
+
+        // Root → FormSelectOption should be PRESERVED (DOM nesting edge,
+        // intermediate FormSelectOptionGroup is NOT PMC from root)
+        let root_to_option = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "FormSelect" && e.child == "FormSelectOption");
+        assert!(
+            root_to_option,
+            "Root→FormSelectOption DOM nesting edge should be preserved when \
+             intermediate (FormSelectOptionGroup) is not PMC from root. Edges: {:?}",
+            tree.edges
+        );
+
+        // Root → FormSelectOptionGroup should still exist
+        let root_to_group = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "FormSelect" && e.child == "FormSelectOptionGroup");
+        assert!(
+            root_to_group,
+            "Root→FormSelectOptionGroup should be preserved. Edges: {:?}",
+            tree.edges
+        );
+    }
+
+    /// DOM nesting edges from the root SHOULD be suppressed when the
+    /// intermediate parent IS PMC=YES from the root (the intermediate is
+    /// mandatory — the child must go through it).
+    ///
+    /// Pattern: Table→Tbody [Required, PMC=YES], Tbody→Tr [Required],
+    /// Table→Tr [Required, DOM nesting]. Tbody is always present, so
+    /// <tr> must go through <tbody>.
+    #[test]
+    fn test_suppress_removes_dom_nesting_edge_when_intermediate_is_pmc() {
+        use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree, EdgeStrength};
+
+        let mut tree = CompositionTree {
+            root: "Table".into(),
+            family_members: vec!["Table".into(), "Tbody".into(), "Tr".into()],
+            edges: vec![
+                // Root → Tbody: Required (PMC=YES — table must contain tbody)
+                CompositionEdge {
+                    parent: "Table".into(),
+                    child: "Tbody".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: Some(
+                        "DOM nesting: Table wraps children in <table>, \
+                         Tbody renders <tbody> as root"
+                            .into(),
+                    ),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Tbody → Tr: Required
+                CompositionEdge {
+                    parent: "Tbody".into(),
+                    child: "Tr".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: Some(
+                        "DOM nesting: Tbody wraps children in <tbody>, \
+                         Tr renders <tr> as root"
+                            .into(),
+                    ),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Root → Tr: Required (DOM nesting — <table> accepts <tr>)
+                CompositionEdge {
+                    parent: "Table".into(),
+                    child: "Tr".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: Some(
+                        "DOM nesting: Table wraps children in <table>, \
+                         Tr renders <tr> as root"
+                            .into(),
+                    ),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        suppress_root_edges_with_intermediate(&mut tree);
+
+        // Root → Tr should be SUPPRESSED (Tbody is PMC from root)
+        let root_to_tr = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Table" && e.child == "Tr");
+        assert!(
+            !root_to_tr,
+            "Root→Tr should be suppressed when intermediate (Tbody) is PMC from root. Edges: {:?}",
+            tree.edges
+        );
+
+        // Root → Tbody should still exist
+        let root_to_tbody = tree
+            .edges
+            .iter()
+            .any(|e| e.parent == "Table" && e.child == "Tbody");
+        assert!(
+            root_to_tbody,
+            "Root→Tbody should be preserved. Edges: {:?}",
+            tree.edges
         );
     }
 }
