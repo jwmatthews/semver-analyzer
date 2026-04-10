@@ -63,7 +63,10 @@ pub fn extract_profile(name: &str, file: &str, source: &str) -> ComponentSourceP
         .element_tags
         .keys()
         .filter(|tag| tag.starts_with(|c: char| c.is_uppercase()))
-        .cloned()
+        .map(|tag| semver_analyzer_core::types::sd::RenderedComponent {
+            name: tag.clone(),
+            conditional: !ast_info.unconditional_tags.contains(tag),
+        })
         .collect();
     profile.aria_attributes = ast_info
         .aria_attrs
@@ -177,6 +180,10 @@ pub(crate) fn kebab_to_camel_case(s: &str) -> String {
 struct FullSourceInfo {
     // ── JSX ─────────────────────────────────────────────────────────
     element_tags: BTreeMap<String, usize>,
+    /// Tags that were found in an unconditional rendering context.
+    /// If a tag is in `element_tags` but NOT in `unconditional_tags`,
+    /// it was only found inside conditional branches (ternary, &&, if).
+    unconditional_tags: BTreeSet<String>,
     aria_attrs: BTreeMap<(String, String), String>,
     role_attrs: BTreeMap<String, String>,
     data_attrs: BTreeMap<(String, String), String>,
@@ -275,7 +282,7 @@ fn extract_from_module_stmt<'a>(
         }
         Statement::ExportDefaultDeclaration(export) => {
             if let Some(expr) = export.declaration.as_expression() {
-                walk_expr_for_jsx(expr, source, info);
+                walk_expr_for_jsx(expr, source, info, false);
             }
         }
 
@@ -285,7 +292,7 @@ fn extract_from_module_stmt<'a>(
         }
 
         // Walk all other statements for JSX
-        _ => walk_stmt_for_jsx(stmt, source, info),
+        _ => walk_stmt_for_jsx(stmt, source, info, false),
     }
 }
 
@@ -302,13 +309,13 @@ fn extract_from_decl<'a>(
         }
         Declaration::FunctionDeclaration(f) => {
             if let Some(body) = &f.body {
-                walk_stmts_for_jsx(&body.statements, source, info);
+                walk_stmts_for_jsx(&body.statements, source, info, false);
             }
         }
         Declaration::VariableDeclaration(var_decl) => {
             for declarator in &var_decl.declarations {
                 if let Some(init) = &declarator.init {
-                    walk_expr_for_jsx(init, source, info);
+                    walk_expr_for_jsx(init, source, info, false);
                 }
             }
         }
@@ -317,12 +324,12 @@ fn extract_from_decl<'a>(
                 match item {
                     ClassElement::MethodDefinition(method) => {
                         if let Some(body) = &method.value.body {
-                            walk_stmts_for_jsx(&body.statements, source, info);
+                            walk_stmts_for_jsx(&body.statements, source, info, false);
                         }
                     }
                     ClassElement::PropertyDefinition(prop) => {
                         if let Some(init) = &prop.value {
-                            walk_expr_for_jsx(init, source, info);
+                            walk_expr_for_jsx(init, source, info, false);
                         }
                     }
                     _ => {}
@@ -429,26 +436,36 @@ fn resolve_heritage_props_type(heritage: &oxc_ast::ast::TSInterfaceHeritage) -> 
 // ── AST walking for JSX extraction ──────────────────────────────────────
 // These mirror the jsx_diff walkers but populate FullSourceInfo.
 
-fn walk_stmts_for_jsx<'a>(stmts: &'a [Statement<'a>], source: &str, info: &mut FullSourceInfo) {
+fn walk_stmts_for_jsx<'a>(
+    stmts: &'a [Statement<'a>],
+    source: &str,
+    info: &mut FullSourceInfo,
+    conditional: bool,
+) {
     for stmt in stmts {
-        walk_stmt_for_jsx(stmt, source, info);
+        walk_stmt_for_jsx(stmt, source, info, conditional);
     }
 }
 
-fn walk_stmt_for_jsx<'a>(stmt: &'a Statement<'a>, source: &str, info: &mut FullSourceInfo) {
+fn walk_stmt_for_jsx<'a>(
+    stmt: &'a Statement<'a>,
+    source: &str,
+    info: &mut FullSourceInfo,
+    conditional: bool,
+) {
     match stmt {
         Statement::ClassDeclaration(cls) => {
             for item in &cls.body.body {
                 match item {
                     ClassElement::MethodDefinition(method) => {
-                        walk_params_for_jsx(&method.value.params, source, info);
+                        walk_params_for_jsx(&method.value.params, source, info, conditional);
                         if let Some(body) = &method.value.body {
-                            walk_stmts_for_jsx(&body.statements, source, info);
+                            walk_stmts_for_jsx(&body.statements, source, info, conditional);
                         }
                     }
                     ClassElement::PropertyDefinition(prop) => {
                         if let Some(init) = &prop.value {
-                            walk_expr_for_jsx(init, source, info);
+                            walk_expr_for_jsx(init, source, info, conditional);
                         }
                     }
                     _ => {}
@@ -456,63 +473,69 @@ fn walk_stmt_for_jsx<'a>(stmt: &'a Statement<'a>, source: &str, info: &mut FullS
             }
         }
         Statement::FunctionDeclaration(f) => {
-            walk_params_for_jsx(&f.params, source, info);
+            walk_params_for_jsx(&f.params, source, info, conditional);
             if let Some(body) = &f.body {
-                walk_stmts_for_jsx(&body.statements, source, info);
+                walk_stmts_for_jsx(&body.statements, source, info, conditional);
             }
         }
         Statement::ReturnStatement(ret) => {
             if let Some(expr) = &ret.argument {
-                walk_expr_for_jsx(expr, source, info);
+                walk_expr_for_jsx(expr, source, info, conditional);
             }
         }
         Statement::ExpressionStatement(expr_stmt) => {
-            walk_expr_for_jsx(&expr_stmt.expression, source, info);
+            walk_expr_for_jsx(&expr_stmt.expression, source, info, conditional);
         }
         Statement::VariableDeclaration(decl) => {
             for declarator in &decl.declarations {
-                walk_binding_defaults_for_jsx(&declarator.id, source, info);
+                walk_binding_defaults_for_jsx(&declarator.id, source, info, conditional);
                 if let Some(init) = &declarator.init {
-                    walk_expr_for_jsx(init, source, info);
+                    walk_expr_for_jsx(init, source, info, conditional);
                 }
             }
         }
         Statement::ExportNamedDeclaration(export) => {
             if let Some(decl) = &export.declaration {
-                walk_decl_for_jsx(decl, source, info);
+                walk_decl_for_jsx(decl, source, info, conditional);
             }
         }
         Statement::ExportDefaultDeclaration(export) => {
             if let Some(expr) = export.declaration.as_expression() {
-                walk_expr_for_jsx(expr, source, info);
+                walk_expr_for_jsx(expr, source, info, conditional);
             }
         }
+        // if/else branches are conditional
         Statement::IfStatement(if_stmt) => {
-            walk_stmt_for_jsx(&if_stmt.consequent, source, info);
+            walk_stmt_for_jsx(&if_stmt.consequent, source, info, true);
             if let Some(alt) = &if_stmt.alternate {
-                walk_stmt_for_jsx(alt, source, info);
+                walk_stmt_for_jsx(alt, source, info, true);
             }
         }
         Statement::BlockStatement(block) => {
-            walk_stmts_for_jsx(&block.body, source, info);
+            walk_stmts_for_jsx(&block.body, source, info, conditional);
         }
         _ => {}
     }
 }
 
-fn walk_decl_for_jsx<'a>(decl: &'a Declaration<'a>, source: &str, info: &mut FullSourceInfo) {
+fn walk_decl_for_jsx<'a>(
+    decl: &'a Declaration<'a>,
+    source: &str,
+    info: &mut FullSourceInfo,
+    conditional: bool,
+) {
     match decl {
         Declaration::FunctionDeclaration(f) => {
-            walk_params_for_jsx(&f.params, source, info);
+            walk_params_for_jsx(&f.params, source, info, conditional);
             if let Some(body) = &f.body {
-                walk_stmts_for_jsx(&body.statements, source, info);
+                walk_stmts_for_jsx(&body.statements, source, info, conditional);
             }
         }
         Declaration::VariableDeclaration(var_decl) => {
             for declarator in &var_decl.declarations {
-                walk_binding_defaults_for_jsx(&declarator.id, source, info);
+                walk_binding_defaults_for_jsx(&declarator.id, source, info, conditional);
                 if let Some(init) = &declarator.init {
-                    walk_expr_for_jsx(init, source, info);
+                    walk_expr_for_jsx(init, source, info, conditional);
                 }
             }
         }
@@ -520,14 +543,14 @@ fn walk_decl_for_jsx<'a>(decl: &'a Declaration<'a>, source: &str, info: &mut Ful
             for item in &cls.body.body {
                 match item {
                     ClassElement::MethodDefinition(method) => {
-                        walk_params_for_jsx(&method.value.params, source, info);
+                        walk_params_for_jsx(&method.value.params, source, info, conditional);
                         if let Some(body) = &method.value.body {
-                            walk_stmts_for_jsx(&body.statements, source, info);
+                            walk_stmts_for_jsx(&body.statements, source, info, conditional);
                         }
                     }
                     ClassElement::PropertyDefinition(prop) => {
                         if let Some(init) = &prop.value {
-                            walk_expr_for_jsx(init, source, info);
+                            walk_expr_for_jsx(init, source, info, conditional);
                         }
                     }
                     _ => {}
@@ -549,11 +572,12 @@ fn walk_binding_defaults_for_jsx<'a>(
     pattern: &'a BindingPattern<'a>,
     source: &str,
     info: &mut FullSourceInfo,
+    conditional: bool,
 ) {
     if let BindingPattern::ObjectPattern(obj) = pattern {
         for prop in &obj.properties {
             if let BindingPattern::AssignmentPattern(assign) = &prop.value {
-                walk_expr_for_jsx(&assign.right, source, info);
+                walk_expr_for_jsx(&assign.right, source, info, conditional);
             }
         }
     }
@@ -563,7 +587,7 @@ fn walk_binding_defaults_for_jsx<'a>(
         if let BindingPattern::ObjectPattern(obj) = &assign.left {
             for prop in &obj.properties {
                 if let BindingPattern::AssignmentPattern(inner) = &prop.value {
-                    walk_expr_for_jsx(&inner.right, source, info);
+                    walk_expr_for_jsx(&inner.right, source, info, conditional);
                 }
             }
         }
@@ -575,29 +599,37 @@ fn walk_params_for_jsx<'a>(
     params: &'a FormalParameters<'a>,
     source: &str,
     info: &mut FullSourceInfo,
+    conditional: bool,
 ) {
     for param in &params.items {
-        walk_binding_defaults_for_jsx(&param.pattern, source, info);
+        walk_binding_defaults_for_jsx(&param.pattern, source, info, conditional);
     }
 }
 
-fn walk_expr_for_jsx<'a>(expr: &'a Expression<'a>, source: &str, info: &mut FullSourceInfo) {
+fn walk_expr_for_jsx<'a>(
+    expr: &'a Expression<'a>,
+    source: &str,
+    info: &mut FullSourceInfo,
+    conditional: bool,
+) {
     match expr {
-        Expression::JSXElement(el) => visit_jsx_element_info(el, source, info),
+        Expression::JSXElement(el) => visit_jsx_element_info(el, source, info, conditional),
         Expression::JSXFragment(frag) => {
             for child in &frag.children {
-                walk_jsx_child_info(child, source, info);
+                walk_jsx_child_info(child, source, info, conditional);
             }
         }
         Expression::ParenthesizedExpression(paren) => {
-            walk_expr_for_jsx(&paren.expression, source, info);
+            walk_expr_for_jsx(&paren.expression, source, info, conditional);
         }
+        // Ternary: both branches are conditional
         Expression::ConditionalExpression(cond) => {
-            walk_expr_for_jsx(&cond.consequent, source, info);
-            walk_expr_for_jsx(&cond.alternate, source, info);
+            walk_expr_for_jsx(&cond.consequent, source, info, true);
+            walk_expr_for_jsx(&cond.alternate, source, info, true);
         }
+        // && / ||: right side is conditional
         Expression::LogicalExpression(logical) => {
-            walk_expr_for_jsx(&logical.right, source, info);
+            walk_expr_for_jsx(&logical.right, source, info, true);
         }
         Expression::CallExpression(call) => {
             // Detect cloneElement(child, { prop1, prop2 }) calls
@@ -606,62 +638,77 @@ fn walk_expr_for_jsx<'a>(expr: &'a Expression<'a>, source: &str, info: &mut Full
             }
             for arg in &call.arguments {
                 if let Some(expr) = arg.as_expression() {
-                    walk_expr_for_jsx(expr, source, info);
+                    // .map() callbacks: children rendered in map are unconditional
+                    // (the component's purpose is to render them from data)
+                    walk_expr_for_jsx(expr, source, info, conditional);
                 }
             }
         }
         // TypeScript expression wrappers — transparent to JSX walking.
         // e.g., `ReactDOM.createPortal(<Foo/>, el) as React.ReactElement`
         Expression::TSAsExpression(ts_as) => {
-            walk_expr_for_jsx(&ts_as.expression, source, info);
+            walk_expr_for_jsx(&ts_as.expression, source, info, conditional);
         }
         Expression::TSSatisfiesExpression(ts_sat) => {
-            walk_expr_for_jsx(&ts_sat.expression, source, info);
+            walk_expr_for_jsx(&ts_sat.expression, source, info, conditional);
         }
         Expression::TSNonNullExpression(ts_nn) => {
-            walk_expr_for_jsx(&ts_nn.expression, source, info);
+            walk_expr_for_jsx(&ts_nn.expression, source, info, conditional);
         }
         Expression::TSTypeAssertion(ts_assert) => {
-            walk_expr_for_jsx(&ts_assert.expression, source, info);
+            walk_expr_for_jsx(&ts_assert.expression, source, info, conditional);
         }
         Expression::TSInstantiationExpression(ts_inst) => {
-            walk_expr_for_jsx(&ts_inst.expression, source, info);
+            walk_expr_for_jsx(&ts_inst.expression, source, info, conditional);
         }
         Expression::ArrowFunctionExpression(arrow) => {
-            walk_params_for_jsx(&arrow.params, source, info);
-            walk_stmts_for_jsx(&arrow.body.statements, source, info);
+            walk_params_for_jsx(&arrow.params, source, info, conditional);
+            walk_stmts_for_jsx(&arrow.body.statements, source, info, conditional);
         }
         Expression::FunctionExpression(func) => {
-            walk_params_for_jsx(&func.params, source, info);
+            walk_params_for_jsx(&func.params, source, info, conditional);
             if let Some(body) = &func.body {
-                walk_stmts_for_jsx(&body.statements, source, info);
+                walk_stmts_for_jsx(&body.statements, source, info, conditional);
             }
         }
         _ => {}
     }
 }
 
-fn walk_jsx_child_info<'a>(child: &'a JSXChild<'a>, source: &str, info: &mut FullSourceInfo) {
+fn walk_jsx_child_info<'a>(
+    child: &'a JSXChild<'a>,
+    source: &str,
+    info: &mut FullSourceInfo,
+    conditional: bool,
+) {
     match child {
-        JSXChild::Element(el) => visit_jsx_element_info(el, source, info),
+        JSXChild::Element(el) => visit_jsx_element_info(el, source, info, conditional),
         JSXChild::Fragment(frag) => {
             for c in &frag.children {
-                walk_jsx_child_info(c, source, info);
+                walk_jsx_child_info(c, source, info, conditional);
             }
         }
         JSXChild::ExpressionContainer(container) => {
             if let Some(expr) = container.expression.as_expression() {
-                walk_expr_for_jsx(expr, source, info);
+                walk_expr_for_jsx(expr, source, info, conditional);
             }
         }
         _ => {}
     }
 }
 
-fn visit_jsx_element_info<'a>(el: &'a JSXElement<'a>, source: &str, info: &mut FullSourceInfo) {
+fn visit_jsx_element_info<'a>(
+    el: &'a JSXElement<'a>,
+    source: &str,
+    info: &mut FullSourceInfo,
+    conditional: bool,
+) {
     let tag_name = jsx_element_name_str(&el.opening_element.name);
 
     *info.element_tags.entry(tag_name.clone()).or_insert(0) += 1;
+    if !conditional {
+        info.unconditional_tags.insert(tag_name.clone());
+    }
 
     // Detect React Context usage from JSX member expressions:
     //   <XContext.Provider ...>  → context_providers += "XContext"
@@ -703,9 +750,9 @@ fn visit_jsx_element_info<'a>(el: &'a JSXElement<'a>, source: &str, info: &mut F
         }
     }
 
-    // Recurse into children
+    // Recurse into children (inherit conditionality from parent)
     for child in &el.children {
-        walk_jsx_child_info(child, source, info);
+        walk_jsx_child_info(child, source, info, conditional);
     }
 
     // Also recurse into attribute values (for JSX in props)
@@ -713,7 +760,7 @@ fn visit_jsx_element_info<'a>(el: &'a JSXElement<'a>, source: &str, info: &mut F
         if let JSXAttributeItem::Attribute(attr) = attr_item {
             if let Some(JSXAttributeValue::ExpressionContainer(container)) = &attr.value {
                 if let Some(expr) = container.expression.as_expression() {
-                    walk_expr_for_jsx(expr, source, info);
+                    walk_expr_for_jsx(expr, source, info, conditional);
                 }
             }
         }
@@ -911,7 +958,8 @@ mod tests {
         assert!(
             profile
                 .rendered_components
-                .contains(&"MenuContext.Provider".to_string()),
+                .iter()
+                .any(|r| r.name == "MenuContext.Provider"),
             "Expected MenuContext.Provider in rendered_components, got: {:?}",
             profile.rendered_components
         );
@@ -1130,21 +1178,24 @@ mod tests {
         assert!(
             profile
                 .rendered_components
-                .contains(&"ChartBulletComparativeErrorMeasure".to_string()),
+                .iter()
+                .any(|r| r.name == "ChartBulletComparativeErrorMeasure"),
             "Expected ChartBulletComparativeErrorMeasure in rendered_components, got: {:?}",
             profile.rendered_components
         );
         assert!(
             profile
                 .rendered_components
-                .contains(&"ChartBulletQualitativeRange".to_string()),
+                .iter()
+                .any(|r| r.name == "ChartBulletQualitativeRange"),
             "Expected ChartBulletQualitativeRange in rendered_components, got: {:?}",
             profile.rendered_components
         );
         assert!(
             profile
                 .rendered_components
-                .contains(&"ChartBulletTitle".to_string()),
+                .iter()
+                .any(|r| r.name == "ChartBulletTitle"),
             "Expected ChartBulletTitle in rendered_components, got: {:?}",
             profile.rendered_components
         );
@@ -1182,7 +1233,8 @@ mod tests {
         assert!(
             profile
                 .rendered_components
-                .contains(&"RhMicronsCaretDownIcon".to_string()),
+                .iter()
+                .any(|r| r.name == "RhMicronsCaretDownIcon"),
             "Expected RhMicronsCaretDownIcon in rendered_components, got: {:?}",
             profile.rendered_components
         );
@@ -1260,16 +1312,197 @@ mod tests {
         assert!(
             profile
                 .rendered_components
-                .contains(&"ClipboardCopyButton".to_string()),
+                .iter()
+                .any(|r| r.name == "ClipboardCopyButton"),
             "Expected ClipboardCopyButton in rendered_components, got: {:?}",
             profile.rendered_components
         );
         assert!(
             profile
                 .rendered_components
-                .contains(&"ClipboardCopyToggle".to_string()),
+                .iter()
+                .any(|r| r.name == "ClipboardCopyToggle"),
             "Expected ClipboardCopyToggle in rendered_components, got: {:?}",
             profile.rendered_components
+        );
+    }
+
+    #[test]
+    fn test_conditional_rendering_ternary() {
+        // Components inside ternary are conditional;
+        // components outside are unconditional.
+        let source = r#"
+            import React from 'react';
+            const Comp = ({ show }) => {
+                return (
+                    <div>
+                        <AlwaysRendered />
+                        {show ? <ConditionalA /> : <ConditionalB />}
+                    </div>
+                );
+            };
+            export { Comp };
+        "#;
+
+        let profile = extract_profile("Comp", "Comp.tsx", source);
+
+        let always = profile
+            .rendered_components
+            .iter()
+            .find(|r| r.name == "AlwaysRendered");
+        assert!(always.is_some(), "AlwaysRendered should be present");
+        assert!(
+            !always.unwrap().conditional,
+            "AlwaysRendered should be unconditional"
+        );
+
+        let cond_a = profile
+            .rendered_components
+            .iter()
+            .find(|r| r.name == "ConditionalA");
+        assert!(cond_a.is_some(), "ConditionalA should be present");
+        assert!(
+            cond_a.unwrap().conditional,
+            "ConditionalA should be conditional (inside ternary)"
+        );
+
+        let cond_b = profile
+            .rendered_components
+            .iter()
+            .find(|r| r.name == "ConditionalB");
+        assert!(cond_b.is_some(), "ConditionalB should be present");
+        assert!(
+            cond_b.unwrap().conditional,
+            "ConditionalB should be conditional (inside ternary)"
+        );
+    }
+
+    #[test]
+    fn test_conditional_rendering_logical_and() {
+        // Components inside && are conditional.
+        let source = r#"
+            import React from 'react';
+            const Comp = ({ show }) => {
+                return (
+                    <div>
+                        <Header />
+                        {show && <OptionalFooter />}
+                    </div>
+                );
+            };
+            export { Comp };
+        "#;
+
+        let profile = extract_profile("Comp", "Comp.tsx", source);
+
+        let header = profile
+            .rendered_components
+            .iter()
+            .find(|r| r.name == "Header");
+        assert!(
+            !header.unwrap().conditional,
+            "Header should be unconditional"
+        );
+
+        let footer = profile
+            .rendered_components
+            .iter()
+            .find(|r| r.name == "OptionalFooter");
+        assert!(
+            footer.unwrap().conditional,
+            "OptionalFooter should be conditional (inside &&)"
+        );
+    }
+
+    #[test]
+    fn test_conditional_rendering_if_statement() {
+        // Components inside if branches are conditional.
+        let source = r#"
+            import React from 'react';
+            function Comp({ variant }) {
+                if (variant === 'a') {
+                    return <VariantA />;
+                }
+                return <Default />;
+            }
+            export { Comp };
+        "#;
+
+        let profile = extract_profile("Comp", "Comp.tsx", source);
+
+        let variant_a = profile
+            .rendered_components
+            .iter()
+            .find(|r| r.name == "VariantA");
+        assert!(
+            variant_a.unwrap().conditional,
+            "VariantA should be conditional (inside if branch)"
+        );
+
+        let default = profile
+            .rendered_components
+            .iter()
+            .find(|r| r.name == "Default");
+        assert!(
+            !default.unwrap().conditional,
+            "Default should be unconditional (bare return)"
+        );
+    }
+
+    #[test]
+    fn test_conditional_rendering_map_is_unconditional() {
+        // Components inside .map() are unconditional — the component's
+        // purpose is to render children from data.
+        let source = r#"
+            import React from 'react';
+            const List = ({ items }) => {
+                return (
+                    <ul>
+                        {items.map(item => <ListItem key={item.id} />)}
+                    </ul>
+                );
+            };
+            export { List };
+        "#;
+
+        let profile = extract_profile("List", "List.tsx", source);
+
+        let item = profile
+            .rendered_components
+            .iter()
+            .find(|r| r.name == "ListItem");
+        assert!(
+            !item.unwrap().conditional,
+            "ListItem inside .map() should be unconditional"
+        );
+    }
+
+    #[test]
+    fn test_unconditional_wins_over_conditional() {
+        // If a component appears both conditionally and unconditionally,
+        // unconditional wins.
+        let source = r#"
+            import React from 'react';
+            const Comp = ({ extra }) => {
+                return (
+                    <div>
+                        <Child />
+                        {extra && <Child />}
+                    </div>
+                );
+            };
+            export { Comp };
+        "#;
+
+        let profile = extract_profile("Comp", "Comp.tsx", source);
+
+        let child = profile
+            .rendered_components
+            .iter()
+            .find(|r| r.name == "Child");
+        assert!(
+            !child.unwrap().conditional,
+            "Child should be unconditional (appears in both conditional and unconditional contexts)"
         );
     }
 }

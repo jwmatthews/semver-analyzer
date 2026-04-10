@@ -145,9 +145,9 @@ from structural evidence.**
 | 5.5 | CSS layout children | Allowed | Shared CSS rule with flex-wrap/gap implies containment |
 | 6 | React context | Required | Null context = crash/broken behavior |
 | 7 | DOM nesting | Required | Invalid HTML without correct parent |
-| 8 | cloneElement | Required | Missing injected props breaks functionality |
+| 8 | cloneElement | Structural | Child relies on injected props from parent (CHP=YES), but parent doesn't demand specific child (PMC=NO) |
 | 8.5 | BEM element orphan fallback | Allowed | Orphan BEM elements connected to root as last resort |
-| 8.6 | Secondary BEM block sub-root | Allowed | Cross-block orphans connected to sub-root (e.g., ModalBox→ModalBody) |
+| 8.6 | Secondary BEM block sub-root | Structural | BEM element CSS classes are designed to be styled inside their block's container (CHP=YES, PMC=NO) |
 | 8.7 | Prop-passed detection | Allowed | ReactNode/ReactElement prop name matches child component name |
 
 *Steps 2, 3, 3b use `Allowed` instead of `Required` when the child component
@@ -255,19 +255,65 @@ edges are retained as **secondary roots** — top-level containers within
 the family. Non-exported secondary roots are then properly collapsed by
 `collapse_internal_nodes`.
 
-#### EdgeStrength: Required vs Allowed
+#### EdgeStrength: Two-Dimensional Constraint Model (CRITICAL)
 
-Every edge has a `strength: EdgeStrength` field:
+Every edge has a `strength: EdgeStrength` field (Required or Allowed), but
+correctness depends on **two independent dimensions** per edge:
 
-- **Required** — Rendering breaks without this nesting. Generates conformance
-  rules.
-- **Allowed** — Valid placement documented in CSS but not the only option. Stays
-  in the tree for migration guidance but produces zero conformance rules.
-  Included in the `notParent` regex to prevent false positives on valid
-  placements.
+| Dimension | Abbreviation | Question | Drives Rule Type |
+|-----------|-------------|----------|------------------|
+| **child-must-have-parent** | CHP | Does the child break if placed outside the parent? | `notParent` |
+| **parent-must-have-child** | PMC | Does the parent break without this child? | `requiresChild` |
+
+These are independent. A CSS `>` selector tells us CHP=YES (child must be
+a direct child of this parent) but says nothing about PMC (whether the
+parent requires the child to be present at all).
+
+**Four categories of edges:**
+
+| Category | CHP | PMC | Current `strength` | Correct Behavior |
+|----------|-----|-----|--------------------|------------------|
+| A: Both Required | YES | YES | Required | Both `notParent` and `requiresChild` valid |
+| B: CHP-only | YES | NO | Required | Only `notParent` valid; `requiresChild` is WRONG |
+| C: PMC-only | NO | YES | Required | Only `requiresChild` valid; `notParent` is WRONG |
+| D: Both Allowed | NO | NO | Should be Allowed | No conformance rules; currently Wrong if Required |
+
+**What determines each dimension:**
+
+| Signal | CHP? | PMC? |
+|--------|------|------|
+| CSS `>` direct-child selector | YES | Check docs/required props |
+| CSS grid parent-child | YES | Check docs |
+| React context dependency | YES | NO (provider just exists) |
+| DOM nesting (`<li>` in `<ul>`) | YES | Usually YES (semantic HTML) |
+| cloneElement prop injection | YES | NO (parent processes whatever children it has) |
+| `children` prop is `*required` | N/A | YES |
+| Docs say "not required"/"may omit" | N/A | NO |
+| Internal rendering | YES | YES |
+| CSS descendant ` ` (no `>`) | Weak (Allowed) | NO |
+| BEM CSS-only (no structural signal) | NO | NO |
+
+**Example — Modal family (Category B: CHP-only):**
+Modal uses a cross-block BEM structure (root uses "backdrop" block, children
+use "modalBox" block). Step 8.6 detects ModalBody/ModalHeader/ModalFooter as
+BEM elements of the modalBox block and connects them to the sub-root (ModalBox)
+with Structural strength (CHP=YES). After collapsing internal nodes, these
+become Modal→ModalBody/ModalHeader/ModalFooter with Structural strength.
+PF6 docs explicitly state "ModalBody, ModalHeader, and ModalFooter are not
+required," so PMC=NO. Only `notParent` (child must be inside Modal when used)
+is valid.
+
+**Example — Tabs family (Category A: Both Required):**
+`Tabs -> Tab` has CHP=YES (Tab consumes context from Tabs) and PMC=YES
+(`children` is `*required` on Tabs and only accepts Tab components). Both
+`requiresChild` and `notParent` are correct.
 
 Collapsed edges (from `collapse_internal_nodes`) inherit the **stronger** of
 the two edges in the chain.
+
+See the **Edge Ground Truth** section below for the complete two-dimensional
+classification of every non-internal edge verified against upstream PF6
+documentation.
 
 #### Conformance Rule Generation (CRITICAL)
 
@@ -309,6 +355,32 @@ for (parent, children) in parent_to_req_children:
 - Cycles (A→B Required + B→A Required) are tree accuracy bugs. Both edges
   should not be Required — the recursive direction should be `Allowed`.
   The rule generator does not handle cycles; fix the tree instead.
+
+**Two-dimensional rule accuracy (IMPORTANT):**
+
+The current algorithm uses a single `strength` field to drive both
+`requiresChild` and `notParent` rules. This is correct for Category A edges
+(CHP=YES, PMC=YES) but incorrect for Category B (CHP-only). In Category B,
+the `Required` strength causes a `requiresChild` rule on the root parent,
+falsely claiming it MUST contain the child. Only the `notParent` rule
+(child must be inside parent when used) is valid.
+
+**Affected families (Category B edges on root parents):**
+- Modal: `requiresChild` says "Modal must contain ModalBody, ModalHeader,
+  ModalFooter" — wrong; PF6 docs say all three are optional
+- Card: `requiresChild` says "Card must contain CardHeader, CardBody,
+  CardFooter, CardTitle" — wrong; docs say "may omit these"
+- ToggleGroup: `requiresChild` says "ToggleGroup must contain
+  ToggleGroupItem" — wrong; empty group is valid
+- List: `requiresChild` says "List must contain ListItem" — wrong;
+  empty list is valid HTML
+
+**Future fix:** Add a `parent_requires_child: bool` field to
+`CompositionEdge`. The conformance rule generator should only emit
+`requiresChild` when `parent_requires_child=true`, and only emit
+`notParent` when `child_placement_required=true` (i.e., edge strength
+is Required). See the Edge Ground Truth section for the complete
+two-dimensional classification.
 
 #### Conformance Rule ID Format
 
@@ -411,7 +483,7 @@ parses for path and detail).
 
 #### Single-Component Families (Skip for Composition)
 
-The following 51 families are genuinely single-component — one file in the
+The following 50 families are genuinely single-component — one file in the
 directory, no sub-components, no composition tree needed. Skip these during
 composition tree validation:
 
@@ -422,8 +494,7 @@ ChartLegend, ChartLine, ChartPie, ChartPoint, ChartScatter, ChartStack,
 ChartThreshold, ChartTooltip, ChartVoronoiContainer, Charts, Checkbox,
 Content, DatePicker, Divider, FormControl, Icon, Line, NotificationBadge,
 NumberInput, Radio, Sankey, Skeleton, SkipToContent, Spinner, Switch,
-TextArea, TextInput, Timestamp, Title, Truncate, deprecated/DragDrop,
-deprecated/Tile.
+TextArea, TextInput, Timestamp, Title, Truncate, deprecated/Tile.
 
 #### Composition Tree Ground Truth (PatternFly v6.4.1)
 
@@ -488,8 +559,10 @@ sub-components are internally rendered, not consumer-placed).
 | TreeView | TreeView, TreeViewSearch | — |
 | Wizard | Wizard, WizardBody, WizardFooter, WizardHeader, WizardNav, WizardNavItem, WizardStep, WizardToggle | WizardHeader: prop-passed via `header` |
 | deprecated/Chip | Chip, ChipGroup | — |
+| deprecated/DragDrop | DragDrop, Draggable, Droppable | DroppableContext: context export noise |
 | deprecated/DualListSelector | DualListSelector, DualListSelectorControl, DualListSelectorControlsWrapper, DualListSelectorList, DualListSelectorListItem, DualListSelectorPane, DualListSelectorTree | — |
 | deprecated/Modal | Modal, ModalBox, ModalBoxBody, ModalBoxCloseButton, ModalBoxFooter, ModalBoxHeader, ModalContent | — |
+| deprecated/Table | Table, Body, Header | Deprecated legacy table API |
 | deprecated/Wizard | Wizard, WizardBody, WizardFooter, WizardHeader, WizardNav, WizardNavItem, WizardToggle | WizardFooter: prop-passed via `footer` |
 
 **Note on Table:** The Table family exports many components (Caption, Tbody,
@@ -507,6 +580,134 @@ convenience composites or orchestrators with no structural composition
 signal. Context providers (AlertContext, FormContext, TabsContext,
 WizardContext, etc.) appear as orphan members when exported from barrel
 files; they don't affect rule generation.
+
+#### Edge Ground Truth (CRITICAL)
+
+The following table classifies every non-internal Required edge by the
+two constraint dimensions (CHP = child-must-have-parent, PMC =
+parent-must-have-child), verified against upstream PF6 documentation at
+v6.4.1. This is the definitive reference for conformance rule correctness.
+
+**Category A: Both Required (CHP=YES, PMC=YES) — 37 edges**
+
+Both `notParent` and `requiresChild` rules are valid for these edges.
+
+| Family | Parent | Child | Signal |
+|--------|--------|-------|--------|
+| DataList | DataListItemCells | DataListCell | CSS `>` + purpose |
+| DataList | DataListItem | DataListItemRow | cloneElement + CSS `>` + content |
+| DescriptionList | DescriptionList | DescriptionListGroup | DOM `<dl>` nesting + CSS grid |
+| DescriptionList | DescriptionListGroup | DescriptionListDescription | Semantic `<dd>` pair |
+| Drawer | DrawerHead | DrawerActions | CSS grid parent-child |
+| Drawer | DrawerContent | DrawerPanelContent | CSS + `panelContent` prop `*required` |
+| Drawer | Drawer | DrawerPanelContent | CSS + panel essential for drawer |
+| Drawer | Drawer | DrawerContent | CSS + content essential for drawer |
+| DualListSelector | DualListSelectorPane | DualListSelectorListItem | CSS + items needed |
+| DualListSelector | DualListSelectorTree | DualListSelectorControl | Context + tree uses controls |
+| DualListSelector | DualListSelectorTree | DualListSelectorPane | Structural dependency |
+| DualListSelector | DualListSelectorPane | DualListSelectorControl | CSS + pane uses controls |
+| JumpLinks | JumpLinksList | JumpLinksItem | Scroll spy context + list purpose |
+| Masthead | Masthead | MastheadBrand | CSS grid; docs explicitly required |
+| Masthead | Masthead | MastheadContent | CSS grid; docs explicitly required |
+| Masthead | Masthead | MastheadMain | CSS grid; docs explicitly required |
+| MultipleFileUpload | MultipleFileUploadStatus | MultipleFileUploadStatusItem | CSS + status list purpose |
+| Nav | NavList | NavItem | DOM `<li>` in `<ul>` + list purpose |
+| Nav | NavGroup | NavItem | Context + group purpose |
+| NotificationDrawer | NotificationDrawerList | NotificationDrawerListItem | CSS + list purpose |
+| Progress | Progress | ProgressBar | Internal rendering (should be `internal`) |
+| ProgressStepper | ProgressStepper | ProgressStep | DOM `<li>` in `<ol>` + stepper purpose |
+| SimpleList | SimpleListGroup | SimpleListItem | CSS + selection context |
+| Table | Tbody | Tr | DOM `<tr>` in `<tbody>` |
+| Table | Table | Tbody | DOM nesting |
+| Table | Table | Thead | DOM nesting + a11y |
+| Table | Tr | Th | DOM `<th>` in `<tr>` |
+| Table | Tr | Td | DOM `<td>` in `<tr>` |
+| Tabs | Tabs | Tab | Context + `children` `*required` |
+| Wizard | WizardNav | WizardNavItem | CSS + nav purpose |
+| deprecated/DualListSelector | DualListSelectorPane | DualListSelectorListItem | Same as v6 |
+| deprecated/DualListSelector | DualListSelectorTree | DualListSelectorContext | Context dependency |
+| deprecated/DualListSelector | DualListSelectorTree | DualListSelectorControl | Same as v6 |
+| deprecated/DualListSelector | DualListSelectorTree | DualListSelectorPane | Same as v6 |
+| deprecated/DualListSelector | DualListSelectorPane | DualListSelectorContext | Context dependency |
+| deprecated/DualListSelector | DualListSelectorPane | DualListSelectorControl | Same as v6 |
+| deprecated/Wizard | WizardNav | WizardNavItem | Same as v6 |
+
+**Category B: CHP-only (CHP=YES, PMC=NO) — 37 edges**
+
+Only `notParent` is valid. `requiresChild` is **wrong** for these edges.
+The child must be inside the parent IF used, but the parent does NOT
+require the child.
+
+| Family | Parent | Child | Signal | Why PMC=NO |
+|--------|--------|-------|--------|------------|
+| Alert | AlertGroup | Alert | DOM context | Alert is standalone; AlertGroup can be empty (toast/dynamic) |
+| Card | Card | CardHeader | CSS `>` | PF docs: "may omit these components" |
+| Card | Card | CardTitle | CSS `>` | PF docs: "may omit these components" |
+| Card | Card | CardBody | CSS `>` | PF docs: "recommended" but not required |
+| Card | Card | CardFooter | CSS `>` | PF docs: "may omit these components" |
+| ChartBullet | ChartBullet | ChartBulletComparativeErrorMeasure | Prop-passed | Internally rendered by default; prop is optional customization |
+| ChartBullet | ChartBullet | ChartBulletComparativeWarningMeasure | Prop-passed | Same |
+| ChartBullet | ChartBullet | ChartBulletGroupTitle | Prop-passed | Same |
+| ChartBullet | ChartBullet | ChartBulletPrimaryDotMeasure | Prop-passed | Same |
+| ChartBullet | ChartBullet | ChartBulletPrimarySegmentedMeasure | Prop-passed | Same |
+| ChartBullet | ChartBullet | ChartBulletQualitativeRange | Prop-passed | Same |
+| ChartBullet | ChartBullet | ChartBulletTitle | Prop-passed | Same |
+| DataList | DataListItem | DataListItemCells | cloneElement + CSS `>` | Cells are common but not sole child type |
+| DataList | DataListItem | DataListToggle | CSS context | Only for expandable items |
+| DataList | DataListItemRow | DataListItemCells | cloneElement + CSS `>` | Row can have just controls |
+| DataList | DataListItemRow | DataListToggle | CSS context | Only for expandable items |
+| DescriptionList | DescriptionList | DescriptionListTerm | CSS `>` | SPURIOUS: terms should only be inside DLGroup |
+| DescriptionList | DescriptionList | DescriptionListTermHelpText | CSS `>` | SPURIOUS: should only be inside DLGroup |
+| DualListSelector | DualListSelectorPane | DualListSelectorTree | CSS | Tree is alternative to List |
+| FormSelect | FormSelect | FormSelectOptionGroup | DOM `<optgroup>` | Grouping optional; options go directly in FormSelect |
+| List | List | ListItem | DOM `<li>` in `<ul>` | Empty list is valid HTML |
+| Menu | MenuItem | MenuItemAction | Prop-passed (`actions`) | Actions are optional on MenuItem |
+| Modal | Modal | ModalBody | Step 8.6 (cross-block BEM) | PF docs: "ModalBody...are not required" |
+| Modal | Modal | ModalHeader | Step 8.6 (cross-block BEM) | PF docs: "ModalHeader...are not required" |
+| Modal | Modal | ModalFooter | Step 8.6 (cross-block BEM) | PF docs: "ModalFooter...are not required" |
+| Nav | NavList | NavItemSeparator | DOM nesting | Separators are optional dividers |
+| Nav | NavList | NavExpandable | DOM nesting | Expandable sections are optional |
+| Nav | NavGroup | NavItemSeparator | Context | Separators optional |
+| Nav | NavGroup | NavExpandable | Context | Expandable optional |
+| Nav | NavExpandable | NavItemSeparator | DOM nesting | Separators always optional |
+| NotificationDrawer | NotificationDrawerListItem | NotificationDrawerListItemBody | CSS | Docs show lightweight variant without body |
+| Page | Page | PageBreadcrumb | Prop-passed | Breadcrumb is optional |
+| Table | Tr | ExpandableRowContent | CSS | Only for expandable rows |
+| Table | Td | ExpandableRowContent | CSS | Only for expandable rows |
+| Table | Table | Caption | DOM | Caption is optional per docs |
+| Tabs | Tab | TabAction | Prop-passed (`actions`) | Actions are optional on Tab |
+| ToggleGroup | ToggleGroup | ToggleGroupItem | CSS layout | Empty group is valid DOM |
+
+**Category C: PMC-only (CHP=NO, PMC=YES) — 1 edge**
+
+Only `requiresChild` is valid. `notParent` is wrong.
+
+| Family | Parent | Child | Signal | Why CHP=NO |
+|--------|--------|-------|--------|------------|
+| ChartDonutUtilization | ChartDonutThreshold | ChartDonutUtilization | JSX children | ChartDonutUtilization works standalone |
+
+**Category D: Both Allowed (CHP=NO, PMC=NO) — 5 edges**
+
+Currently marked Required but should be **Allowed**. No conformance rules
+should be generated.
+
+| Family | Parent | Child | Issue |
+|--------|--------|-------|-------|
+| Alert | AlertGroup | AlertActionCloseButton | WRONG PARENT: goes inside Alert via `actionClose` prop, not AlertGroup |
+| FormSelect | FormSelectOptionGroup | FormSelectOption | Option can skip group; empty group valid |
+| Hint | Hint | HintBody | CSS-only dependency; Hint works without body |
+| Hint | Hint | HintFooter | CSS-only dependency; footer is optional |
+| TreeView | TreeView | TreeViewSearch | Passed via `toolbar` prop; most examples omit it |
+
+**Edge Ground Truth Summary:**
+
+| Category | Count | % | Current Status |
+|----------|-------|---|----------------|
+| A: Both Required (correct) | 37 | 46% | Correct — both rules valid |
+| B: CHP-only (needs split) | 37 | 46% | Wrong for root parents — false `requiresChild` |
+| C: PMC-only (needs split) | 1 | 1% | Wrong — false `notParent` |
+| D: Both Allowed (wrong strength) | 5 | 6% | Wrong — should not be Required |
+| **Total** | **80** | | **43 edges (54%) need correction** |
 
 #### Family Grouping and Deprecated Separation
 

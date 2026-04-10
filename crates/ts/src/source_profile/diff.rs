@@ -6,6 +6,7 @@
 use semver_analyzer_core::types::sd::{
     ComponentSourceProfile, SourceLevelCategory, SourceLevelChange,
 };
+use std::collections::BTreeSet;
 
 /// Diff two component profiles and produce a list of source-level changes.
 ///
@@ -315,14 +316,25 @@ fn diff_rendered_components(
     component: &str,
     changes: &mut Vec<SourceLevelChange>,
 ) {
-    for comp in &new.rendered_components {
-        if !old.rendered_components.contains(comp) {
+    let old_names: BTreeSet<&str> = old
+        .rendered_components
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    let new_names: BTreeSet<&str> = new
+        .rendered_components
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+
+    for name in &new_names {
+        if !old_names.contains(name) {
             changes.push(SourceLevelChange {
                 component: component.to_string(),
                 category: SourceLevelCategory::RenderedComponent,
-                description: format!("{component} now internally renders {comp}"),
+                description: format!("{component} now internally renders {name}"),
                 old_value: None,
-                new_value: Some(comp.clone()),
+                new_value: Some(name.to_string()),
                 has_test_implications: false,
                 test_description: None,
                 element: None,
@@ -331,13 +343,13 @@ fn diff_rendered_components(
         }
     }
 
-    for comp in &old.rendered_components {
-        if !new.rendered_components.contains(comp) {
+    for name in &old_names {
+        if !new_names.contains(name) {
             changes.push(SourceLevelChange {
                 component: component.to_string(),
                 category: SourceLevelCategory::RenderedComponent,
-                description: format!("{component} no longer internally renders {comp}"),
-                old_value: Some(comp.clone()),
+                description: format!("{component} no longer internally renders {name}"),
+                old_value: Some(name.to_string()),
                 new_value: None,
                 has_test_implications: false,
                 test_description: None,

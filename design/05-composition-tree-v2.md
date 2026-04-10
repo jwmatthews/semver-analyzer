@@ -56,7 +56,7 @@ steps in order:
 | 5.5 | CSS layout children | Allowed | Shared CSS rule with flex-wrap/gap implies containment |
 | 6 | React context | Required | A provides XContext, B consumes XContext |
 | 7 | DOM nesting | Required | A wraps children in `<ul>`, B renders `<li>` |
-| 8 | cloneElement | Required | A uses `Children.map + cloneElement({ prop })`, B declares `prop` |
+| 8 | cloneElement | Structural | A uses `Children.map + cloneElement({ prop })`, B declares `prop` (CHP=YES, PMC=NO) |
 | 8.5 | BEM element orphan fallback | Allowed | Orphan BEM elements connected to root as last resort |
 
 After all steps: deduplicate, suppress root edges when intermediate exists,

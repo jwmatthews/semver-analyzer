@@ -1128,9 +1128,10 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
                 if collapsed_set.contains(&child_edge.child) {
                     continue;
                 }
-                // Inherit the STRONGER strength of the two edges.
-                let strength =
-                    std::cmp::max(parent_edge.strength.clone(), child_edge.strength.clone());
+                // Compute collapsed strength: each dimension (CHP, PMC)
+                // is ANDed through the chain — the chain is only as strong
+                // as its weakest link in each direction.
+                let strength = parent_edge.strength.collapse_chain(&child_edge.strength);
                 new_edges.push(semver_analyzer_core::types::sd::CompositionEdge {
                     parent: parent_edge.parent.clone(),
                     child: child_edge.child.clone(),
@@ -1900,19 +1901,17 @@ export { DropdownList } from './DropdownList';
             "packages/react-core/src/deprecated/components/Select/Select.tsx".to_string();
         deprecated_profile
             .rendered_components
-            .push("TextInput".to_string());
+            .push("TextInput".into());
         deprecated_profile
             .rendered_components
-            .push("ChipGroup".to_string());
+            .push("ChipGroup".into());
 
         // New Select does NOT render TextInput or ChipGroup
         let mut replacement_profile = ComponentSourceProfile::default();
         replacement_profile.name = "Select".to_string();
         replacement_profile.file =
             "packages/react-core/src/components/Select/Select.tsx".to_string();
-        replacement_profile
-            .rendered_components
-            .push("Menu".to_string());
+        replacement_profile.rendered_components.push("Menu".into());
 
         // Diff them
         let changes = diff_profiles(&deprecated_profile, &replacement_profile);
@@ -1977,9 +1976,7 @@ export { DropdownList } from './DropdownList';
         deprecated_profile.name = "Tile".to_string();
         deprecated_profile.file =
             "packages/react-core/src/deprecated/components/Tile/Tile.tsx".to_string();
-        deprecated_profile
-            .rendered_components
-            .push("Button".to_string());
+        deprecated_profile.rendered_components.push("Button".into());
 
         // Simulate: new_profiles does NOT contain "Tile"
         let new_profiles: HashMap<String, ComponentSourceProfile> = HashMap::new();
@@ -2002,13 +1999,13 @@ export { DropdownList } from './DropdownList';
         let mut select_v5 = ComponentSourceProfile::default();
         select_v5.name = "Select".to_string();
         select_v5.file = "packages/react-core/src/components/Select/Select.tsx".to_string();
-        select_v5.rendered_components.push("Menu".to_string());
+        select_v5.rendered_components.push("Menu".into());
 
         let mut select_v6 = ComponentSourceProfile::default();
         select_v6.name = "Select".to_string();
         select_v6.file = "packages/react-core/src/components/Select/Select.tsx".to_string();
-        select_v6.rendered_components.push("Menu".to_string());
-        select_v6.rendered_components.push("Popper".to_string()); // new in v6
+        select_v6.rendered_components.push("Menu".into());
+        select_v6.rendered_components.push("Popper".into()); // new in v6
 
         let evolution_changes = diff_profiles(&select_v5, &select_v6);
 
@@ -2019,7 +2016,7 @@ export { DropdownList } from './DropdownList';
             "packages/react-core/src/deprecated/components/Select/Select.tsx".to_string();
         deprecated_select
             .rendered_components
-            .push("TextInput".to_string());
+            .push("TextInput".into());
 
         let migration_changes = diff_profiles(&deprecated_select, &select_v6);
 
@@ -2154,34 +2151,34 @@ export { DropdownList } from './DropdownList';
                     strength: EdgeStrength::Required,
                     prop_name: None,
                 },
-                // Step 8.6: ModalBox → ModalBody (secondary block fallback)
+                // Step 8.6: ModalBox → ModalBody (secondary block fallback, Structural = CHP=YES)
                 CompositionEdge {
                     parent: "ModalBox".into(),
                     child: "ModalBody".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: Some("secondary block fallback".into()),
-                    strength: EdgeStrength::Allowed,
+                    strength: EdgeStrength::Structural,
                     prop_name: None,
                 },
-                // Step 8.6: ModalBox → ModalFooter (secondary block fallback)
+                // Step 8.6: ModalBox → ModalFooter (secondary block fallback, Structural = CHP=YES)
                 CompositionEdge {
                     parent: "ModalBox".into(),
                     child: "ModalFooter".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: Some("secondary block fallback".into()),
-                    strength: EdgeStrength::Allowed,
+                    strength: EdgeStrength::Structural,
                     prop_name: None,
                 },
-                // Step 8.6: ModalBox → ModalHeader (secondary block fallback)
+                // Step 8.6: ModalBox → ModalHeader (secondary block fallback, Structural = CHP=YES)
                 CompositionEdge {
                     parent: "ModalBox".into(),
                     child: "ModalHeader".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: Some("secondary block fallback".into()),
-                    strength: EdgeStrength::Allowed,
+                    strength: EdgeStrength::Structural,
                     prop_name: None,
                 },
             ],

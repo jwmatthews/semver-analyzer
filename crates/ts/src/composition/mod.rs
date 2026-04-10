@@ -52,6 +52,64 @@ pub struct DelegateContext<'a> {
 /// 8.7. Prop-passed detection (ReactNode/ReactElement props → PropPassed edges)
 /// 9. Suppress root edges when intermediate exists
 /// 10. Drop unconnected members (exported orphans are retained)
+///
+/// **Signal combining**: When multiple steps detect the same (parent, child)
+/// pair, their strengths are combined via `EdgeStrength::combine()` (OR per
+/// dimension). This ensures that CSS `>` (Structural) + DOM nesting (Required)
+/// produces Required, rather than the first signal winning and the second
+/// being discarded.
+
+/// Record a signal for a (parent, child) edge. If the edge already exists,
+/// combines the new strength with the existing one. If it's new, creates it.
+///
+/// Relationship priority: Internal > PropPassed > DirectChild.
+/// Evidence strings are concatenated with " + " to preserve the audit trail.
+fn record_signal(
+    tree: &mut CompositionTree,
+    edge_map: &mut HashMap<(String, String), usize>,
+    parent: String,
+    child: String,
+    strength: EdgeStrength,
+    relationship: ChildRelationship,
+    evidence: String,
+    prop_name: Option<String>,
+) {
+    let key = (parent.clone(), child.clone());
+    if let Some(&idx) = edge_map.get(&key) {
+        // Upgrade existing edge
+        let edge = &mut tree.edges[idx];
+        edge.strength = edge.strength.combine(&strength);
+        edge.required = edge.strength.parent_requires_child();
+        // Upgrade relationship if new one is more specific
+        if relationship == ChildRelationship::Internal
+            || (relationship == ChildRelationship::PropPassed
+                && edge.relationship == ChildRelationship::DirectChild)
+        {
+            edge.relationship = relationship;
+        }
+        if let Some(pn) = prop_name {
+            edge.prop_name = Some(pn);
+        }
+        // Append evidence
+        if let Some(ref mut ev) = edge.bem_evidence {
+            ev.push_str(" + ");
+            ev.push_str(&evidence);
+        }
+    } else {
+        let idx = tree.edges.len();
+        tree.edges.push(CompositionEdge {
+            parent,
+            child,
+            relationship,
+            required: strength.parent_requires_child(),
+            bem_evidence: Some(evidence),
+            strength,
+            prop_name,
+        });
+        edge_map.insert(key, idx);
+    }
+}
+
 pub fn build_composition_tree_v2(
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
@@ -76,8 +134,11 @@ pub fn build_composition_tree_v2(
         edges: Vec::new(),
     };
 
-    // Track existing edges for O(1) dedup lookups instead of linear scan
-    let mut edge_set: HashSet<(String, String)> = HashSet::new();
+    // Track existing edges for O(1) lookup. Maps (parent, child) to the
+    // edge's index in tree.edges. When multiple signals target the same
+    // pair, their strengths are combined (ORed per dimension) instead of
+    // the first signal winning.
+    let mut edge_map: HashMap<(String, String), usize> = HashMap::new();
 
     // Resolve the primary CSS profile from the profiles map.
     let css_profile = primary_css_block.and_then(|key| css_profiles?.get(key));
@@ -97,19 +158,27 @@ pub fn build_composition_tree_v2(
             continue;
         };
         for rendered in &parent_profile.rendered_components {
-            if family_set.contains(rendered.as_str()) {
-                let key = (parent_name.clone(), rendered.clone());
-                if edge_set.insert(key) {
-                    tree.edges.push(CompositionEdge {
-                        parent: parent_name.clone(),
-                        child: rendered.clone(),
-                        relationship: ChildRelationship::Internal,
-                        required: true,
-                        bem_evidence: Some("internally rendered".to_string()),
-                        strength: EdgeStrength::Required,
-                        prop_name: None,
-                    });
-                }
+            if family_set.contains(rendered.name.as_str()) {
+                let strength = if rendered.conditional {
+                    EdgeStrength::Allowed
+                } else {
+                    EdgeStrength::Wrapper
+                };
+                let evidence = if rendered.conditional {
+                    "conditionally rendered".to_string()
+                } else {
+                    "internally rendered".to_string()
+                };
+                record_signal(
+                    &mut tree,
+                    &mut edge_map,
+                    parent_name.clone(),
+                    rendered.name.clone(),
+                    strength,
+                    ChildRelationship::Internal,
+                    evidence,
+                    None,
+                );
             }
         }
     }
@@ -149,33 +218,27 @@ pub fn build_composition_tree_v2(
                 continue;
             }
 
-            let key = (wrapper_parent.to_string(), wrapper_child.to_string());
-            if edge_set.insert(key) {
-                debug!(
-                    parent = %wrapper_parent,
-                    child = %wrapper_child,
-                    delegate_parent = %edge.parent,
-                    delegate_child = %edge.child,
-                    delegate_family = %ctx.delegate_tree.root,
-                    "delegate tree projection"
-                );
-                tree.edges.push(CompositionEdge {
-                    parent: wrapper_parent.to_string(),
-                    child: wrapper_child.to_string(),
-                    relationship: edge.relationship.clone(),
-                    required: false,
-                    bem_evidence: Some(format!(
-                        "Delegate projection from {} tree: {} wraps {}, {} wraps {}",
-                        ctx.delegate_tree.root,
-                        wrapper_parent,
-                        edge.parent,
-                        wrapper_child,
-                        edge.child,
-                    )),
-                    strength: EdgeStrength::Allowed,
-                    prop_name: None,
-                });
-            }
+            debug!(
+                parent = %wrapper_parent,
+                child = %wrapper_child,
+                delegate_parent = %edge.parent,
+                delegate_child = %edge.child,
+                delegate_family = %ctx.delegate_tree.root,
+                "delegate tree projection"
+            );
+            record_signal(
+                &mut tree,
+                &mut edge_map,
+                wrapper_parent.to_string(),
+                wrapper_child.to_string(),
+                edge.strength.clone(),
+                edge.relationship.clone(),
+                format!(
+                    "Delegate projection from {} tree: {} wraps {}, {} wraps {}",
+                    ctx.delegate_tree.root, wrapper_parent, edge.parent, wrapper_child, edge.child,
+                ),
+                None,
+            );
         }
     }
 
@@ -195,37 +258,35 @@ pub fn build_composition_tree_v2(
             let child_ambiguous = child_comps.len() > 1;
             for parent_comp in parent_comps {
                 for child_comp in child_comps {
-                    let key = (parent_comp.clone(), child_comp.clone());
-                    if parent_comp != child_comp && edge_set.insert(key) {
-                        // If the reverse edge already exists (child→parent from
-                        // a prior step), this creates a bidirectional pair.
-                        // Bidirectional CSS relationships represent optional
-                        // recursive nesting (e.g., WizardNavItem > WizardNav
-                        // for sub-navigation), not mandatory containment.
-                        let reverse_key = (child_comp.clone(), parent_comp.clone());
-                        let has_reverse = edge_set.contains(&reverse_key);
-                        let strength = if *child_comp == root
-                            || parent_ambiguous
-                            || child_ambiguous
-                            || has_reverse
-                        {
-                            EdgeStrength::Allowed
-                        } else {
-                            EdgeStrength::Required
-                        };
-                        tree.edges.push(CompositionEdge {
-                            parent: parent_comp.clone(),
-                            child: child_comp.clone(),
-                            relationship: ChildRelationship::DirectChild,
-                            required: false,
-                            bem_evidence: Some(format!(
-                                "CSS direct child: .{} > .{}",
-                                css_parent, css_child
-                            )),
-                            strength,
-                            prop_name: None,
-                        });
+                    if parent_comp == child_comp {
+                        continue;
                     }
+                    // If the reverse edge already exists (child→parent from
+                    // a prior step), this creates a bidirectional pair.
+                    // Bidirectional CSS relationships represent optional
+                    // recursive nesting (e.g., WizardNavItem > WizardNav
+                    // for sub-navigation), not mandatory containment.
+                    let reverse_key = (child_comp.clone(), parent_comp.clone());
+                    let has_reverse = edge_map.contains_key(&reverse_key);
+                    let strength = if *child_comp == root
+                        || parent_ambiguous
+                        || child_ambiguous
+                        || has_reverse
+                    {
+                        EdgeStrength::Allowed
+                    } else {
+                        EdgeStrength::Structural
+                    };
+                    record_signal(
+                        &mut tree,
+                        &mut edge_map,
+                        parent_comp.clone(),
+                        child_comp.clone(),
+                        strength,
+                        ChildRelationship::DirectChild,
+                        format!("CSS direct child: .{} > .{}", css_parent, css_child),
+                        None,
+                    );
                 }
             }
         }
@@ -298,26 +359,24 @@ pub fn build_composition_tree_v2(
                 }
 
                 if let Some(parent_comp) = best_parent {
-                    let key = (parent_comp.to_string(), child_comp.clone());
-                    if edge_set.insert(key) {
-                        let strength = if *child_comp == root || child_ambiguous {
-                            EdgeStrength::Allowed
-                        } else {
-                            EdgeStrength::Required
-                        };
-                        tree.edges.push(CompositionEdge {
-                            parent: parent_comp.to_string(),
-                            child: child_comp.clone(),
-                            relationship: ChildRelationship::DirectChild,
-                            required: false,
-                            bem_evidence: Some(format!(
-                                "CSS grid: {} has grid-template, {} has grid-column/row",
-                                parent_comp, child_comp
-                            )),
-                            strength,
-                            prop_name: None,
-                        });
-                    }
+                    let strength = if *child_comp == root || child_ambiguous {
+                        EdgeStrength::Allowed
+                    } else {
+                        EdgeStrength::Structural
+                    };
+                    record_signal(
+                        &mut tree,
+                        &mut edge_map,
+                        parent_comp.to_string(),
+                        child_comp.clone(),
+                        strength,
+                        ChildRelationship::DirectChild,
+                        format!(
+                            "CSS grid: {} has grid-template, {} has grid-column/row",
+                            parent_comp, child_comp
+                        ),
+                        None,
+                    );
                 }
             }
         }
@@ -398,26 +457,24 @@ pub fn build_composition_tree_v2(
                     }
 
                     if let Some(parent_comp) = best_parent {
-                        let key = (parent_comp.to_string(), child_comp.clone());
-                        if edge_set.insert(key) {
-                            let strength = if *child_comp == root || child_ambiguous {
-                                EdgeStrength::Allowed
-                            } else {
-                                EdgeStrength::Required
-                            };
-                            tree.edges.push(CompositionEdge {
-                                parent: parent_comp.to_string(),
-                                child: child_comp.clone(),
-                                relationship: ChildRelationship::DirectChild,
-                                required: false,
-                                bem_evidence: Some(format!(
-                                    "CSS grid: {} is grid container, {} is implicit grid child",
-                                    parent_comp, child_comp
-                                )),
-                                strength,
-                                prop_name: None,
-                            });
-                        }
+                        let strength = if *child_comp == root || child_ambiguous {
+                            EdgeStrength::Allowed
+                        } else {
+                            EdgeStrength::Structural
+                        };
+                        record_signal(
+                            &mut tree,
+                            &mut edge_map,
+                            parent_comp.to_string(),
+                            child_comp.clone(),
+                            strength,
+                            ChildRelationship::DirectChild,
+                            format!(
+                                "CSS grid: {} is grid container, {} is implicit grid child",
+                                parent_comp, child_comp
+                            ),
+                            None,
+                        );
                     }
                 }
             }
@@ -544,21 +601,19 @@ pub fn build_composition_tree_v2(
                         });
 
                     if let Some((best_parent, _)) = best {
-                        let key = (best_parent.clone(), child_name.clone());
-                        if edge_set.insert(key) {
-                            tree.edges.push(CompositionEdge {
-                                parent: best_parent.clone(),
-                                child: child_name.clone(),
-                                relationship: ChildRelationship::DirectChild,
-                                required: false,
-                                bem_evidence: Some(format!(
-                                    "CSS flex context: {} wraps children in flex, root is grid",
-                                    best_parent
-                                )),
-                                strength: EdgeStrength::Allowed,
-                                prop_name: None,
-                            });
-                        }
+                        record_signal(
+                            &mut tree,
+                            &mut edge_map,
+                            best_parent.clone(),
+                            child_name.clone(),
+                            EdgeStrength::Allowed,
+                            ChildRelationship::DirectChild,
+                            format!(
+                                "CSS flex context: {} wraps children in flex, root is grid",
+                                best_parent
+                            ),
+                            None,
+                        );
                     }
                 }
             }
@@ -574,21 +629,19 @@ pub fn build_composition_tree_v2(
             };
             for parent_comp in parent_comps {
                 for child_comp in child_comps {
-                    let key = (parent_comp.clone(), child_comp.clone());
-                    if parent_comp != child_comp && edge_set.insert(key) {
-                        tree.edges.push(CompositionEdge {
-                            parent: parent_comp.clone(),
-                            child: child_comp.clone(),
-                            relationship: ChildRelationship::DirectChild,
-                            required: false,
-                            bem_evidence: Some(format!(
-                                "CSS descendant: .{} .{}",
-                                css_parent, css_child
-                            )),
-                            strength: EdgeStrength::Allowed,
-                            prop_name: None,
-                        });
+                    if parent_comp == child_comp {
+                        continue;
                     }
+                    record_signal(
+                        &mut tree,
+                        &mut edge_map,
+                        parent_comp.clone(),
+                        child_comp.clone(),
+                        EdgeStrength::Allowed,
+                        ChildRelationship::DirectChild,
+                        format!("CSS descendant: .{} .{}", css_parent, css_child),
+                        None,
+                    );
                 }
             }
         }
@@ -611,33 +664,35 @@ pub fn build_composition_tree_v2(
             };
             for container_comp in container_comps {
                 for child_comp in child_comps {
-                    let key = (container_comp.clone(), child_comp.clone());
-                    if container_comp != child_comp && edge_set.insert(key) {
-                        tree.edges.push(CompositionEdge {
-                            parent: container_comp.clone(),
-                            child: child_comp.clone(),
-                            relationship: ChildRelationship::DirectChild,
-                            required: false,
-                            bem_evidence: Some(format!(
-                                "CSS layout container: .{} wraps .{} (shared CSS rule with flex-wrap/gap)",
-                                css_container, css_child
-                            )),
-                            strength: EdgeStrength::Allowed, prop_name: None,
-                        });
+                    if container_comp == child_comp {
+                        continue;
                     }
+                    record_signal(
+                        &mut tree,
+                        &mut edge_map,
+                        container_comp.clone(),
+                        child_comp.clone(),
+                        EdgeStrength::Allowed,
+                        ChildRelationship::DirectChild,
+                        format!(
+                            "CSS layout container: .{} wraps .{} (shared CSS rule with flex-wrap/gap)",
+                            css_container, css_child
+                        ),
+                        None,
+                    );
                 }
             }
         }
     }
 
     // ── Step 6: React context ───────────────────────────────────────
-    infer_context_nesting(&mut tree, profiles, family_exports);
+    infer_context_nesting(&mut tree, &mut edge_map, profiles, family_exports);
 
     // ── Step 7: DOM nesting ─────────────────────────────────────────
-    infer_dom_nesting(&mut tree, profiles, family_exports);
+    infer_dom_nesting(&mut tree, &mut edge_map, profiles, family_exports);
 
     // ── Step 8: cloneElement threading ──────────────────────────────
-    infer_clone_element_nesting(&mut tree, profiles, family_exports);
+    infer_clone_element_nesting(&mut tree, &mut edge_map, profiles, family_exports);
 
     // ── Step 8.5: BEM element orphan fallback ──────────────────────
     // For family members with zero incoming edges after all structural
@@ -705,28 +760,29 @@ pub fn build_composition_tree_v2(
                     }
                 }
 
-                let key = (root.clone(), member.clone());
-                if edge_set.insert(key) {
-                    debug!(
-                        root = %root,
-                        member = %member,
-                        "BEM orphan fallback: connecting orphan to root"
-                    );
-                    fallback_edges.push(CompositionEdge {
-                        parent: root.clone(),
-                        child: member.clone(),
-                        relationship: ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence: Some(format!(
-                            "BEM element fallback: {} is a BEM element of {}'s block with no other parent",
-                            member, root
-                        )),
-                        strength: EdgeStrength::Allowed, prop_name: None,
-                    });
-                }
+                debug!(
+                    root = %root,
+                    member = %member,
+                    "BEM orphan fallback: connecting orphan to root"
+                );
+                fallback_edges.push((root.clone(), member.clone()));
             }
 
-            tree.edges.extend(fallback_edges);
+            for (parent, child) in fallback_edges {
+                record_signal(
+                    &mut tree,
+                    &mut edge_map,
+                    parent.clone(),
+                    child.clone(),
+                    EdgeStrength::Allowed,
+                    ChildRelationship::DirectChild,
+                    format!(
+                        "BEM element fallback: {} is a BEM element of {}'s block with no other parent",
+                        child, parent
+                    ),
+                    None,
+                );
+            }
         }
     }
 
@@ -839,30 +895,33 @@ pub fn build_composition_tree_v2(
                     continue;
                 }
 
-                let key = (sub_root.to_string(), member.clone());
-                if edge_set.insert(key) {
-                    debug!(
-                        sub_root = %sub_root,
-                        member = %member,
-                        secondary_block = %sec_block,
-                        "Secondary block fallback: connecting orphan to sub-root"
-                    );
-                    sec_fallback_edges.push(CompositionEdge {
-                        parent: sub_root.to_string(),
-                        child: member.clone(),
-                        relationship: ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence: Some(format!(
-                            "Secondary block fallback: {} is a BEM element of {}'s block ({})",
-                            member, sub_root, sec_block
-                        )),
-                        strength: EdgeStrength::Allowed,
-                        prop_name: None,
-                    });
-                }
+                debug!(
+                    sub_root = %sub_root,
+                    member = %member,
+                    secondary_block = %sec_block,
+                    "Secondary block fallback: connecting orphan to sub-root"
+                );
+                sec_fallback_edges.push((sub_root.to_string(), member.clone(), sec_block.clone()));
             }
 
-            tree.edges.extend(sec_fallback_edges);
+            for (parent, child, block) in sec_fallback_edges {
+                record_signal(
+                    &mut tree,
+                    &mut edge_map,
+                    parent.clone(),
+                    child.clone(),
+                    // CHP=YES: BEM element CSS classes are designed to be styled inside their
+                    // block's container. Placing them outside breaks styling.
+                    // PMC=NO: the parent doesn't necessarily require every BEM element child.
+                    EdgeStrength::Structural,
+                    ChildRelationship::DirectChild,
+                    format!(
+                        "Secondary block fallback: {} is a BEM element of {}'s block ({})",
+                        child, parent, block
+                    ),
+                    None,
+                );
+            }
         }
     }
 
@@ -941,28 +1000,19 @@ pub fn build_composition_tree_v2(
                             ));
                         } else if !parented.contains(child_name) {
                             // Create new PropPassed edge for orphan
-                            let key = (parent_name.clone(), child_name.clone());
-                            if edge_set.insert(key) {
-                                debug!(
-                                    parent = %parent_name,
-                                    child = %child_name,
-                                    prop = %prop_name,
-                                    "Prop-passed detection: {} accepts {} via prop '{}'",
-                                    parent_name, child_name, prop_name
-                                );
-                                new_prop_edges.push(CompositionEdge {
-                                    parent: parent_name.clone(),
-                                    child: child_name.clone(),
-                                    relationship: ChildRelationship::PropPassed,
-                                    required: false,
-                                    bem_evidence: Some(format!(
-                                        "Prop-passed: {} accepts {} via `{}` prop ({})",
-                                        parent_name, child_name, prop_name, prop_type
-                                    )),
-                                    strength: EdgeStrength::Allowed,
-                                    prop_name: Some(prop_name.clone()),
-                                });
-                            }
+                            debug!(
+                                parent = %parent_name,
+                                child = %child_name,
+                                prop = %prop_name,
+                                "Prop-passed detection: {} accepts {} via prop '{}'",
+                                parent_name, child_name, prop_name
+                            );
+                            new_prop_edges.push((
+                                parent_name.clone(),
+                                child_name.clone(),
+                                prop_name.clone(),
+                                prop_type.clone(),
+                            ));
                         }
                         break; // Found a match for this parent, no need to check more props
                     }
@@ -970,7 +1020,21 @@ pub fn build_composition_tree_v2(
             }
         }
 
-        tree.edges.extend(new_prop_edges);
+        for (parent, child, prop, ptype) in new_prop_edges {
+            record_signal(
+                &mut tree,
+                &mut edge_map,
+                parent.clone(),
+                child.clone(),
+                EdgeStrength::Allowed,
+                ChildRelationship::PropPassed,
+                format!(
+                    "Prop-passed: {} accepts {} via `{}` prop ({})",
+                    parent, child, prop, ptype
+                ),
+                Some(prop),
+            );
+        }
 
         // Reclassify existing edges
         for (parent, child, prop) in reclassify {
@@ -991,6 +1055,7 @@ pub fn build_composition_tree_v2(
 
     // ── Step 9: Suppress + dedup ───────────────────────────────────
     deduplicate_edges(&mut tree);
+    swap_mutual_css_strengths(&mut tree);
     suppress_root_edges_with_intermediate(&mut tree);
 
     // ── Step 10: Drop unconnected members ───────────────────────────
@@ -1040,17 +1105,15 @@ pub fn build_composition_tree_v2(
 ///    the same layout props (height, width, theme) into non-family primitives.
 fn infer_clone_element_nesting(
     tree: &mut CompositionTree,
+    edge_map: &mut HashMap<(String, String), usize>,
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
 ) {
     // Collect existing edges from prior steps to detect reverse conflicts
-    let prior_edges: HashSet<(&str, &str)> = tree
-        .edges
-        .iter()
-        .map(|e| (e.parent.as_str(), e.child.as_str()))
-        .collect();
+    let prior_edges: HashSet<(String, String)> = edge_map.keys().cloned().collect();
 
-    let mut new_edges = Vec::new();
+    // Collect candidate signals: (parent, child, evidence)
+    let mut candidates: Vec<(String, String, String)> = Vec::new();
 
     for parent_name in family_exports {
         let Some(parent_profile) = profiles.get(parent_name) else {
@@ -1060,9 +1123,13 @@ fn infer_clone_element_nesting(
             continue;
         }
 
-        // Collect all injected prop names, filtering out universal props
-        // that every component declares (children, className, style, etc.)
-        // — these create false edges because they match everything.
+        // Skip components that don't accept children — their cloneElement
+        // calls target internally-created elements (e.g., dropdown items),
+        // not consumer-provided children.
+        if !parent_profile.has_children_prop {
+            continue;
+        }
+
         let universal_props: HashSet<&str> =
             ["children", "className", "style", "id", "key", "ref"].into();
 
@@ -1077,17 +1144,12 @@ fn infer_clone_element_nesting(
             continue;
         }
 
-        // Find family members that declare any of these props
         for child_name in family_exports {
             if child_name == parent_name {
                 continue;
             }
-            if edge_exists(tree, parent_name, child_name) {
-                continue;
-            }
             // Filter 1: skip if reverse edge already exists from a prior step.
-            // If B→A exists (B renders A), creating A→B would be a false cycle.
-            if prior_edges.contains(&(child_name.as_str(), parent_name.as_str())) {
+            if prior_edges.contains(&(child_name.clone(), parent_name.clone())) {
                 continue;
             }
 
@@ -1095,7 +1157,6 @@ fn infer_clone_element_nesting(
                 continue;
             };
 
-            // Check if child declares any of the injected props
             let matching_props: Vec<&str> = injected_props
                 .iter()
                 .filter(|prop| child_profile.all_props.contains(**prop))
@@ -1103,35 +1164,42 @@ fn infer_clone_element_nesting(
                 .collect();
 
             if !matching_props.is_empty() {
-                new_edges.push(CompositionEdge {
-                    parent: parent_name.clone(),
-                    child: child_name.clone(),
-                    relationship: ChildRelationship::DirectChild,
-                    required: false,
-                    bem_evidence: Some(format!(
+                candidates.push((
+                    parent_name.clone(),
+                    child_name.clone(),
+                    format!(
                         "cloneElement: {} injects [{}], {} declares them",
                         parent_name,
                         matching_props.join(", "),
                         child_name
-                    )),
-                    strength: EdgeStrength::Required,
-                    prop_name: None,
-                });
+                    ),
+                ));
             }
         }
     }
 
     // Filter 2: remove bidirectional cloneElement pairs.
-    // If A→B and B→A both come from cloneElement, they indicate peers
-    // with shared prop vocabulary, not a parent-child relationship.
-    let clone_pairs: HashSet<(String, String)> = new_edges
+    let clone_pairs: HashSet<(String, String)> = candidates
         .iter()
-        .map(|e| (e.parent.clone(), e.child.clone()))
+        .map(|(p, c, _)| (p.clone(), c.clone()))
         .collect();
 
-    new_edges.retain(|e| !clone_pairs.contains(&(e.child.clone(), e.parent.clone())));
+    candidates.retain(|(p, c, _)| !clone_pairs.contains(&(c.clone(), p.clone())));
 
-    tree.edges.extend(new_edges);
+    for (parent, child, evidence) in candidates {
+        record_signal(
+            tree,
+            edge_map,
+            parent,
+            child,
+            // CHP=YES: child relies on injected props from parent (missing props breaks functionality).
+            // PMC=NO: parent processes whatever children it has, doesn't demand a specific child type.
+            EdgeStrength::Structural,
+            ChildRelationship::DirectChild,
+            evidence,
+            None,
+        );
+    }
 }
 
 /// Build a mapping from CSS BEM element names to component names.
@@ -1222,12 +1290,6 @@ fn camel_to_kebab(s: &str) -> String {
 }
 
 /// Check if an edge from parent to child already exists in the tree.
-fn edge_exists(tree: &CompositionTree, parent: &str, child: &str) -> bool {
-    tree.edges
-        .iter()
-        .any(|e| e.parent == parent && e.child == child)
-}
-
 /// Infer parent→child edges from HTML DOM nesting rules.
 ///
 /// For each family member that wraps `{children}` in an HTML element,
@@ -1241,17 +1303,12 @@ fn edge_exists(tree: &CompositionTree, parent: &str, child: &str) -> bool {
 /// but MenuItem's `<li>` goes inside MenuList's `<ul>`).
 fn infer_dom_nesting(
     tree: &mut CompositionTree,
+    edge_map: &mut HashMap<(String, String), usize>,
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
 ) {
-    // Build a set of existing edges to avoid duplicates
-    let existing: HashSet<(String, String)> = tree
-        .edges
-        .iter()
-        .map(|e| (e.parent.clone(), e.child.clone()))
-        .collect();
-
-    let mut new_edges = Vec::new();
+    // Collect DOM nesting signals: (parent, child, slot_el, root_el)
+    let mut signals: Vec<(String, String, String, String)> = Vec::new();
 
     for parent_name in family_exports {
         let Some(parent_profile) = profiles.get(parent_name) else {
@@ -1261,8 +1318,6 @@ fn infer_dom_nesting(
             continue;
         }
 
-        // Get the element that wraps {children} — last lowercase entry
-        // in children_slot_path
         let slot_element = parent_profile
             .children_slot_path
             .iter()
@@ -1273,18 +1328,13 @@ fn infer_dom_nesting(
             continue;
         };
 
-        // Get the expected child elements for this slot
         let expected_children = html_expected_children(slot_el);
         if expected_children.is_empty() {
             continue;
         }
 
-        // Check if any family member renders one of these elements as root
         for child_name in family_exports {
             if child_name == parent_name {
-                continue;
-            }
-            if existing.contains(&(parent_name.clone(), child_name.clone())) {
                 continue;
             }
 
@@ -1292,8 +1342,6 @@ fn infer_dom_nesting(
                 continue;
             };
 
-            // Get the child's root element — first lowercase entry in
-            // children_slot_path, or the most prominent rendered element
             let child_root = child_profile
                 .children_slot_path
                 .first()
@@ -1303,24 +1351,48 @@ fn infer_dom_nesting(
 
             if let Some(ref root_el) = child_root {
                 if expected_children.contains(&root_el.as_str()) {
-                    new_edges.push(CompositionEdge {
-                        parent: parent_name.clone(),
-                        child: child_name.clone(),
-                        relationship: ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence: Some(format!(
-                            "DOM nesting: {} wraps children in <{}>, {} renders <{}> as root",
-                            parent_name, slot_el, child_name, root_el
-                        )),
-                        strength: EdgeStrength::Required,
-                        prop_name: None,
-                    });
+                    signals.push((
+                        parent_name.clone(),
+                        child_name.clone(),
+                        slot_el.clone(),
+                        root_el.clone(),
+                    ));
                 }
             }
         }
     }
 
-    tree.edges.extend(new_edges);
+    // For pure containers with multiple matching children, use Structural
+    // instead of Required. The container needs SOME children, but no
+    // specific child is individually required (e.g., NavList has NavItem,
+    // NavItemSeparator, NavExpandable — all render <li>, but only NavItem
+    // is the "primary" child).
+    let mut parent_dom_child_count: HashMap<String, usize> = HashMap::new();
+    for (parent, _, _, _) in &signals {
+        *parent_dom_child_count.entry(parent.clone()).or_insert(0) += 1;
+    }
+
+    for (parent, child, slot_el, root_el) in signals {
+        let child_count = parent_dom_child_count.get(&parent).copied().unwrap_or(0);
+        let strength = if is_pure_container_tag(&slot_el) && child_count == 1 {
+            EdgeStrength::Required
+        } else {
+            EdgeStrength::Structural
+        };
+        record_signal(
+            tree,
+            edge_map,
+            parent.clone(),
+            child.clone(),
+            strength,
+            ChildRelationship::DirectChild,
+            format!(
+                "DOM nesting: {} wraps children in <{}>, {} renders <{}> as root",
+                parent, slot_el, child, root_el
+            ),
+            None,
+        );
+    }
 
     // ── Flow container fallback ─────────────────────────────────────
     //
@@ -1453,17 +1525,10 @@ fn infer_dom_nesting(
 /// under the provider.
 fn infer_context_nesting(
     tree: &mut CompositionTree,
+    edge_map: &mut HashMap<(String, String), usize>,
     profiles: &HashMap<String, ComponentSourceProfile>,
     family_exports: &[String],
 ) {
-    let existing: HashSet<(String, String)> = tree
-        .edges
-        .iter()
-        .map(|e| (e.parent.clone(), e.child.clone()))
-        .collect();
-
-    let mut new_edges = Vec::new();
-
     // Build map: context_name → provider component
     // Detect from rendered_components entries like "XContext.Provider"
     let mut context_providers: HashMap<String, Vec<String>> = HashMap::new();
@@ -1472,7 +1537,7 @@ fn infer_context_nesting(
             continue;
         };
         for rc in &profile.rendered_components {
-            if let Some(ctx_name) = rc.strip_suffix(".Provider") {
+            if let Some(ctx_name) = rc.name.strip_suffix(".Provider") {
                 context_providers
                     .entry(ctx_name.to_string())
                     .or_default()
@@ -1485,7 +1550,9 @@ fn infer_context_nesting(
         return;
     }
 
-    // For each consumer, find which provider(s) it depends on
+    // Collect signals to add (can't borrow tree mutably while iterating profiles)
+    let mut signals: Vec<(String, String, String)> = Vec::new();
+
     for child_name in family_exports {
         let Some(child_profile) = profiles.get(child_name) else {
             continue;
@@ -1498,10 +1565,7 @@ fn infer_context_nesting(
                         continue;
                     }
 
-                    // Skip re-providers: if the provider also CONSUMES
-                    // the same context, it's re-providing for a nested
-                    // scope (e.g., MenuItem re-provides MenuContext for
-                    // flyout submenus). Only root providers create edges.
+                    // Skip re-providers
                     let Some(provider_profile) = profiles.get(provider_name) else {
                         continue;
                     };
@@ -1514,13 +1578,12 @@ fn infer_context_nesting(
                         );
                         continue;
                     }
-                    if existing.contains(&(provider_name.clone(), child_name.clone())) {
-                        continue;
-                    }
-                    // Avoid duplicate with edges we're about to add
-                    if new_edges.iter().any(|e: &CompositionEdge| {
-                        e.parent == *provider_name && e.child == *child_name
-                    }) {
+
+                    // Avoid duplicate signals within this step
+                    if signals
+                        .iter()
+                        .any(|(p, c, _)| p == provider_name && c == child_name)
+                    {
                         continue;
                     }
 
@@ -1531,31 +1594,31 @@ fn infer_context_nesting(
                         "context nesting inferred"
                     );
 
-                    // Context availability does NOT mean mandatory children.
-                    // A parent providing context means "these children CAN use
-                    // this context if present", not "these children MUST be
-                    // present". For example, ToolbarContent provides
-                    // ToolbarContentContext for ToolbarFilter, but
-                    // <ToolbarContent> with just <ToolbarGroup> children is
-                    // perfectly valid.
-                    new_edges.push(CompositionEdge {
-                        parent: provider_name.clone(),
-                        child: child_name.clone(),
-                        relationship: ChildRelationship::DirectChild,
-                        required: false,
-                        bem_evidence: Some(format!(
-                            "Context nesting: {} provides {}, {} consumes it via useContext",
-                            provider_name, consumed_ctx, child_name
-                        )),
-                        strength: EdgeStrength::Allowed,
-                        prop_name: None,
-                    });
+                    signals.push((
+                        provider_name.clone(),
+                        child_name.clone(),
+                        consumed_ctx.clone(),
+                    ));
                 }
             }
         }
     }
 
-    tree.edges.extend(new_edges);
+    for (provider, child, ctx) in signals {
+        record_signal(
+            tree,
+            edge_map,
+            provider.clone(),
+            child.clone(),
+            EdgeStrength::Structural,
+            ChildRelationship::DirectChild,
+            format!(
+                "Context nesting: {} provides {}, {} consumes it via useContext",
+                provider, ctx, child
+            ),
+            None,
+        );
+    }
 }
 
 /// Get expected child element tags for a given HTML parent element.
@@ -1570,6 +1633,18 @@ fn html_expected_children(parent_tag: &str) -> Vec<&'static str> {
         "optgroup" => vec!["option"],
         _ => vec![],
     }
+}
+
+/// Whether an HTML tag is a "pure container" whose only purpose is to
+/// hold specific children. Empty pure containers are semantically invalid.
+///
+/// Pure containers produce Required (both directions) DOM nesting edges.
+/// Non-pure containers produce Structural (child→parent only) edges.
+fn is_pure_container_tag(tag: &str) -> bool {
+    // Only tags that are truly meaningless without children.
+    // Excluded: ul/ol (empty list is valid HTML), select (empty is valid),
+    // optgroup (option can exist directly in select without optgroup).
+    matches!(tag, "tbody" | "thead" | "tfoot" | "tr" | "dl")
 }
 
 /// Infer the root HTML element from a component's rendered_elements
@@ -1613,6 +1688,90 @@ fn infer_root_element(profile: &ComponentSourceProfile) -> Option<String> {
     None
 }
 
+/// Swap strengths in mutual CSS pairs where one edge is from CSS direct-child
+/// (`>`) and the other is from CSS descendant (` `).
+///
+/// In a mutual pair (A→B + B→A), the CSS `>` direction represents optional
+/// recursive/self-nesting (e.g., WizardNavItem > WizardNav for sub-navigation),
+/// while the CSS descendant direction represents the main hierarchy
+/// (e.g., WizardNav contains WizardNavItems). Step 2 assigns Structural to
+/// CSS `>` edges and Step 5 assigns Allowed to CSS descendant edges, but
+/// when both directions exist, the descendant direction is the primary
+/// relationship and should be Structural. The direct-child direction is the
+/// recursive nesting and should be Allowed.
+fn swap_mutual_css_strengths(tree: &mut CompositionTree) {
+    // Build index: (parent, child) → edge index
+    let mut edge_index: HashMap<(String, String), usize> = HashMap::new();
+    for (i, e) in tree.edges.iter().enumerate() {
+        edge_index.insert((e.parent.clone(), e.child.clone()), i);
+    }
+
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+
+    // Collect swaps to apply (can't mutate while iterating the index)
+    let mut swaps: Vec<(usize, usize)> = Vec::new();
+
+    for (i, e) in tree.edges.iter().enumerate() {
+        let fwd = (e.parent.clone(), e.child.clone());
+        if seen.contains(&fwd) {
+            continue;
+        }
+        let rev = (e.child.clone(), e.parent.clone());
+        if let Some(&j) = edge_index.get(&rev) {
+            seen.insert(fwd);
+            seen.insert(rev);
+
+            let e_fwd = &tree.edges[i];
+            let e_rev = &tree.edges[j];
+
+            // Check: one is "CSS direct child:" Structural, other is "CSS descendant:" Allowed
+            let fwd_is_direct = e_fwd.strength == EdgeStrength::Structural
+                && e_fwd
+                    .bem_evidence
+                    .as_ref()
+                    .is_some_and(|ev| ev.starts_with("CSS direct child:"));
+            let rev_is_desc = e_rev.strength == EdgeStrength::Allowed
+                && e_rev
+                    .bem_evidence
+                    .as_ref()
+                    .is_some_and(|ev| ev.starts_with("CSS descendant:"));
+
+            let rev_is_direct = e_rev.strength == EdgeStrength::Structural
+                && e_rev
+                    .bem_evidence
+                    .as_ref()
+                    .is_some_and(|ev| ev.starts_with("CSS direct child:"));
+            let fwd_is_desc = e_fwd.strength == EdgeStrength::Allowed
+                && e_fwd
+                    .bem_evidence
+                    .as_ref()
+                    .is_some_and(|ev| ev.starts_with("CSS descendant:"));
+
+            if fwd_is_direct && rev_is_desc {
+                // fwd (CSS >) is Structural, rev (CSS desc) is Allowed → swap
+                swaps.push((i, j));
+            } else if rev_is_direct && fwd_is_desc {
+                // rev (CSS >) is Structural, fwd (CSS desc) is Allowed → swap
+                swaps.push((j, i));
+            }
+        }
+    }
+
+    for (direct_idx, desc_idx) in swaps {
+        tracing::debug!(
+            parent_direct = %tree.edges[direct_idx].parent,
+            child_direct = %tree.edges[direct_idx].child,
+            parent_desc = %tree.edges[desc_idx].parent,
+            child_desc = %tree.edges[desc_idx].child,
+            "swapping mutual CSS pair: CSS > becomes Allowed, CSS descendant becomes Structural"
+        );
+        tree.edges[direct_idx].strength = EdgeStrength::Allowed;
+        tree.edges[direct_idx].required = false;
+        tree.edges[desc_idx].strength = EdgeStrength::Structural;
+        tree.edges[desc_idx].required = false;
+    }
+}
+
 /// Suppress root→child BEM edges when a more specific intermediate→child
 /// edge exists from DOM nesting, context, or delegation projection.
 ///
@@ -1627,16 +1786,23 @@ fn infer_root_element(profile: &ComponentSourceProfile) -> Option<String> {
 fn suppress_root_edges_with_intermediate(tree: &mut CompositionTree) {
     let root = &tree.root;
 
-    // Collect children that have a direct_child edge from a non-root
-    // intermediate family member.
-    let children_with_intermediate: HashSet<String> = tree
-        .edges
-        .iter()
-        .filter(|e| e.parent != *root && matches!(e.relationship, ChildRelationship::DirectChild))
-        .map(|e| e.child.clone())
-        .collect();
+    // Collect children with intermediate edges AND their max strength.
+    // Only suppress root edges when the intermediate is at least as
+    // strong — a Required root edge (e.g., CSS `>`) should not be
+    // suppressed by an Allowed intermediate (e.g., layout_children).
+    let mut children_max_strength: HashMap<String, EdgeStrength> = HashMap::new();
+    for edge in &tree.edges {
+        if edge.parent != *root && matches!(edge.relationship, ChildRelationship::DirectChild) {
+            let entry = children_max_strength
+                .entry(edge.child.clone())
+                .or_insert(EdgeStrength::Allowed);
+            if edge.strength > *entry {
+                *entry = edge.strength.clone();
+            }
+        }
+    }
 
-    if children_with_intermediate.is_empty() {
+    if children_max_strength.is_empty() {
         return;
     }
 
@@ -1646,20 +1812,24 @@ fn suppress_root_edges_with_intermediate(tree: &mut CompositionTree) {
         if edge.parent != *root {
             return true;
         }
-        // Keep root edges for children that have NO intermediate
-        if !children_with_intermediate.contains(&edge.child) {
+        // Only suppress DirectChild edges
+        if !matches!(edge.relationship, ChildRelationship::DirectChild) {
             return true;
         }
-        // Suppress root→child direct_child edges when intermediate exists
-        if matches!(edge.relationship, ChildRelationship::DirectChild) {
-            tracing::debug!(
-                root = %root,
-                child = %edge.child,
-                "suppressing root BEM edge — intermediate parent exists"
-            );
-            return false;
+        // Only suppress when intermediate is at least as strong as root edge
+        match children_max_strength.get(&edge.child) {
+            Some(intermediate_strength) if *intermediate_strength >= edge.strength => {
+                tracing::debug!(
+                    root = %root,
+                    child = %edge.child,
+                    root_strength = ?edge.strength,
+                    intermediate_strength = ?intermediate_strength,
+                    "suppressing root edge — equally/more-strong intermediate parent exists"
+                );
+                false
+            }
+            _ => true, // No intermediate, or root edge is stronger
         }
-        true
     });
 
     let suppressed = before - tree.edges.len();
@@ -1667,7 +1837,7 @@ fn suppress_root_edges_with_intermediate(tree: &mut CompositionTree) {
         tracing::debug!(
             root = %root,
             suppressed,
-            "suppressed root→child BEM edges with intermediate parents"
+            "suppressed root→child edges with intermediate parents"
         );
     }
 }
@@ -1937,6 +2107,234 @@ mod tests {
             3,
             "No edges should be suppressed for Masthead"
         );
+    }
+
+    #[test]
+    fn test_swap_mutual_css_strengths_wizard_pattern() {
+        // Wizard scenario: WizardNavItem → WizardNav (Structural, CSS >)
+        // and WizardNav → WizardNavItem (Allowed, CSS descendant).
+        // The CSS > direction is recursive sub-navigation nesting;
+        // the CSS descendant direction is the main hierarchy.
+        // After swap: CSS > becomes Allowed, CSS descendant becomes Structural.
+        let mut tree = CompositionTree {
+            root: "Wizard".into(),
+            family_members: vec!["Wizard".into(), "WizardNav".into(), "WizardNavItem".into()],
+            edges: vec![
+                // CSS > : WizardNavItem contains WizardNav (recursive sub-nav)
+                CompositionEdge {
+                    parent: "WizardNavItem".into(),
+                    child: "WizardNav".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("CSS direct child: .nav-item > .nav-list".into()),
+                    strength: EdgeStrength::Structural,
+                    prop_name: None,
+                },
+                // CSS descendant: WizardNav contains WizardNavItems (main hierarchy)
+                CompositionEdge {
+                    parent: "WizardNav".into(),
+                    child: "WizardNavItem".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("CSS descendant: .nav-list .nav-link".into()),
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        swap_mutual_css_strengths(&mut tree);
+
+        // CSS > direction should now be Allowed (recursive nesting is optional)
+        let direct_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "WizardNavItem" && e.child == "WizardNav")
+            .expect("WizardNavItem → WizardNav edge should exist");
+        assert_eq!(
+            direct_edge.strength,
+            EdgeStrength::Allowed,
+            "CSS > edge should be Allowed after swap"
+        );
+
+        // CSS descendant direction should now be Structural (main hierarchy)
+        let desc_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "WizardNav" && e.child == "WizardNavItem")
+            .expect("WizardNav → WizardNavItem edge should exist");
+        assert_eq!(
+            desc_edge.strength,
+            EdgeStrength::Structural,
+            "CSS descendant edge should be Structural after swap"
+        );
+    }
+
+    #[test]
+    fn test_swap_mutual_css_no_swap_when_not_css_pair() {
+        // Mutual pair where one edge is internal rendering (not CSS).
+        // No swap should happen — only pure CSS mutual pairs are swapped.
+        let mut tree = CompositionTree {
+            root: "DrilldownMenu".into(),
+            family_members: vec!["DrilldownMenu".into(), "Menu".into()],
+            edges: vec![
+                // Internal rendering: DrilldownMenu renders Menu
+                CompositionEdge {
+                    parent: "DrilldownMenu".into(),
+                    child: "Menu".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: Some("internally rendered".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Context: Menu provides context for DrilldownMenu
+                CompositionEdge {
+                    parent: "Menu".into(),
+                    child: "DrilldownMenu".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("Context nesting: Menu provides MenuContext".into()),
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        swap_mutual_css_strengths(&mut tree);
+
+        // No swap — internal rendering is not CSS
+        let internal = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "DrilldownMenu" && e.child == "Menu")
+            .unwrap();
+        assert_eq!(
+            internal.strength,
+            EdgeStrength::Required,
+            "Internal rendering edge should remain Required"
+        );
+
+        let context = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Menu" && e.child == "DrilldownMenu")
+            .unwrap();
+        assert_eq!(
+            context.strength,
+            EdgeStrength::Allowed,
+            "Context edge should remain Allowed"
+        );
+    }
+
+    #[test]
+    fn test_suppress_preserves_stronger_root_edge() {
+        // Card scenario: root→child is Required (CSS `>`), but
+        // intermediate→child is Allowed (layout_children). The root
+        // edge should NOT be suppressed because it's stronger.
+        let mut tree = CompositionTree {
+            root: "Card".into(),
+            family_members: vec![
+                "Card".into(),
+                "CardHeader".into(),
+                "CardBody".into(),
+                "CardFooter".into(),
+            ],
+            edges: vec![
+                // Root → CardHeader (Required, CSS >) — no intermediate, kept
+                CompositionEdge {
+                    parent: "Card".into(),
+                    child: "CardHeader".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: Some("CSS direct child: > .header".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Root → CardBody (Required, CSS >) — has weaker intermediate
+                CompositionEdge {
+                    parent: "Card".into(),
+                    child: "CardBody".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: Some("CSS direct child: > .body".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Root → CardFooter (Required, CSS >) — has weaker intermediate
+                CompositionEdge {
+                    parent: "Card".into(),
+                    child: "CardFooter".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: true,
+                    bem_evidence: Some("CSS direct child: > .footer".into()),
+                    strength: EdgeStrength::Required,
+                    prop_name: None,
+                },
+                // Intermediate: CardHeader → CardBody (Allowed, layout_children)
+                CompositionEdge {
+                    parent: "CardHeader".into(),
+                    child: "CardBody".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("CSS layout container".into()),
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+                // Intermediate: CardHeader → CardFooter (Allowed, layout_children)
+                CompositionEdge {
+                    parent: "CardHeader".into(),
+                    child: "CardFooter".into(),
+                    relationship: ChildRelationship::DirectChild,
+                    required: false,
+                    bem_evidence: Some("CSS layout container".into()),
+                    strength: EdgeStrength::Allowed,
+                    prop_name: None,
+                },
+            ],
+        };
+
+        suppress_root_edges_with_intermediate(&mut tree);
+
+        // Card → CardHeader should be kept (no intermediate)
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "Card" && e.child == "CardHeader"),
+            "Card → CardHeader should be kept"
+        );
+
+        // Card → CardBody should be KEPT (Required root > Allowed intermediate)
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "Card" && e.child == "CardBody"),
+            "Card → CardBody should be kept (Required root edge is stronger than Allowed intermediate)"
+        );
+
+        // Card → CardFooter should be KEPT (Required root > Allowed intermediate)
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "Card" && e.child == "CardFooter"),
+            "Card → CardFooter should be kept (Required root edge is stronger than Allowed intermediate)"
+        );
+
+        // Intermediate edges should also be kept
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "CardHeader" && e.child == "CardBody"),
+            "CardHeader → CardBody intermediate should be kept"
+        );
+        assert!(
+            tree.edges
+                .iter()
+                .any(|e| e.parent == "CardHeader" && e.child == "CardFooter"),
+            "CardHeader → CardFooter intermediate should be kept"
+        );
+
+        assert_eq!(tree.edges.len(), 5, "All 5 edges should be preserved");
     }
 
     /// Verify that BEM edges are created with required=false.
@@ -2392,6 +2790,88 @@ mod tests {
             bad_edge.is_none(),
             "Sub → Root should be skipped (reverse of prior Root → Sub). Edges: {:?}",
             tree.edges
+        );
+    }
+
+    #[test]
+    fn test_clone_element_skipped_when_no_children_prop() {
+        use semver_analyzer_core::types::sd::CloneElementInjection;
+
+        // ActionsColumn scenario: parent uses cloneElement on internally-
+        // created elements (dropdown items), NOT on consumer children.
+        // has_children_prop = false → no edge should be created.
+        let mut parent = make_profile("ActionsColumn");
+        parent.has_children_prop = false; // does not accept children
+        parent.clone_element_injections = vec![CloneElementInjection {
+            injected_props: vec!["onClick".into(), "isDisabled".into()],
+        }];
+
+        let mut child = make_profile("DraggableCell");
+        child.has_children_prop = true;
+        child.all_props = vec!["className".into(), "id".into(), "onClick".into()]
+            .into_iter()
+            .collect();
+
+        let mut profiles = HashMap::new();
+        profiles.insert("ActionsColumn".into(), parent);
+        profiles.insert("DraggableCell".into(), child);
+
+        let family = vec!["ActionsColumn".into(), "DraggableCell".into()];
+
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
+
+        // No edge should be created — parent doesn't accept children
+        let false_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "ActionsColumn" && e.child == "DraggableCell");
+        assert!(
+            false_edge.is_none(),
+            "ActionsColumn → DraggableCell should not exist (has_children_prop=false). Edges: {:?}",
+            tree.edges
+        );
+    }
+
+    #[test]
+    fn test_clone_element_works_when_has_children_prop() {
+        use semver_analyzer_core::types::sd::CloneElementInjection;
+
+        // ToggleGroup scenario: parent uses cloneElement on consumer-
+        // provided children. has_children_prop = true → edge is created.
+        let mut parent = make_profile("ToggleGroup");
+        parent.has_children_prop = true; // accepts children
+        parent.clone_element_injections = vec![CloneElementInjection {
+            injected_props: vec!["isDisabled".into()],
+        }];
+
+        let mut child = make_profile("ToggleGroupItem");
+        child.has_children_prop = true;
+        child.all_props = vec!["isDisabled".into(), "onChange".into()]
+            .into_iter()
+            .collect();
+
+        let mut profiles = HashMap::new();
+        profiles.insert("ToggleGroup".into(), parent);
+        profiles.insert("ToggleGroupItem".into(), child);
+
+        let family = vec!["ToggleGroup".into(), "ToggleGroupItem".into()];
+
+        let tree = build_composition_tree_v2(&profiles, &family, None, None, &[], None).unwrap();
+
+        // Edge should be created — parent accepts children and injects via cloneElement
+        let edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "ToggleGroup" && e.child == "ToggleGroupItem");
+        assert!(
+            edge.is_some(),
+            "ToggleGroup → ToggleGroupItem should exist (has_children_prop=true). Edges: {:?}",
+            tree.edges
+        );
+        assert_eq!(
+            edge.unwrap().strength,
+            EdgeStrength::Structural,
+            "cloneElement edge should be Structural (CHP=YES: child needs injected props)"
         );
     }
 
@@ -3079,16 +3559,40 @@ mod tests {
             tree.edges
         );
 
-        // All edges should be Allowed (delegation is optional)
-        for edge in &tree.edges {
-            assert_eq!(
-                edge.strength,
-                EdgeStrength::Allowed,
-                "Projected edge {} → {} should be Allowed",
-                edge.parent,
-                edge.child
-            );
-        }
+        // Projected edges inherit the delegate edge's strength.
+        // Dropdown→DropdownList: delegate Menu→MenuList is Required → Required
+        // DropdownList→DropdownItem: delegate MenuList→MenuItem is Required → Required
+        // Dropdown→DropdownGroup: delegate Menu→MenuGroup is Allowed → Allowed
+        let dl_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Dropdown" && e.child == "DropdownList")
+            .unwrap();
+        assert_eq!(
+            dl_edge.strength,
+            EdgeStrength::Required,
+            "Dropdown → DropdownList should inherit Required from delegate"
+        );
+        let di_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "DropdownList" && e.child == "DropdownItem")
+            .unwrap();
+        assert_eq!(
+            di_edge.strength,
+            EdgeStrength::Required,
+            "DropdownList → DropdownItem should inherit Required from delegate"
+        );
+        let dg_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.parent == "Dropdown" && e.child == "DropdownGroup")
+            .unwrap();
+        assert_eq!(
+            dg_edge.strength,
+            EdgeStrength::Allowed,
+            "Dropdown → DropdownGroup should inherit Allowed from delegate"
+        );
 
         // All 4 members retained (not dropped by Step 10)
         assert_eq!(

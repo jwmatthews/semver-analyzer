@@ -341,45 +341,35 @@ fn generate_conformance_rules(
     let mut rules = Vec::new();
 
     for tree in trees {
-        // ── Step 1: Build the `has_required_incoming` set.
+        // ── Step 1: Build children needing notParent rules.
         //
-        // Members with at least one incoming Required non-internal edge have
-        // a mandatory parent — the constraint is on where they must be PLACED
-        // (notParent rule on the child).
+        // Children with at least one incoming edge that has
+        // child_requires_parent (CHP) — i.e., Required or Structural edges.
+        // These children MUST be placed inside their parent when used.
         //
-        // Members with zero Required incoming edges are "entry points" (the
-        // family root or secondary roots like AlertGroup, JumpLinksList).
-        // These can exist standalone — the constraint is on what they must
-        // CONTAIN (requiresChild rule on the parent).
-        //
-        // Only Required edges count. An Allowed incoming edge (e.g., Tab→Tabs
-        // for recursive nesting) doesn't make the child mandatory — it's a
-        // valid-but-optional placement.
-        let mut has_required_incoming: HashSet<&str> = HashSet::new();
+        // PropPassed edges are included for notParent (the scanner correctly
+        // tracks parent_name through prop expressions).
+        let mut children_needing_not_parent: HashSet<&str> = HashSet::new();
         for edge in &tree.edges {
             if edge.relationship != ChildRelationship::Internal
-                && edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Required
+                && edge.strength.child_requires_parent()
             {
-                has_required_incoming.insert(edge.child.as_str());
+                children_needing_not_parent.insert(edge.child.as_str());
             }
         }
 
-        // ── Step 2: Build parent → required children map.
+        // ── Step 2: Build parent → PMC children map.
         //
-        // Only Required, non-internal edges. Determines WHICH parents need
-        // conformance rules and what type:
-        //   - Parent in no_incoming → requiresChild rule on the parent
-        //   - Parent NOT in no_incoming → notParent rule on each child
+        // Edges where parent_requires_child (PMC) — i.e., Required or Wrapper.
+        // These parents MUST contain these children.
         //
         // PropPassed edges are excluded because the requiresChild scanner
         // only checks direct JSX children (el.children), not prop value
         // expressions. A prop-passed child like <Tab actions={<TabAction/>}/>
         // is invisible to the scanner and would cause guaranteed FPs.
-        // notParent rules still work for prop-passed children because the
-        // scanner correctly tracks parent_name through prop expressions.
         let mut parent_to_req_children: HashMap<&str, Vec<&str>> = HashMap::new();
         for edge in &tree.edges {
-            if edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Required
+            if edge.strength.parent_requires_child()
                 && edge.relationship != ChildRelationship::Internal
                 && edge.relationship != ChildRelationship::PropPassed
             {
@@ -392,7 +382,7 @@ fn generate_conformance_rules(
 
         // ── Step 3: Build child → all parents map.
         //
-        // ALL non-internal edges (Required + Allowed). Used for the notParent
+        // ALL non-internal edges (all strengths). Used for the notParent
         // regex so valid-but-not-required placements don't trigger false
         // positives, and for InvalidDirectChild grandparent lookup.
         let mut child_to_all_parents: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -405,9 +395,9 @@ fn generate_conformance_rules(
             }
         }
 
-        // ── Step 3b: Build parent → all children map (Required + Allowed).
+        // ── Step 3b: Build parent → all children map (all strengths).
         //
-        // Used for the requiresChild scanner regex. Including Allowed children
+        // Used for the requiresChild scanner regex. Including non-PMC children
         // prevents false positives when a parent has valid-but-not-required
         // children (e.g., ToolbarContent with ToolbarGroup/ToolbarItem).
         // The `parent_to_req_children` map still determines WHICH parents get
@@ -429,27 +419,17 @@ fn generate_conformance_rules(
 
         // ── Step 4: Generate rules.
         //
-        // For each parent with Required children, the rule type depends on
-        // whether the parent has incoming edges:
+        // Two independent rule types based on the two dimensions:
         //
-        //   no_incoming parent → requiresChild rule
-        //     "If you use <AlertGroup>, it must contain <Alert> children"
-        //     Scanner: pattern=AlertGroup, requiresChild=^(Alert)$
-        //
-        //   has_incoming parent → notParent rule on each child
-        //     "Td must be inside Tr"
+        //   notParent rule on child:
+        //     Generated for children in children_needing_not_parent.
+        //     "Td must be inside Tr" — child has CHP edge.
         //     Scanner: pattern=Td, notParent=^(Tr)$
-
-        // 4a: Collect children that need notParent rules (parents with incoming edges).
-        //     Group by child to merge parents into one regex.
-        let mut children_needing_not_parent: HashSet<&str> = HashSet::new();
-        for (parent, children) in &parent_to_req_children {
-            if has_required_incoming.contains(parent) {
-                for child in children {
-                    children_needing_not_parent.insert(child);
-                }
-            }
-        }
+        //
+        //   requiresChild rule on parent:
+        //     Generated for parents in parent_to_req_children.
+        //     "ToggleGroup must contain ToggleGroupItem" — parent has PMC edge.
+        //     Scanner: pattern=ToggleGroup, requiresChild=^(ToggleGroupItem)$
 
         // 4b: Generate notParent rules (child must be inside parent).
         for child in &children_needing_not_parent {
@@ -665,18 +645,14 @@ fn generate_conformance_rules(
 
         // 4c: Generate requiresChild rules (parent must contain children).
         //
-        // For parents in no_incoming (roots / secondary roots), the constraint
+        // For parents with PMC edges (Required or Wrapper), the constraint
         // is "if you use this component, it must contain these children."
         //
-        // The scanner regex uses ALL children (Required + Allowed) so that
+        // The scanner regex uses ALL children (all strengths) so that
         // valid-but-optional children don't trigger false positives. The rule
-        // still only fires on parents that have Required children (from
-        // parent_to_req_children), and the description lists the Required ones.
+        // still only fires on parents that have PMC children (from
+        // parent_to_req_children), and the description lists the PMC ones.
         for (parent, children) in &parent_to_req_children {
-            if has_required_incoming.contains(parent) {
-                continue; // handled above as notParent
-            }
-
             let pkg = pkg_for(parent, component_packages);
             let mut sorted_children: Vec<&str> = children.clone();
             sorted_children.sort();
@@ -3574,6 +3550,12 @@ mod tests {
     /// notParent rules. Children of non-root parents get notParent rules.
     #[test]
     fn test_root_gets_requires_child_children_get_not_parent() {
+        // Four-strength model test:
+        // Dropdown→DropdownList: Wrapper (parent renders child internally)
+        //   → generates requiresChild on Dropdown
+        //   → does NOT generate notParent on DropdownList (CHP=NO for Wrapper)
+        // DropdownList→DropdownItem: Required (DOM nesting <ul>→<li>)
+        //   → generates both requiresChild on DropdownList AND notParent on DropdownItem
         let tree = CompositionTree {
             root: "Dropdown".into(),
             family_members: vec![
@@ -3586,9 +3568,9 @@ mod tests {
                     parent: "Dropdown".into(),
                     child: "DropdownList".into(),
                     relationship: ChildRelationship::DirectChild,
-                    required: true,
+                    required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Wrapper,
                     prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
@@ -3605,7 +3587,7 @@ mod tests {
 
         let rules = generate_conformance_rules(&[tree], &[], &test_pkg_map());
 
-        // Dropdown is root (no incoming) → requiresChild rule
+        // Dropdown→DropdownList is Wrapper (PMC=YES) → requiresChild rule on Dropdown
         let dropdown_rule = rules
             .iter()
             .find(|r| r.rule_id.contains("dropdown-req-list"));
@@ -3616,16 +3598,13 @@ mod tests {
         );
         if let KonveyorCondition::FrontendReferenced { referenced } = &dropdown_rule.unwrap().when {
             assert_eq!(referenced.pattern, "^Dropdown$");
-            assert_eq!(
-                referenced.requires_child.as_deref(),
-                Some("^(DropdownList)$"),
-            );
+            assert!(referenced.requires_child.is_some());
             assert!(referenced.not_parent.is_none());
         } else {
             panic!("Expected FrontendReferenced condition");
         }
 
-        // DropdownItem has incoming edge (from DropdownList) → notParent rule
+        // DropdownItem has Required incoming edge (CHP=YES) → notParent rule
         let di_rule = rules.iter().find(|r| r.rule_id.contains("item-in-list"));
         assert!(
             di_rule.is_some(),
@@ -3634,15 +3613,15 @@ mod tests {
         );
         if let KonveyorCondition::FrontendReferenced { referenced } = &di_rule.unwrap().when {
             assert_eq!(referenced.pattern, "^DropdownItem$");
-            assert_eq!(referenced.not_parent.as_deref(), Some("^DropdownList$"),);
+            assert!(referenced.not_parent.is_some());
         } else {
             panic!("Expected FrontendReferenced condition");
         }
 
-        // NO notParent rule for DropdownList (its parent Dropdown is no_incoming)
+        // NO notParent for DropdownList — its parent Dropdown has Wrapper (CHP=NO)
         assert!(
             !rules.iter().any(|r| r.rule_id.contains("list-in")),
-            "DropdownList should not have a notParent rule (parent is root/no_incoming)"
+            "DropdownList should not have a notParent rule (Wrapper edge has CHP=NO)"
         );
     }
 
@@ -4045,6 +4024,8 @@ mod tests {
             "@patternfly/react-core".into(),
         );
 
+        // Four-strength model: AlertGroup wraps Alert/AlertActionCloseButton
+        // via Wrapper edges (parent requires child, child can exist standalone).
         let tree = CompositionTree {
             root: "Alert".into(),
             family_members: vec![
@@ -4054,13 +4035,14 @@ mod tests {
             ],
             edges: vec![
                 // AlertGroup is a secondary root — no incoming edges
+                // Wrapper: AlertGroup must contain Alert, Alert can exist standalone
                 semver_analyzer_core::types::sd::CompositionEdge {
                     parent: "AlertGroup".into(),
                     child: "Alert".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Wrapper,
                     prop_name: None,
                 },
                 semver_analyzer_core::types::sd::CompositionEdge {
@@ -4069,7 +4051,7 @@ mod tests {
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: semver_analyzer_core::types::sd::EdgeStrength::Wrapper,
                     prop_name: None,
                 },
             ],
@@ -4077,7 +4059,7 @@ mod tests {
 
         let rules = generate_conformance_rules(&[tree], &[], &pkgs);
 
-        // AlertGroup should get a requiresChild rule
+        // AlertGroup should get a requiresChild rule (Wrapper = PMC=YES)
         let ag_rule = rules.iter().find(|r| r.rule_id.contains("group-req-"));
         assert!(
             ag_rule.is_some(),
@@ -4101,11 +4083,10 @@ mod tests {
             panic!("Expected FrontendReferenced condition");
         }
 
-        // Alert should NOT get a notParent rule — its only Required parent
-        // is AlertGroup which is no_incoming (secondary root)
+        // Alert should NOT get a notParent rule — Wrapper edges have CHP=NO
         assert!(
             !rules.iter().any(|r| r.rule_id.contains("alert-in")),
-            "Alert should NOT have a notParent rule. Got: {:?}",
+            "Alert should NOT have a notParent rule (Wrapper has CHP=NO). Got: {:?}",
             rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
     }
@@ -4191,10 +4172,12 @@ mod tests {
             rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
 
-        // Tbody should NOT have a notParent rule (parent is Table = no_incoming)
+        // Tbody SHOULD have a notParent rule — Required edges have CHP=YES,
+        // so Tbody must be inside Table regardless of Table being a root.
         assert!(
-            !rules.iter().any(|r| r.rule_id.contains("tbody-in")),
-            "Tbody should NOT have notParent (parent Table is no_incoming)"
+            rules.iter().any(|r| r.rule_id.contains("tbody-in")),
+            "Tbody should have notParent (Required edge has CHP=YES). Got: {:?}",
+            rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
     }
 

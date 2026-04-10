@@ -51,6 +51,54 @@ where
     Ok(result)
 }
 
+/// A React component rendered internally by another component.
+///
+/// Tracks whether the rendering is conditional (inside a ternary,
+/// `&&`, `if` branch) or unconditional (always rendered).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenderedComponent {
+    /// Component name (PascalCase tag, e.g., "ModalBox", "Menu").
+    pub name: String,
+    /// Whether this component is rendered conditionally.
+    /// - `false` — always rendered (unconditional): `return <Child/>`
+    /// - `true` — conditionally rendered: `condition ? <Child/> : null`
+    #[serde(default)]
+    pub conditional: bool,
+}
+
+impl RenderedComponent {
+    pub fn unconditional(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            conditional: false,
+        }
+    }
+
+    pub fn conditional(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            conditional: true,
+        }
+    }
+}
+
+impl From<&str> for RenderedComponent {
+    /// Creates an unconditional RenderedComponent from a string.
+    /// Convenience for test code and migration of existing `vec!["Name".into()]`.
+    fn from(name: &str) -> Self {
+        Self::unconditional(name)
+    }
+}
+
+impl From<String> for RenderedComponent {
+    fn from(name: String) -> Self {
+        Self {
+            name,
+            conditional: false,
+        }
+    }
+}
+
 // ── Source Profile (extracted from a single component) ──────────────────
 
 /// A structured profile of a React component's source-level characteristics.
@@ -73,9 +121,10 @@ pub struct ComponentSourceProfile {
     /// e.g., { "div": 2, "button": 1, "section": 1 }
     pub rendered_elements: BTreeMap<String, u32>,
 
-    /// React components (PascalCase tags) rendered internally.
-    /// e.g., ["Menu", "MenuContent", "Popper"]
-    pub rendered_components: Vec<String>,
+    /// React components (PascalCase tags) rendered internally,
+    /// with a flag indicating whether rendering is conditional.
+    /// e.g., [RenderedComponent { name: "Menu", conditional: false }]
+    pub rendered_components: Vec<RenderedComponent>,
 
     /// ARIA attributes on rendered elements.
     /// Key: (element_tag, attribute_name), Value: attribute_value.
@@ -410,6 +459,17 @@ pub struct CompositionEdge {
 }
 
 /// How strongly a composition edge is enforced.
+///
+/// Four strengths encode two independent constraint dimensions:
+/// - **child-must-have-parent (CHP)**: Does the child break outside the parent?
+/// - **parent-must-have-child (PMC)**: Does the parent need this child?
+///
+/// | Strength   | CHP | PMC | Rule types generated        |
+/// |------------|-----|-----|-----------------------------|
+/// | Required   | YES | YES | `notParent` + `requiresChild` |
+/// | Structural | YES | NO  | `notParent` only             |
+/// | Wrapper    | NO  | YES | `requiresChild` only         |
+/// | Allowed    | NO  | NO  | Neither (regex inclusion only)|
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeStrength {
@@ -417,10 +477,70 @@ pub enum EdgeStrength {
     /// but not the only valid placement. No conformance rule generated.
     #[default]
     Allowed = 0,
-    /// Rendering breaks without this nesting — CSS layout, context,
-    /// DOM semantics, or prop threading requires this parent.
-    /// Conformance rules are generated for Required edges.
-    Required = 1,
+    /// Child must be inside this parent when used (CHP=YES, PMC=NO).
+    /// CSS `>`, CSS grid, React context, DOM nesting (non-container).
+    /// Generates `notParent` rules only.
+    Structural = 1,
+    /// Parent must contain this child (PMC=YES, CHP=NO).
+    /// cloneElement, internal rendering (unconditional).
+    /// Generates `requiresChild` rules only.
+    Wrapper = 2,
+    /// Both directions required (CHP=YES, PMC=YES).
+    /// DOM nesting for pure containers, or Structural + Wrapper combined.
+    /// Generates both `notParent` and `requiresChild` rules.
+    Required = 3,
+}
+
+impl EdgeStrength {
+    /// Whether this strength implies child-must-have-parent (CHP).
+    /// Used by conformance rule generation for `notParent` rules.
+    pub fn child_requires_parent(&self) -> bool {
+        matches!(self, EdgeStrength::Required | EdgeStrength::Structural)
+    }
+
+    /// Whether this strength implies parent-must-have-child (PMC).
+    /// Used by conformance rule generation for `requiresChild` rules.
+    pub fn parent_requires_child(&self) -> bool {
+        matches!(self, EdgeStrength::Required | EdgeStrength::Wrapper)
+    }
+
+    /// Combine two strengths when multiple signals create the same edge.
+    /// Each dimension is ORed independently:
+    /// - If ANY signal says CHP=YES, the result has CHP=YES.
+    /// - If ANY signal says PMC=YES, the result has PMC=YES.
+    pub fn combine(&self, other: &EdgeStrength) -> EdgeStrength {
+        let chp = self.child_requires_parent() || other.child_requires_parent();
+        let pmc = self.parent_requires_child() || other.parent_requires_child();
+        match (chp, pmc) {
+            (true, true) => EdgeStrength::Required,
+            (true, false) => EdgeStrength::Structural,
+            (false, true) => EdgeStrength::Wrapper,
+            (false, false) => EdgeStrength::Allowed,
+        }
+    }
+
+    /// Compute the collapsed strength through a chain of two edges
+    /// (A →outer→ B →inner→ C), producing the transitive edge A → C.
+    ///
+    /// `self` is the outer edge (A→B), `child_edge` is the inner edge (B→C).
+    ///
+    /// CHP (C must be inside A): The inner child (C) must be inside the
+    /// intermediate (B) — inner.CHP — AND the intermediate is guaranteed
+    /// to be inside the transitive parent (A) — outer.PMC (A always
+    /// renders B). If both hold, C transitively must be inside A.
+    ///
+    /// PMC (A must contain C): Only if ALL links say "parent requires
+    /// child" — outer.PMC AND inner.PMC.
+    pub fn collapse_chain(&self, child_edge: &EdgeStrength) -> EdgeStrength {
+        let chp = child_edge.child_requires_parent() && self.parent_requires_child();
+        let pmc = self.parent_requires_child() && child_edge.parent_requires_child();
+        match (chp, pmc) {
+            (true, true) => EdgeStrength::Required,
+            (true, false) => EdgeStrength::Structural,
+            (false, true) => EdgeStrength::Wrapper,
+            (false, false) => EdgeStrength::Allowed,
+        }
+    }
 }
 
 /// How a child component relates to its parent in the composition tree.
@@ -670,4 +790,204 @@ pub struct DeprecatedReplacement {
     /// Host components that confirmed the swap
     /// (e.g., \["ToolbarFilter", "MultiTypeaheadSelect"\]).
     pub evidence_hosts: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── EdgeStrength::combine tests ─────────────────────────────────
+
+    #[test]
+    fn test_combine_structural_plus_wrapper_equals_required() {
+        // CSS > (Structural) + cloneElement (Wrapper) = Required
+        assert_eq!(
+            EdgeStrength::Structural.combine(&EdgeStrength::Wrapper),
+            EdgeStrength::Required,
+        );
+        // Order shouldn't matter
+        assert_eq!(
+            EdgeStrength::Wrapper.combine(&EdgeStrength::Structural),
+            EdgeStrength::Required,
+        );
+    }
+
+    #[test]
+    fn test_combine_allowed_with_structural() {
+        assert_eq!(
+            EdgeStrength::Allowed.combine(&EdgeStrength::Structural),
+            EdgeStrength::Structural,
+        );
+    }
+
+    #[test]
+    fn test_combine_allowed_with_wrapper() {
+        assert_eq!(
+            EdgeStrength::Allowed.combine(&EdgeStrength::Wrapper),
+            EdgeStrength::Wrapper,
+        );
+    }
+
+    #[test]
+    fn test_combine_required_dominates() {
+        assert_eq!(
+            EdgeStrength::Required.combine(&EdgeStrength::Allowed),
+            EdgeStrength::Required,
+        );
+        assert_eq!(
+            EdgeStrength::Required.combine(&EdgeStrength::Structural),
+            EdgeStrength::Required,
+        );
+        assert_eq!(
+            EdgeStrength::Required.combine(&EdgeStrength::Wrapper),
+            EdgeStrength::Required,
+        );
+    }
+
+    #[test]
+    fn test_combine_allowed_stays_allowed() {
+        assert_eq!(
+            EdgeStrength::Allowed.combine(&EdgeStrength::Allowed),
+            EdgeStrength::Allowed,
+        );
+    }
+
+    // ── EdgeStrength::collapse_chain tests ───────────────────────────
+
+    #[test]
+    fn test_collapse_modal_chain_wrapper_then_structural() {
+        // Modal(Wrapper) → ModalContent → ModalBody(Structural)
+        // Wrapper: Modal always renders ModalContent (PMC=YES)
+        // Structural: ModalBody must be inside ModalContent (CHP=YES)
+        // Collapsed: ModalBody must be inside Modal (CHP=YES from
+        // inner, because outer PMC guarantees intermediate is present)
+        // PMC=NO (Structural inner doesn't have PMC)
+        let outer = EdgeStrength::Wrapper;
+        let inner = EdgeStrength::Structural;
+        assert_eq!(
+            outer.collapse_chain(&inner),
+            EdgeStrength::Structural,
+            "Modal→ModalBody should be Structural after collapse"
+        );
+    }
+
+    #[test]
+    fn test_collapse_required_chain() {
+        // Table(Required) → Tbody → Tr(Required)
+        // Both links have CHP+PMC → collapsed is Required
+        let outer = EdgeStrength::Required;
+        let inner = EdgeStrength::Required;
+        assert_eq!(
+            outer.collapse_chain(&inner),
+            EdgeStrength::Required,
+            "Required + Required = Required"
+        );
+    }
+
+    #[test]
+    fn test_collapse_wrapper_chain() {
+        // A(Wrapper) → B → C(Wrapper)
+        // A always renders B, B always renders C
+        // C doesn't need to be inside A (CHP=NO for both)
+        // But A transitively needs C (PMC=YES for both)
+        let outer = EdgeStrength::Wrapper;
+        let inner = EdgeStrength::Wrapper;
+        assert_eq!(
+            outer.collapse_chain(&inner),
+            EdgeStrength::Wrapper,
+            "Wrapper + Wrapper = Wrapper (parent still needs child)"
+        );
+    }
+
+    #[test]
+    fn test_collapse_structural_then_wrapper() {
+        // A(Structural) → B → C(Wrapper)
+        // Structural outer: A doesn't render B (PMC=NO)
+        // So even though B→C is Wrapper (B needs C),
+        // A→C has no constraint (A doesn't guarantee B is present)
+        let outer = EdgeStrength::Structural;
+        let inner = EdgeStrength::Wrapper;
+        assert_eq!(
+            outer.collapse_chain(&inner),
+            EdgeStrength::Allowed,
+            "Structural + Wrapper = Allowed (outer doesn't guarantee intermediate)"
+        );
+    }
+
+    #[test]
+    fn test_collapse_wrapper_then_allowed() {
+        // A(Wrapper) → B → C(Allowed)
+        // Inner is Allowed: C has no constraints relative to B
+        // Collapsed: C has no constraints relative to A
+        let outer = EdgeStrength::Wrapper;
+        let inner = EdgeStrength::Allowed;
+        assert_eq!(
+            outer.collapse_chain(&inner),
+            EdgeStrength::Allowed,
+            "Wrapper + Allowed = Allowed (inner has no constraints)"
+        );
+    }
+
+    #[test]
+    fn test_collapse_allowed_kills_everything() {
+        // If outer is Allowed, nothing propagates
+        let outer = EdgeStrength::Allowed;
+        assert_eq!(
+            outer.collapse_chain(&EdgeStrength::Required),
+            EdgeStrength::Allowed
+        );
+        assert_eq!(
+            outer.collapse_chain(&EdgeStrength::Structural),
+            EdgeStrength::Allowed
+        );
+        assert_eq!(
+            outer.collapse_chain(&EdgeStrength::Wrapper),
+            EdgeStrength::Allowed
+        );
+    }
+
+    #[test]
+    fn test_collapse_required_then_structural() {
+        // A(Required) → B → C(Structural)
+        // CHP: inner.CHP(true) AND outer.PMC(true) = true → C must be inside A
+        // PMC: outer.PMC(true) AND inner.PMC(false) = false → A doesn't need C
+        let outer = EdgeStrength::Required;
+        let inner = EdgeStrength::Structural;
+        assert_eq!(
+            outer.collapse_chain(&inner),
+            EdgeStrength::Structural,
+            "Required + Structural = Structural (child constraint propagates, parent constraint doesn't)"
+        );
+    }
+
+    #[test]
+    fn test_collapse_required_then_wrapper() {
+        // A(Required) → B → C(Wrapper)
+        // CHP: inner.CHP(false) AND outer.PMC(true) = false
+        // PMC: outer.PMC(true) AND inner.PMC(true) = true
+        let outer = EdgeStrength::Required;
+        let inner = EdgeStrength::Wrapper;
+        assert_eq!(
+            outer.collapse_chain(&inner),
+            EdgeStrength::Wrapper,
+            "Required + Wrapper = Wrapper (parent needs child transitively)"
+        );
+    }
+
+    // ── EdgeStrength dimension accessor tests ────────────────────────
+
+    #[test]
+    fn test_strength_dimensions() {
+        assert!(!EdgeStrength::Allowed.child_requires_parent());
+        assert!(!EdgeStrength::Allowed.parent_requires_child());
+
+        assert!(EdgeStrength::Structural.child_requires_parent());
+        assert!(!EdgeStrength::Structural.parent_requires_child());
+
+        assert!(!EdgeStrength::Wrapper.child_requires_parent());
+        assert!(EdgeStrength::Wrapper.parent_requires_child());
+
+        assert!(EdgeStrength::Required.child_requires_parent());
+        assert!(EdgeStrength::Required.parent_requires_child());
+    }
 }
