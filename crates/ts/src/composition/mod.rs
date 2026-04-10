@@ -1058,6 +1058,50 @@ pub fn build_composition_tree_v2(
     swap_mutual_css_strengths(&mut tree);
     suppress_root_edges_with_intermediate(&mut tree);
 
+    // ── Step 9.5: PMC upgrade from required props ───────────────────
+    // When a parent has `children: ReactNode` (required, no `?`) or a
+    // required ReactNode/ReactElement prop matching a child component,
+    // upgrade existing Structural edges to Required (add PMC=YES).
+    //
+    // This covers:
+    // - DataListItem→DataListItemRow: `children: ReactNode` is required
+    // - DrawerContent→DrawerPanelContent: `panelContent: ReactNode` is required
+    for edge in &mut tree.edges {
+        let Some(parent_profile) = profiles.get(&edge.parent) else {
+            continue;
+        };
+        // Skip edges that already have PMC=YES (Required or Wrapper)
+        if edge.strength.parent_requires_child() {
+            continue;
+        }
+        // Skip edges without CHP (we only upgrade Structural→Required, not Allowed→Wrapper)
+        if !edge.strength.child_requires_parent() {
+            continue;
+        }
+        // Fix C: Parent has required `children` prop
+        if parent_profile.required_props.contains("children") {
+            edge.strength = EdgeStrength::Required;
+            edge.required = true;
+            continue;
+        }
+        // Fix E: Parent has a required ReactNode/ReactElement prop matching the child
+        // Check prop-passed edges (they already have a prop_name linking parent prop to child)
+        if let Some(ref prop_name) = edge.prop_name {
+            if parent_profile.required_props.contains(prop_name) {
+                if let Some(prop_type) = parent_profile.prop_types.get(prop_name) {
+                    if prop_type.contains("ReactNode")
+                        || prop_type.contains("ReactElement")
+                        || prop_type.contains("React.ReactNode")
+                        || prop_type.contains("React.ReactElement")
+                    {
+                        edge.strength = EdgeStrength::Required;
+                        edge.required = true;
+                    }
+                }
+            }
+        }
+    }
+
     // ── Step 10: Drop unconnected members ───────────────────────────
     // Members with no edges at all are dropped from the tree, UNLESS
     // they are barrel-file exports (exported_members). Exported orphans
@@ -1374,7 +1418,9 @@ fn infer_dom_nesting(
 
     for (parent, child, slot_el, root_el) in signals {
         let child_count = parent_dom_child_count.get(&parent).copied().unwrap_or(0);
-        let strength = if is_pure_container_tag(&slot_el) && child_count == 1 {
+        let strength = if is_pure_container_tag(&slot_el)
+            && (child_count == 1 || all_children_are_peers(&slot_el))
+        {
             EdgeStrength::Required
         } else {
             EdgeStrength::Structural
@@ -1537,11 +1583,34 @@ fn infer_context_nesting(
             continue;
         };
         for rc in &profile.rendered_components {
+            // Direct member expression: <XContext.Provider>
             if let Some(ctx_name) = rc.name.strip_suffix(".Provider") {
                 context_providers
                     .entry(ctx_name.to_string())
                     .or_default()
                     .push(name.clone());
+            }
+            // Aliased provider: <XContextProvider> or <XProvider>
+            // These are plain identifiers, not member expressions.
+            // Example: `export const TabsContextProvider = TabsContext.Provider`
+            // then `<TabsContextProvider>` in JSX.
+            else if rc.name.ends_with("Provider") && rc.name != "Provider" {
+                let base = rc.name.strip_suffix("Provider").unwrap();
+                // "TabsContextProvider" → base = "TabsContext"
+                // "TabsProvider" → base = "Tabs", candidate = "TabsContext"
+                let candidates = if base.ends_with("Context") {
+                    vec![base.to_string()]
+                } else {
+                    vec![format!("{}Context", base), base.to_string()]
+                };
+                for candidate in candidates {
+                    if !context_providers.contains_key(&candidate) {
+                        context_providers
+                            .entry(candidate)
+                            .or_default()
+                            .push(name.clone());
+                    }
+                }
             }
         }
     }
@@ -1645,6 +1714,17 @@ fn is_pure_container_tag(tag: &str) -> bool {
     // Excluded: select (empty is valid), optgroup (option can exist
     // directly in select without optgroup).
     matches!(tag, "ul" | "ol" | "tbody" | "thead" | "tfoot" | "tr" | "dl")
+}
+
+/// Whether ALL valid HTML children of this tag are interchangeable
+/// structural peers. For these tags, every matching child component
+/// gets Required even when child_count > 1.
+///
+/// Example: `<tr>` accepts both `<td>` and `<th>` — both are table
+/// cells and the row needs at least one. Contrast with `<ul>` where
+/// NavItem is primary but NavItemSeparator is auxiliary.
+fn all_children_are_peers(tag: &str) -> bool {
+    matches!(tag, "tr")
 }
 
 /// Infer the root HTML element from a component's rendered_elements
