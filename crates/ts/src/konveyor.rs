@@ -552,6 +552,36 @@ pub fn generate_rules(
 ) -> Vec<KonveyorRule> {
     let mut rules = Vec::new();
     let mut id_counts: HashMap<String, usize> = HashMap::new();
+
+    // ── Pre-scan: build component → family root lookup ──────────────────────
+    //
+    // Maps component names (and their `XProps` interface variants) to the
+    // family root name from SD composition trees. Used to add `family=` labels
+    // to TD-generated rules so the fix engine can consolidate related
+    // violations into a single family-level LLM prompt.
+    let component_to_family: HashMap<String, String> = if let Some(ref sd) = report.sd_result {
+        let mut map = HashMap::new();
+        for tree in &sd.composition_trees {
+            // Skip deprecated families — they have separate rule namespaces
+            if tree.root.starts_with("deprecated/") {
+                continue;
+            }
+            // Map root and all family members
+            map.insert(tree.root.clone(), tree.root.clone());
+            for member in &tree.family_members {
+                map.insert(member.clone(), tree.root.clone());
+            }
+            // Also map "XProps" variants (e.g., "ModalProps" → "Modal")
+            map.insert(format!("{}Props", tree.root), tree.root.clone());
+            for member in &tree.family_members {
+                map.insert(format!("{}Props", member), tree.root.clone());
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
     // ── Pre-scan: collect components referenced in composition pattern changes ──
     //
     // Components that appear as the `component` in a composition_pattern_change
@@ -1238,6 +1268,7 @@ pub fn generate_rules(
                 &mut id_counts,
                 rename_patterns,
                 member_renames,
+                &component_to_family,
             );
             rules.extend(new_rules);
         }
@@ -1634,14 +1665,21 @@ pub fn generate_rules(
                         }
                     };
 
+                    let mut p0c_labels = vec![
+                        "source=semver-analyzer".to_string(),
+                        "change-type=component-removal".to_string(),
+                        "kind=interface".to_string(),
+                        "has-codemod=false".to_string(),
+                    ];
+                    // Add family label so the fix engine can consolidate this
+                    // rule with other rules from the same component family.
+                    if let Some(family) = component_to_family.get(&comp.name) {
+                        p0c_labels.push(format!("family={}", family));
+                    }
+
                     rules.push(KonveyorRule {
                         rule_id,
-                        labels: vec![
-                            "source=semver-analyzer".to_string(),
-                            "change-type=component-removal".to_string(),
-                            "kind=interface".to_string(),
-                            "has-codemod=false".to_string(),
-                        ],
+                        labels: p0c_labels,
                         effort: 3,
                         category: "mandatory".to_string(),
                         description: format!(
@@ -3091,6 +3129,7 @@ fn api_change_to_rules(
     id_counts: &mut HashMap<String, usize>,
     rename_patterns: &RenamePatterns,
     member_renames: &HashMap<String, String>,
+    component_to_family: &HashMap<String, String>,
 ) -> Vec<KonveyorRule> {
     let file_path = file_changes.file.display().to_string();
     let leaf_symbol = extract_leaf_symbol(&change.symbol);
@@ -3285,6 +3324,14 @@ fn api_change_to_rules(
     // meaning existing consumer code is unaffected.
     if is_additive_change(change) {
         labels.push("change-scope=additive".to_string());
+    }
+
+    // Add family label for fix engine consolidation.
+    // Extract component name from the symbol (e.g., "ModalProps.title" → "ModalProps")
+    // and look up which family it belongs to.
+    let symbol_root = change.symbol.split('.').next().unwrap_or(&change.symbol);
+    if let Some(family) = component_to_family.get(symbol_root) {
+        labels.push(format!("family={}", family));
     }
 
     let condition = build_frontend_condition(change, leaf_symbol, from_pkg);

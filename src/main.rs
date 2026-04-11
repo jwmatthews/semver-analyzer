@@ -661,6 +661,20 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
             let sd_strategies = konveyor::extract_fix_strategies(&sd_rules);
             strategies.extend(sd_strategies);
 
+            // Generate family-level strategies from composition data.
+            // These describe the complete target component structure (e.g., Modal
+            // with ModalHeader/ModalBody/ModalFooter) so the fix engine can build
+            // a single coherent LLM prompt per component family per file.
+            let family_strategies =
+                semver_analyzer_ts::konveyor_v2::generate_family_strategies(&report, sd);
+            if !family_strategies.is_empty() {
+                info!(
+                    count = family_strategies.len(),
+                    "generated family-level strategies"
+                );
+            }
+            strategies.extend(family_strategies);
+
             all_rules.extend(sd_rules);
             sd_rule_phase.finish_with_detail("SD rules generated", &format!("{} rules", sd_count));
         }

@@ -15,6 +15,7 @@ use semver_analyzer_core::types::sd::{
     ChildRelationship, CompositionChangeType, CompositionTree, ConformanceCheck,
     ConformanceCheckType, SdPipelineResult, SourceLevelCategory, SourceLevelChange,
 };
+use semver_analyzer_core::types::MigrationTarget;
 use semver_analyzer_core::{AnalysisReport, ApiChangeType};
 use semver_analyzer_konveyor_core::{
     FixStrategyEntry, FrontendPatternFields, FrontendReferencedFields, KonveyorCondition,
@@ -1889,6 +1890,426 @@ fn format_tree_as_jsx(tree: &CompositionTree) -> String {
 
     let mut visited = HashSet::new();
     render(&tree.root, &parent_children, 1, &mut lines, &mut visited);
+    lines.join("\n")
+}
+
+// ── Family-level strategy generation ────────────────────────────────────
+//
+// Generates one `FixStrategyEntry` per family that has structural composition
+// changes. These entries describe the complete target v6 component structure
+// so the frontend-analyzer-provider can build a single coherent LLM prompt
+// per (file, family) instead of N overlapping rule-level prompts.
+
+/// Generate family-level fix strategy entries for families with structural changes.
+///
+/// Returns a map of `"family:<Name>"` → `FixStrategyEntry` with the complete
+/// target structure, prop assignments, and import changes.
+pub fn generate_family_strategies(
+    report: &AnalysisReport<TypeScript>,
+    sd: &SdPipelineResult,
+) -> HashMap<String, FixStrategyEntry> {
+    let mut family_strats = HashMap::new();
+
+    // Build lookup: component name → removed props (from TD pipeline)
+    let mut removed_props_by_component: HashMap<String, Vec<String>> = HashMap::new();
+    for file_changes in &report.changes {
+        for change in &file_changes.breaking_api_changes {
+            if change.change == ApiChangeType::Removed {
+                if let Some(component) = extract_component_name_from_symbol(&change.symbol) {
+                    if let Some(prop) = extract_prop_name_from_symbol(&change.symbol) {
+                        removed_props_by_component
+                            .entry(component)
+                            .or_default()
+                            .push(prop);
+                    }
+                }
+            }
+        }
+    }
+
+    for tree in &sd.composition_trees {
+        // Skip single-component families and deprecated families
+        if tree.family_members.len() <= 1 || tree.root.starts_with("deprecated/") {
+            continue;
+        }
+
+        // Only generate for families that have composition changes
+        let has_changes = sd.composition_changes.iter().any(|c| c.family == tree.root);
+        if !has_changes {
+            continue;
+        }
+
+        // 1. Render target structure with props
+        let target_jsx = render_family_target_with_props(tree, &sd.new_component_props);
+
+        // 2. Retained props (props on root in new version)
+        let retained_props: Vec<String> = sd
+            .new_component_props
+            .get(&tree.root)
+            .map(|props| {
+                props
+                    .iter()
+                    .filter(|p| p.as_str() != "children" && p.as_str() != "className")
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 3. Prop-to-child map: removed root props that appear on new children
+        let mut prop_to_child: BTreeMap<String, String> = BTreeMap::new();
+        let new_children: HashSet<&str> = tree
+            .edges
+            .iter()
+            .filter(|e| e.parent == tree.root && e.relationship != ChildRelationship::Internal)
+            .map(|e| e.child.as_str())
+            .collect();
+
+        if let Some(removed) = removed_props_by_component.get(&tree.root) {
+            for prop_name in removed {
+                for &child_name in &new_children {
+                    if let Some(child_props) = sd.new_component_props.get(child_name) {
+                        if child_props.contains(prop_name) {
+                            prop_to_child.insert(prop_name.clone(), child_name.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Child-to-parent map: props named after removed children
+        let mut child_props_to_parent: BTreeMap<String, String> = BTreeMap::new();
+        let old_members: HashSet<&str> = sd
+            .old_composition_trees
+            .iter()
+            .find(|t| t.root == tree.root)
+            .map(|t| t.family_members.iter().map(|m| m.as_str()).collect())
+            .unwrap_or_default();
+        let new_members: HashSet<&str> = tree.family_members.iter().map(|m| m.as_str()).collect();
+        let removed_members: Vec<&str> = old_members.difference(&new_members).copied().collect();
+
+        for removed_member in &removed_members {
+            // Check if root gained a prop matching the child suffix
+            if let Some(root_props) = sd.new_component_props.get(&tree.root) {
+                let suffix = removed_member
+                    .strip_prefix(&tree.root)
+                    .unwrap_or(removed_member)
+                    .to_lowercase();
+                for prop in root_props {
+                    if !suffix.is_empty() && prop.to_lowercase() == suffix {
+                        child_props_to_parent.insert(
+                            format!("{}.props", removed_member),
+                            format!("{}.{}", tree.root, prop),
+                        );
+                    }
+                }
+            }
+        }
+
+        // 5. Removed children (in old tree but not new)
+        let removed_children: Vec<String> = removed_members.iter().map(|m| m.to_string()).collect();
+
+        // 6. New imports: child components that consumers need to import
+        let new_imports: Vec<String> = new_children
+            .iter()
+            .filter(|&&child| {
+                // Only include children that didn't exist in the old tree
+                !old_members.contains(child)
+            })
+            .map(|c| c.to_string())
+            .collect();
+
+        // 7. Removed imports: old children no longer in the family
+        let removed_imports: Vec<String> = removed_children.clone();
+
+        // 8. Import source package
+        let import_source = sd.component_packages.get(&tree.root).cloned();
+
+        // 9. Prop value changes from composition changes
+        let prop_value_changes: BTreeMap<String, Vec<semver_analyzer_konveyor_core::MappingEntry>> =
+            BTreeMap::new();
+        for change in &sd.composition_changes {
+            if change.family != tree.root {
+                continue;
+            }
+            if let CompositionChangeType::PropToChild { props, child, .. } = &change.change_type {
+                for prop in props {
+                    prop_to_child.insert(prop.clone(), child.clone());
+                }
+            }
+            if let CompositionChangeType::ChildToProp { props, child, .. } = &change.change_type {
+                for prop in props {
+                    child_props_to_parent.insert(
+                        format!("{}.content", child),
+                        format!("{}.{}", tree.root, prop),
+                    );
+                }
+            }
+        }
+
+        // 10. Deprecated migration context: cross-reference MigrationTarget
+        //     with prop type maps to build a complete old→new mapping.
+        //
+        //     Look for a MigrationTarget whose replacement matches this family's
+        //     root Props interface (e.g., "SelectProps" → "SelectProps"). This
+        //     means a deprecated component was removed and detected as having a
+        //     migration path to this family's root.
+        let deprecated_migration = build_deprecated_migration_context(&tree.root, report, sd);
+
+        // Only emit if we have meaningful data
+        if target_jsx.is_empty()
+            && retained_props.is_empty()
+            && prop_to_child.is_empty()
+            && child_props_to_parent.is_empty()
+            && removed_children.is_empty()
+            && deprecated_migration.is_none()
+        {
+            continue;
+        }
+
+        let entry = FixStrategyEntry {
+            strategy: "FamilyMigration".into(),
+            component: Some(tree.root.clone()),
+            target_structure: Some(target_jsx),
+            retained_props,
+            prop_to_child,
+            child_props_to_parent,
+            removed_children,
+            prop_value_changes,
+            new_imports,
+            removed_imports,
+            import_source,
+            deprecated_migration,
+            ..Default::default()
+        };
+
+        family_strats.insert(format!("family:{}", tree.root), entry);
+    }
+
+    family_strats
+}
+
+/// Build a `DeprecatedMigrationContext` for a family root by finding
+/// `MigrationTarget` entries where the replacement matches this family's
+/// Props interface, then cross-referencing with prop type maps.
+fn build_deprecated_migration_context(
+    family_root: &str,
+    report: &AnalysisReport<TypeScript>,
+    sd: &SdPipelineResult,
+) -> Option<semver_analyzer_konveyor_core::DeprecatedMigrationContext> {
+    let root_props_name = format!("{}Props", family_root);
+
+    // Find the MigrationTarget where replacement_symbol matches our root Props.
+    // This means a deprecated interface was detected as migrating TO this family.
+    let mut best_mt: Option<&MigrationTarget> = None;
+    let mut best_change_file: Option<String> = None;
+
+    for file_changes in &report.changes {
+        let file_str = file_changes.file.to_string_lossy();
+        for change in &file_changes.breaking_api_changes {
+            if let Some(ref mt) = change.migration_target {
+                if mt.replacement_symbol == root_props_name && mt.removed_symbol != root_props_name
+                {
+                    // Prefer higher overlap ratio
+                    let dominated = best_mt
+                        .map(|prev| mt.overlap_ratio > prev.overlap_ratio)
+                        .unwrap_or(true);
+                    if dominated {
+                        best_mt = Some(mt);
+                        best_change_file = Some(file_str.to_string());
+                    }
+                }
+                // Also check deprecated→promoted same-name migration
+                // (e.g., deprecated SelectProps → promoted SelectProps)
+                if mt.replacement_symbol == root_props_name && mt.removed_symbol == root_props_name
+                {
+                    // Same-name migration (deprecated → promoted version)
+                    let is_deprecated = change.qualified_name.contains("deprecated")
+                        || file_str.contains("deprecated");
+                    if is_deprecated {
+                        let dominated = best_mt
+                            .map(|prev| mt.overlap_ratio > prev.overlap_ratio)
+                            .unwrap_or(true);
+                        if dominated {
+                            best_mt = Some(mt);
+                            best_change_file = Some(file_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mt = best_mt?;
+
+    // Determine old/new package from component_packages or the file path.
+    let old_package = mt
+        .removed_package
+        .clone()
+        .or_else(|| {
+            best_change_file.as_deref().and_then(|f| {
+                if f.contains("deprecated") {
+                    sd.old_component_packages
+                        .get(family_root)
+                        .cloned()
+                        .map(|p| {
+                            if p.contains("/deprecated") {
+                                p
+                            } else {
+                                format!("{}/deprecated", p)
+                            }
+                        })
+                } else {
+                    sd.old_component_packages.get(family_root).cloned()
+                }
+            })
+        })
+        .unwrap_or_else(|| "@patternfly/react-core/deprecated".to_string());
+
+    let new_package = mt
+        .replacement_package
+        .clone()
+        .or_else(|| sd.component_packages.get(family_root).cloned())
+        .unwrap_or_else(|| "@patternfly/react-core".to_string());
+
+    // Cross-reference matching members with prop type maps.
+    let old_types = sd.old_component_prop_types.get(family_root);
+    let new_types = sd.new_component_prop_types.get(family_root);
+
+    let matching_props: Vec<semver_analyzer_konveyor_core::PropMigrationEntry> = mt
+        .matching_members
+        .iter()
+        .map(|m| {
+            let ot = old_types.and_then(|t| t.get(&m.old_name)).cloned();
+            let nt = new_types.and_then(|t| t.get(&m.new_name)).cloned();
+            let type_changed = match (&ot, &nt) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            };
+            semver_analyzer_konveyor_core::PropMigrationEntry {
+                old_name: m.old_name.clone(),
+                new_name: m.new_name.clone(),
+                old_type: ot,
+                new_type: nt,
+                type_changed,
+            }
+        })
+        .collect();
+
+    // Compute new-only props: props on the v6 component that have NO match
+    // in the deprecated component's matching or removed lists.
+    let matching_new_names: HashSet<&str> = mt
+        .matching_members
+        .iter()
+        .map(|m| m.new_name.as_str())
+        .collect();
+    let new_props: BTreeMap<String, String> = new_types
+        .map(|types| {
+            types
+                .iter()
+                .filter(|(name, _)| {
+                    !matching_new_names.contains(name.as_str())
+                        && name.as_str() != "children"
+                        && name.as_str() != "className"
+                })
+                .map(|(name, typ)| (name.clone(), typ.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let removed_props = mt.removed_only_members.clone();
+
+    // Only return if we have meaningful data
+    if matching_props.is_empty() && new_props.is_empty() && removed_props.is_empty() {
+        return None;
+    }
+
+    Some(semver_analyzer_konveyor_core::DeprecatedMigrationContext {
+        old_package,
+        new_package,
+        matching_props,
+        new_props,
+        removed_props,
+    })
+}
+
+/// Render a family's target JSX structure with prop names on each component.
+fn render_family_target_with_props(
+    tree: &CompositionTree,
+    new_props: &HashMap<String, BTreeSet<String>>,
+) -> String {
+    let mut lines = Vec::new();
+
+    // Build children lookup: parent → [child]
+    let mut parent_children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for edge in &tree.edges {
+        if edge.relationship != ChildRelationship::Internal {
+            parent_children
+                .entry(edge.parent.as_str())
+                .or_default()
+                .push(edge.child.as_str());
+        }
+    }
+
+    fn render(
+        component: &str,
+        parent_children: &BTreeMap<&str, Vec<&str>>,
+        new_props: &HashMap<String, BTreeSet<String>>,
+        indent: usize,
+        lines: &mut Vec<String>,
+        visited: &mut HashSet<String>,
+    ) {
+        let pad = "  ".repeat(indent);
+        if !visited.insert(component.to_string()) || indent > 5 {
+            lines.push(format!("{}<{} />", pad, component));
+            return;
+        }
+
+        // Format props for this component (show most important ones)
+        let props_str = if let Some(props) = new_props.get(component) {
+            let display_props: Vec<String> = props
+                .iter()
+                .filter(|p| p.as_str() != "children" && p.as_str() != "className")
+                .take(8) // limit to avoid overly long lines
+                .map(|p| format!("{}={{...}}", p))
+                .collect();
+            if display_props.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", display_props.join(" "))
+            }
+        } else {
+            String::new()
+        };
+
+        if let Some(children) = parent_children.get(component) {
+            lines.push(format!("{}<{}{}>", pad, component, props_str));
+            for child in children {
+                render(
+                    child,
+                    parent_children,
+                    new_props,
+                    indent + 1,
+                    lines,
+                    visited,
+                );
+            }
+            lines.push(format!("{}</{}>", pad, component));
+        } else {
+            lines.push(format!("{}<{}{} />", pad, component, props_str));
+        }
+        visited.remove(component);
+    }
+
+    let mut visited = HashSet::new();
+    render(
+        &tree.root,
+        &parent_children,
+        new_props,
+        1,
+        &mut lines,
+        &mut visited,
+    );
     lines.join("\n")
 }
 

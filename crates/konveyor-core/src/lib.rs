@@ -31,9 +31,10 @@ pub use konveyor_core::rule::{
 
 // Fix strategy types
 pub use konveyor_core::fix::{
-    extract_fix_strategies, strategy_priority, write_fix_strategies, FixConfidence, FixGuidanceDoc,
-    FixGuidanceEntry, FixSource, FixStrategyEntry, FixStrategyKind as FixStrategy, FixSummary,
-    MappingEntry, MemberMappingEntry, MigrationInfo,
+    extract_fix_strategies, strategy_priority, write_fix_strategies, DeprecatedMigrationContext,
+    FixConfidence, FixGuidanceDoc, FixGuidanceEntry, FixSource, FixStrategyEntry,
+    FixStrategyKind as FixStrategy, FixSummary, MappingEntry, MemberMappingEntry, MigrationInfo,
+    PropMigrationEntry,
 };
 
 // ── User-supplied rename patterns ───────────────────────────────────────
@@ -1097,6 +1098,7 @@ pub fn merge_rule_group(group: Vec<KonveyorRule>) -> KonveyorRule {
                 overlap_ratio: primary.overlap_ratio,
                 package: primary.package.clone(),
                 new_version: primary.new_version.clone(),
+                ..Default::default()
             })
         }
     };
