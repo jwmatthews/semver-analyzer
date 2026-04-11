@@ -38,18 +38,18 @@ pub struct DelegateContext<'a> {
 ///
 /// BEM determines family membership only. All parent-child edges come from:
 /// 1. Internal rendering (A renders B in JSX)
-/// 1.5. Delegate tree projection (edges from a delegate family's tree)
+///    1.5. Delegate tree projection (edges from a delegate family's tree)
 /// 2. CSS direct-child selectors (`.A > .B`)
 /// 3. CSS grid parent-child (`A` has grid-template, `B` has grid-column)
 /// 4. CSS flex context (A wraps children in flex container, B is not a grid child)
 /// 5. CSS descendant selectors (`.A .B`)
-/// 5.5. CSS layout children (shared CSS rule with flex-wrap/gap implies containment)
+///    5.5. CSS layout children (shared CSS rule with flex-wrap/gap implies containment)
 /// 6. React context (A provides, B consumes)
 /// 7. DOM nesting (A wraps children in `<ul>`, B renders `<li>`)
 /// 8. cloneElement threading (A injects props into children that B declares)
-/// 8.5. BEM element orphan fallback (orphan BEM elements → root→member)
-/// 8.6. Secondary BEM block sub-root fallback
-/// 8.7. Prop-passed detection (ReactNode/ReactElement props → PropPassed edges)
+///    8.5. BEM element orphan fallback (orphan BEM elements → root→member)
+///    8.6. Secondary BEM block sub-root fallback
+///    8.7. Prop-passed detection (ReactNode/ReactElement props → PropPassed edges)
 /// 9. Suppress root edges when intermediate exists
 /// 10. Drop unconnected members (exported orphans are retained)
 ///
@@ -58,12 +58,13 @@ pub struct DelegateContext<'a> {
 /// dimension). This ensures that CSS `>` (Structural) + DOM nesting (Required)
 /// produces Required, rather than the first signal winning and the second
 /// being discarded.
-
+///
 /// Record a signal for a (parent, child) edge. If the edge already exists,
 /// combines the new strength with the existing one. If it's new, creates it.
 ///
 /// Relationship priority: Internal > PropPassed > DirectChild.
 /// Evidence strings are concatenated with " + " to preserve the audit trail.
+#[allow(clippy::too_many_arguments)]
 fn record_signal(
     tree: &mut CompositionTree,
     edge_map: &mut HashMap<(String, String), usize>,
@@ -632,6 +633,29 @@ pub fn build_composition_tree_v2(
                     if parent_comp == child_comp {
                         continue;
                     }
+                    // When the parent is the family root and the child is a
+                    // BEM element that acts as a generic wrapper (renders
+                    // div/span and accepts children), annotate the evidence
+                    // with "BEM element" so downstream heuristics (e.g.,
+                    // ExclusiveWrapper) can identify it regardless of which
+                    // signal step connected it first.
+                    let is_bem_wrapper = *parent_comp == root
+                        && child_comp.starts_with(&root)
+                        && child_comp.len() > root.len()
+                        && profiles.get(child_comp).is_some_and(|p| {
+                            p.has_children_prop
+                                && p.children_slot_path
+                                    .first()
+                                    .is_some_and(|tag| matches!(tag.as_str(), "div" | "span"))
+                        });
+                    let evidence = if is_bem_wrapper {
+                        format!(
+                            "CSS descendant (BEM element): .{} .{}",
+                            css_parent, css_child
+                        )
+                    } else {
+                        format!("CSS descendant: .{} .{}", css_parent, css_child)
+                    };
                     record_signal(
                         &mut tree,
                         &mut edge_map,
@@ -639,7 +663,7 @@ pub fn build_composition_tree_v2(
                         child_comp.clone(),
                         EdgeStrength::Allowed,
                         ChildRelationship::DirectChild,
-                        format!("CSS descendant: .{} .{}", css_parent, css_child),
+                        evidence,
                         None,
                     );
                 }
@@ -901,7 +925,11 @@ pub fn build_composition_tree_v2(
                     secondary_block = %sec_block,
                     "Secondary block fallback: connecting orphan to sub-root"
                 );
-                sec_fallback_edges.push((sub_root.to_string(), member.clone(), sec_block.clone()));
+                sec_fallback_edges.push((
+                    sub_root.to_string(),
+                    member.clone(),
+                    (*sec_block).to_string(),
+                ));
             }
 
             for (parent, child, block) in sec_fallback_edges {

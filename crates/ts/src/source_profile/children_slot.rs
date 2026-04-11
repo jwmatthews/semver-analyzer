@@ -472,12 +472,10 @@ fn find_children_in_class_body<'a>(
                 }
             }
             ClassElement::PropertyDefinition(prop) if is_render_named(&prop.key) => {
-                if let Some(init) = &prop.value {
-                    if let Expression::ArrowFunctionExpression(arrow) = init {
-                        for stmt in &arrow.body.statements {
-                            if find_children_in_statement(stmt, source, path, aliases) {
-                                return true;
-                            }
+                if let Some(Expression::ArrowFunctionExpression(arrow)) = &prop.value {
+                    for stmt in &arrow.body.statements {
+                        if find_children_in_statement(stmt, source, path, aliases) {
+                            return true;
                         }
                     }
                 }
@@ -867,12 +865,10 @@ fn find_children_in_class_body_detail<'a>(
                 }
             }
             ClassElement::PropertyDefinition(prop) if is_render_named(&prop.key) => {
-                if let Some(init) = &prop.value {
-                    if let Expression::ArrowFunctionExpression(arrow) = init {
-                        for stmt in &arrow.body.statements {
-                            if find_children_in_statement_detail(stmt, source, path, aliases) {
-                                return true;
-                            }
+                if let Some(Expression::ArrowFunctionExpression(arrow)) = &prop.value {
+                    for stmt in &arrow.body.statements {
+                        if find_children_in_statement_detail(stmt, source, path, aliases) {
+                            return true;
                         }
                     }
                 }
