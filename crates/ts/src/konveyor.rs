@@ -13,15 +13,206 @@ use anyhow::{Context, Result};
 
 use crate::{TsCategory, TsManifestChangeType, TypeScript};
 use semver_analyzer_core::{
-    AnalysisReport, ApiChange, ApiChangeKind, ApiChangeType, BehavioralChange,
+    AnalysisReport, ApiChange, ApiChangeKind, ApiChangeType, BehavioralChange, ChildComponent,
     ChildComponentStatus, ComponentStatus, ComponentSummary, FileChanges, ManifestChange,
-    RemovalDisposition,
+    RemovalDisposition, RemovedMember,
 };
 
 // Re-export all types and functions from semver-analyzer-konveyor-core.
 // That crate now re-exports shared types from the `konveyor-core` crate,
 // so downstream consumers get the canonical shared types transitively.
 pub use semver_analyzer_konveyor_core::*;
+
+// ── Removed-prop classification ─────────────────────────────────────────
+//
+// Shared helper used by both the P0-C message generation (this module) and
+// the family strategy generation (`konveyor_v2.rs`) to classify removed
+// props into their migration targets.
+
+/// Classification of a single removed prop.
+#[derive(Debug, Clone)]
+pub(crate) struct PropClassification {
+    /// The prop name that was removed.
+    pub name: String,
+    /// The child component it migrates to (if any).
+    pub target_child: Option<String>,
+    /// How the prop value is passed: `"prop"` (named prop on child),
+    /// `"children"` (becomes children of child), `"removed"`, or `"unmapped"`.
+    pub mechanism: String,
+    /// The TypeScript type of the removed prop (e.g., `"ReactNode"`, `"string"`).
+    pub old_type: Option<String>,
+}
+
+/// Extract the clean type portion from an `old_type` string.
+///
+/// `RemovedMember.old_type` is often formatted as `"property: name: TYPE"`.
+/// This extracts just the `TYPE` part.
+fn extract_clean_type(old_type: &Option<String>) -> Option<String> {
+    old_type.as_ref().map(|t| {
+        // Strip "property: name: " prefix if present
+        if let Some((_prefix, type_part)) = t.rsplit_once(": ") {
+            type_part.to_string()
+        } else {
+            t.clone()
+        }
+    })
+}
+
+/// Classify removed props into their migration targets using
+/// `RemovalDisposition` data and child component absorption info.
+///
+/// Returns a list of classifications, one per removed member.
+pub(crate) fn classify_removed_props(
+    removed_members: &[RemovedMember],
+    child_components: &[ChildComponent],
+) -> Vec<PropClassification> {
+    // Build prop → disposition for quick lookup
+    let prop_dispositions: HashMap<&str, &RemovalDisposition> = removed_members
+        .iter()
+        .filter_map(|rp| {
+            rp.removal_disposition
+                .as_ref()
+                .map(|d| (rp.name.as_str(), d))
+        })
+        .collect();
+
+    // Build prop → absorbing child lookup
+    let mut prop_to_absorber: HashMap<&str, &ChildComponent> = HashMap::new();
+    for child in child_components {
+        for prop_name in &child.absorbed_members {
+            prop_to_absorber.insert(prop_name.as_str(), child);
+        }
+    }
+
+    // Compute the common prefix of all child component names so we can
+    // extract meaningful suffixes (e.g., "Modal" from ["ModalBody",
+    // "ModalFooter", "ModalHeader"] → suffixes ["body", "footer", "header"]).
+    let child_prefix_len = if child_components.len() > 1 {
+        let first = &child_components[0].name;
+        child_components[1..]
+            .iter()
+            .fold(first.len(), |prefix_len, child| {
+                first
+                    .chars()
+                    .zip(child.name.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+                    .min(prefix_len)
+            })
+    } else {
+        0
+    };
+
+    let mut results = Vec::new();
+
+    for rp in removed_members {
+        let name = &rp.name;
+        let old_type = extract_clean_type(&rp.old_type);
+
+        // Check if a child absorbed this prop
+        if let Some(child) = prop_to_absorber.get(name.as_str()) {
+            // Determine mechanism: named prop or children?
+            let mechanism = match prop_dispositions.get(name.as_str()) {
+                Some(RemovalDisposition::MovedToRelatedType { mechanism, .. })
+                    if mechanism == "children" =>
+                {
+                    "children"
+                }
+                _ => {
+                    // Fallback: if the child has this as a known member, it's a prop;
+                    // otherwise it's likely children.
+                    if child.known_members.contains(name) {
+                        "prop"
+                    } else {
+                        "children"
+                    }
+                }
+            };
+            results.push(PropClassification {
+                name: name.clone(),
+                target_child: Some(child.name.clone()),
+                mechanism: mechanism.to_string(),
+                old_type,
+            });
+        } else {
+            // Not absorbed by any child — check disposition
+            match prop_dispositions.get(name.as_str()) {
+                Some(RemovalDisposition::TrulyRemoved)
+                | Some(RemovalDisposition::MadeAutomatic) => {
+                    results.push(PropClassification {
+                        name: name.clone(),
+                        target_child: None,
+                        mechanism: "removed".to_string(),
+                        old_type,
+                    });
+                }
+                Some(RemovalDisposition::MovedToRelatedType {
+                    target_type,
+                    mechanism,
+                }) => {
+                    results.push(PropClassification {
+                        name: name.clone(),
+                        target_child: Some(target_type.clone()),
+                        mechanism: mechanism.clone(),
+                        old_type,
+                    });
+                }
+                Some(RemovalDisposition::ReplacedByMember { .. }) => {
+                    results.push(PropClassification {
+                        name: name.clone(),
+                        target_child: None,
+                        mechanism: "removed".to_string(),
+                        old_type,
+                    });
+                }
+                None => {
+                    // No disposition data. Use name-suffix heuristic: match
+                    // the prop name against child component suffixes derived
+                    // from the common prefix.
+                    // e.g., "footer" starts with suffix "footer" of ModalFooter,
+                    //        "bodyAriaLabel" starts with suffix "body" of ModalBody.
+                    let mut matched_child = None;
+                    let name_lower = name.to_lowercase();
+                    for child in child_components {
+                        // Extract suffix using common prefix
+                        // (e.g., "ModalFooter"[5..] → "Footer" → "footer")
+                        if child_prefix_len > 0 && child_prefix_len < child.name.len() {
+                            let suffix = child.name[child_prefix_len..].to_lowercase();
+                            if !suffix.is_empty() && name_lower.starts_with(&suffix) {
+                                matched_child = Some(child.name.clone());
+                                break;
+                            }
+                        }
+                        // Also try: does the child name end with the prop name?
+                        // (e.g., "modalfooter".ends_with("footer"))
+                        let child_name_lower = child.name.to_lowercase();
+                        if child_name_lower.ends_with(&name_lower) {
+                            matched_child = Some(child.name.clone());
+                            break;
+                        }
+                    }
+                    if let Some(child_name) = matched_child {
+                        results.push(PropClassification {
+                            name: name.clone(),
+                            target_child: Some(child_name),
+                            mechanism: "children".to_string(),
+                            old_type,
+                        });
+                    } else {
+                        results.push(PropClassification {
+                            name: name.clone(),
+                            target_child: None,
+                            mechanism: "unmapped".to_string(),
+                            old_type,
+                        });
+                    }
+                }
+            };
+        }
+    }
+
+    results
+}
 
 type ConstantGroupEntries<'a> = Vec<(&'a ApiChange, Option<String>, FixStrategyEntry)>;
 
@@ -345,52 +536,67 @@ fn build_migration_message_v2(comp: &ComponentSummary<TypeScript>) -> String {
             msg.push('\n');
 
             // Include child components with prop→child mappings from AST + LLM analysis.
-            // Distinguish between "pass as named prop" and "pass as children" using
-            // the removal_disposition data from LLM analysis.
+            // Use the shared classifier to categorize each removed prop.
             if !comp.child_components.is_empty() {
-                // Build a map of prop → disposition for quick lookup
-                let prop_dispositions: HashMap<&str, &RemovalDisposition> = comp
-                    .removed_members
-                    .iter()
-                    .filter_map(|rp| {
-                        rp.removal_disposition
-                            .as_ref()
-                            .map(|d| (rp.name.as_str(), d))
-                    })
-                    .collect();
+                let classifications =
+                    classify_removed_props(&comp.removed_members, &comp.child_components);
+
+                // Group classifications by child component for display
+                let mut child_as_props: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+                let mut child_as_children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+                let mut truly_removed = Vec::new();
+                let mut unknown = Vec::new();
+                let mut classified_props: HashSet<&str> = HashSet::new();
+
+                for c in &classifications {
+                    classified_props.insert(&c.name);
+                    match (c.target_child.as_deref(), c.mechanism.as_str()) {
+                        (Some(child), "prop") => {
+                            child_as_props.entry(child).or_default().push(&c.name);
+                        }
+                        (Some(child), "children") => {
+                            child_as_children.entry(child).or_default().push(&c.name);
+                        }
+                        (_, "removed") => truly_removed.push(c.name.as_str()),
+                        _ => unknown.push(c.name.as_str()),
+                    }
+                }
+
+                // Also include absorbed_members from children that weren't
+                // in removed_members (e.g., props the child owns natively
+                // that also existed on the parent).
+                for child in &comp.child_components {
+                    for prop_name in &child.absorbed_members {
+                        if classified_props.contains(prop_name.as_str()) {
+                            continue;
+                        }
+                        if child.known_members.contains(prop_name) {
+                            child_as_props
+                                .entry(&child.name)
+                                .or_default()
+                                .push(prop_name);
+                        } else {
+                            child_as_children
+                                .entry(&child.name)
+                                .or_default()
+                                .push(prop_name);
+                        }
+                    }
+                }
 
                 msg.push_str("Use these child components inside <");
                 msg.push_str(component_name);
                 msg.push_str(">:\n");
                 for child in &comp.child_components {
-                    if !child.absorbed_members.is_empty() {
-                        // Separate props by mechanism: named prop vs children
-                        let mut as_props = Vec::new();
-                        let mut as_children = Vec::new();
-                        for prop_name in &child.absorbed_members {
-                            match prop_dispositions.get(prop_name.as_str()) {
-                                Some(RemovalDisposition::MovedToRelatedType {
-                                    mechanism, ..
-                                }) if mechanism == "children" => {
-                                    as_children.push(prop_name.as_str());
-                                }
-                                _ => {
-                                    // Default: if the child has this as a named prop, it's a prop;
-                                    // otherwise it's likely children
-                                    if child.known_members.contains(prop_name) {
-                                        as_props.push(prop_name.as_str());
-                                    } else {
-                                        as_children.push(prop_name.as_str());
-                                    }
-                                }
-                            }
-                        }
+                    let as_props = child_as_props.get(child.name.as_str());
+                    let as_children = child_as_children.get(child.name.as_str());
+                    if as_props.is_some() || as_children.is_some() {
                         let mut parts = Vec::new();
-                        if !as_props.is_empty() {
-                            parts.push(format!("pass as props: {}", as_props.join(", ")));
+                        if let Some(props) = as_props {
+                            parts.push(format!("pass as props: {}", props.join(", ")));
                         }
-                        if !as_children.is_empty() {
-                            parts.push(format!("pass as children: {}", as_children.join(", ")));
+                        if let Some(children) = as_children {
+                            parts.push(format!("pass as children: {}", children.join(", ")));
                         }
                         msg.push_str(&format!("  - <{}> — {}\n", child.name, parts.join("; ")));
                     } else {
@@ -401,48 +607,17 @@ fn build_migration_message_v2(comp: &ComponentSummary<TypeScript>) -> String {
                     }
                 }
 
-                // List any removed props that no child absorbs
-                let absorbed: HashSet<&str> = comp
-                    .child_components
-                    .iter()
-                    .flat_map(|c| c.absorbed_members.iter().map(|s| s.as_str()))
-                    .collect();
-                let unmapped: Vec<&str> = comp
-                    .removed_members
-                    .iter()
-                    .map(|rp| rp.name.as_str())
-                    .filter(|n| !absorbed.contains(n))
-                    .collect();
-                if !unmapped.is_empty() {
-                    // Check if any unmapped props have a known disposition
-                    let truly_removed: Vec<&str> = unmapped
-                        .iter()
-                        .filter(|n| {
-                            matches!(
-                                prop_dispositions.get(*n),
-                                Some(RemovalDisposition::TrulyRemoved)
-                                    | Some(RemovalDisposition::MadeAutomatic)
-                            )
-                        })
-                        .copied()
-                        .collect();
-                    let unknown: Vec<&str> = unmapped
-                        .iter()
-                        .filter(|n| !truly_removed.contains(n))
-                        .copied()
-                        .collect();
-                    if !truly_removed.is_empty() {
-                        msg.push_str(&format!(
-                            "\nRemoved with no replacement (safe to delete): {}\n",
-                            truly_removed.join(", ")
-                        ));
-                    }
-                    if !unknown.is_empty() {
-                        msg.push_str(&format!(
-                            "\nProps with no direct child component match (handle manually): {}\n",
-                            unknown.join(", ")
-                        ));
-                    }
+                if !truly_removed.is_empty() {
+                    msg.push_str(&format!(
+                        "\nRemoved with no replacement (safe to delete): {}\n",
+                        truly_removed.join(", ")
+                    ));
+                }
+                if !unknown.is_empty() {
+                    msg.push_str(&format!(
+                        "\nProps with no direct child component match (handle manually): {}\n",
+                        unknown.join(", ")
+                    ));
                 }
                 msg.push('\n');
             }
@@ -559,22 +734,40 @@ pub fn generate_rules(
     // family root name from SD composition trees. Used to add `family=` labels
     // to TD-generated rules so the fix engine can consolidate related
     // violations into a single family-level LLM prompt.
+    //
+    // We scan both the new (v6) and old (v5) composition trees so that
+    // components removed in v6 (e.g., EmptyStateHeader, EmptyStateIcon)
+    // still map to their family root. Without this, P0C deprecated-import
+    // rules for removed components would lack family= labels and not be
+    // grouped with related composition/conformance rules.
     let component_to_family: HashMap<String, String> = if let Some(ref sd) = report.sd_result {
         let mut map = HashMap::new();
-        for tree in &sd.composition_trees {
+        // Iterate both new and old composition trees. The new trees take
+        // precedence (inserted first), but old-tree members that were
+        // removed in v6 will still get mapped via or_insert.
+        let all_trees = sd
+            .composition_trees
+            .iter()
+            .chain(sd.old_composition_trees.iter());
+        for tree in all_trees {
             // Skip deprecated families — they have separate rule namespaces
             if tree.root.starts_with("deprecated/") {
                 continue;
             }
-            // Map root and all family members
-            map.insert(tree.root.clone(), tree.root.clone());
+            // Map root and all family members (entry() avoids overwriting
+            // new-tree mappings with old-tree ones for the same component).
+            map.entry(tree.root.clone())
+                .or_insert_with(|| tree.root.clone());
             for member in &tree.family_members {
-                map.insert(member.clone(), tree.root.clone());
+                map.entry(member.clone())
+                    .or_insert_with(|| tree.root.clone());
             }
             // Also map "XProps" variants (e.g., "ModalProps" → "Modal")
-            map.insert(format!("{}Props", tree.root), tree.root.clone());
+            map.entry(format!("{}Props", tree.root))
+                .or_insert_with(|| tree.root.clone());
             for member in &tree.family_members {
-                map.insert(format!("{}Props", member), tree.root.clone());
+                map.entry(format!("{}Props", member))
+                    .or_insert_with(|| tree.root.clone());
             }
         }
         map
@@ -2487,7 +2680,7 @@ pub fn generate_rules(
 ///
 /// Returns `(rules, strategies)` where:
 /// - `rules` are Konveyor rules using `builtin.json` to detect the dependency
-/// - `strategies` maps rule IDs to `UpdateDependency` fix strategy entries
+/// - `strategies` maps rule IDs to `EnsureDependency` fix strategy entries
 pub fn generate_dependency_update_rules(
     report: &AnalysisReport<TypeScript>,
     pkg_info_cache: &HashMap<String, PackageInfo>,
@@ -2552,6 +2745,99 @@ pub fn generate_dependency_update_rules(
         }
     }
 
+    // Build cross-package migration map.
+    //
+    // Detects when components moved from one npm package to another by comparing
+    // deprecated/ families in the old package with same-named families in the new
+    // package. For example, deprecated/DragDrop in react-core → DragDrop in
+    // react-drag-drop. This enables an `or` condition so the dependency rule fires
+    // both when the consumer already has the new package at an old version AND when
+    // they import the old components from the source package.
+    //
+    // Map: target_npm_package → Vec<(source_npm_package, Vec<member_names>)>
+    let mut cross_pkg_migrations: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
+
+    if let Some(ref sd) = report.sd_result {
+        // Build a map of non-deprecated family names to their majority package.
+        //
+        // The root component name may collide with the deprecated family in
+        // component_packages (e.g., "DragDrop" maps to react-core/deprecated
+        // instead of react-drag-drop because the deprecated version wins the
+        // collision). So we determine the family's package from the majority
+        // of its members' packages instead.
+        let mut family_packages: HashMap<&str, String> = HashMap::new();
+        for tree in &sd.composition_trees {
+            if tree.root.starts_with("deprecated/") {
+                continue;
+            }
+            // Count packages among the family's members
+            let mut pkg_counts: HashMap<&str, usize> = HashMap::new();
+            for member in &tree.family_members {
+                if let Some(pkg) = sd.component_packages.get(member) {
+                    let base = pkg
+                        .trim_end_matches("/deprecated")
+                        .trim_end_matches("/next");
+                    *pkg_counts.entry(base).or_insert(0) += 1;
+                }
+            }
+            // Pick the package with the most members
+            if let Some((majority_pkg, _)) = pkg_counts.into_iter().max_by_key(|(_, c)| *c) {
+                family_packages.insert(&tree.root, majority_pkg.to_string());
+            }
+        }
+
+        // For each deprecated family, check if a non-deprecated family with the
+        // same base name exists in a different package
+        for tree in &sd.composition_trees {
+            if !tree.root.starts_with("deprecated/") {
+                continue;
+            }
+            let base_name = tree.root.strip_prefix("deprecated/").unwrap();
+
+            // Find the target package (where the non-deprecated family lives)
+            let target_pkg = match family_packages.get(base_name) {
+                Some(pkg) => pkg.clone(),
+                None => continue,
+            };
+
+            // Collect deprecated members whose NEW package differs from the target.
+            //
+            // We use component_packages (new map) rather than old_component_packages
+            // because the old map may not have entries for deprecated components
+            // (the SD pipeline doesn't always extract profiles for both versions).
+            // The new map still maps deprecated components to their source package
+            // (e.g., DragDrop → react-core/deprecated), which we can compare
+            // against the target package.
+            let mut migrated_members: Vec<String> = Vec::new();
+            let mut source_pkg: Option<String> = None;
+
+            for member in &tree.family_members {
+                if let Some(pkg) = sd.component_packages.get(member) {
+                    let member_base = pkg
+                        .trim_end_matches("/deprecated")
+                        .trim_end_matches("/next");
+                    let target_base = target_pkg
+                        .trim_end_matches("/deprecated")
+                        .trim_end_matches("/next");
+
+                    if member_base != target_base {
+                        migrated_members.push(member.clone());
+                        source_pkg = Some(member_base.to_string());
+                    }
+                }
+            }
+
+            if !migrated_members.is_empty() {
+                if let Some(src) = source_pkg {
+                    cross_pkg_migrations
+                        .entry(target_pkg.clone())
+                        .or_default()
+                        .push((src, migrated_members));
+                }
+            }
+        }
+    }
+
     for (npm_name, info) in &packages_with_changes {
         let version = match &info.version {
             Some(v) => v,
@@ -2568,7 +2854,7 @@ pub fn generate_dependency_update_rules(
         // The provider checks dependencies/devDependencies/peerDependencies
         // and only matches when the installed version is <= the old version
         // (i.e., needs updating).
-        let condition = KonveyorCondition::FrontendDependency {
+        let dep_condition = KonveyorCondition::FrontendDependency {
             dependency: FrontendDependencyFields {
                 name: Some(npm_name.clone()),
                 nameregex: None,
@@ -2590,6 +2876,69 @@ pub fn generate_dependency_update_rules(
             },
         };
 
+        // Check for cross-package migrations targeting this package.
+        // If found, wrap the dependency condition and import conditions in an `or`
+        // so the rule fires both when the consumer already has the package (at an
+        // old version) and when they import migrated components from the old source.
+        let condition = if let Some(migrations) = cross_pkg_migrations.get(npm_name.as_str()) {
+            let mut or_conditions = vec![dep_condition];
+            for (source_pkg, members) in migrations {
+                let pattern = if members.len() == 1 {
+                    format!("^{}$", members[0])
+                } else {
+                    format!("^({})$", members.join("|"))
+                };
+                or_conditions.push(KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern,
+                        location: "IMPORT".to_string(),
+                        from: Some(source_pkg.clone()),
+                        component: None,
+                        parent: None,
+                        not_parent: None,
+                        parent_from: None,
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        value: None,
+                        file_pattern: None,
+                    },
+                });
+            }
+            KonveyorCondition::Or { or: or_conditions }
+        } else {
+            dep_condition
+        };
+
+        // Adjust message for cross-package migrations
+        let message = if cross_pkg_migrations.contains_key(npm_name.as_str()) {
+            let sources: Vec<String> = cross_pkg_migrations[npm_name.as_str()]
+                .iter()
+                .map(|(src, _)| src.clone())
+                .collect();
+            format!(
+                "Add or update {} to {}. \
+                 Components from {} have moved to this package.\n\n\
+                 After updating package.json, regenerate your lockfile:\n\
+                 - npm: npm install\n\
+                 - yarn: yarn install\n\
+                 - pnpm: pnpm install",
+                npm_name,
+                new_version,
+                sources.join(", "),
+            )
+        } else {
+            format!(
+                "Update {} from current version to {}. \
+                 This package has breaking changes between {} and {}.\n\n\
+                 After updating package.json, regenerate your lockfile:\n\
+                 - npm: npm install\n\
+                 - yarn: yarn install\n\
+                 - pnpm: pnpm install",
+                npm_name, new_version, report.comparison.from_ref, report.comparison.to_ref,
+            )
+        };
+
         rules.push(KonveyorRule {
             rule_id: rule_id.clone(),
             description: format!("Update {} to v{}", npm_name, version),
@@ -2602,16 +2951,8 @@ pub fn generate_dependency_update_rules(
             category: "mandatory".into(),
             links: Vec::new(),
             when: condition,
-            message: format!(
-                "Update {} from current version to {}. \
-                 This package has breaking changes between {} and {}.\n\n\
-                 After updating package.json, regenerate your lockfile:\n\
-                 - npm: npm install\n\
-                 - yarn: yarn install\n\
-                 - pnpm: pnpm install",
-                npm_name, new_version, report.comparison.from_ref, report.comparison.to_ref,
-            ),
-            fix_strategy: Some(FixStrategyEntry::update_dependency(
+            message,
+            fix_strategy: Some(FixStrategyEntry::ensure_dependency(
                 npm_name.clone(),
                 new_version.clone(),
             )),
@@ -2619,7 +2960,7 @@ pub fn generate_dependency_update_rules(
 
         strategies.insert(
             rule_id,
-            FixStrategyEntry::update_dependency(npm_name.clone(), new_version),
+            FixStrategyEntry::ensure_dependency(npm_name.clone(), new_version),
         );
     }
 
@@ -3936,7 +4277,7 @@ fn manifest_change_to_fix(change: &ManifestChange<TypeScript>, rule_id: &str) ->
         }
 
         TsManifestChangeType::PeerDependencyAdded => (
-            FixStrategy::UpdateDependency,
+            FixStrategy::EnsureDependency,
             FixConfidence::Exact,
             FixSource::Pattern,
             format!(
@@ -3952,7 +4293,7 @@ fn manifest_change_to_fix(change: &ManifestChange<TypeScript>, rule_id: &str) ->
         ),
 
         TsManifestChangeType::PeerDependencyRemoved => (
-            FixStrategy::UpdateDependency,
+            FixStrategy::EnsureDependency,
             FixConfidence::High,
             FixSource::Pattern,
             format!(
@@ -3970,7 +4311,7 @@ fn manifest_change_to_fix(change: &ManifestChange<TypeScript>, rule_id: &str) ->
         ),
 
         TsManifestChangeType::PeerDependencyRangeChanged => (
-            FixStrategy::UpdateDependency,
+            FixStrategy::EnsureDependency,
             FixConfidence::High,
             FixSource::Pattern,
             format!(

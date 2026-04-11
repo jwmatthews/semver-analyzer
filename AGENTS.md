@@ -985,6 +985,14 @@ Collapsed edges inherit:
 - The **stronger** `EdgeStrength` of the two edges in the chain
 - The child edge's `relationship` type
 - The child edge's `prop_name` (propagated through transitive edges)
+- The child edge's `"BEM element"` marker in `bem_evidence` (appended as
+  `" (BEM element)"` to the collapsed evidence string when the child edge's
+  evidence contains `"BEM element"`). This is critical for cross-block
+  families like Modal where Step 8.6 creates edges from an internal sub-root
+  (ModalBox) to BEM element children. Without propagation, the
+  `exclusiveWrapper` detection in `generate_conformance_checks()` fails
+  because it relies on `ev.contains("BEM element")` to identify BEM element
+  children of the root.
 
 Regression test:
 `sd_pipeline::tests::test_collapse_three_level_internal_chain` — uses

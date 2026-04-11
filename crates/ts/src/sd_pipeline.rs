@@ -1160,14 +1160,29 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
                     // Structural or Required outer: use standard collapse
                     parent_edge.strength.collapse_chain(&child_edge.strength)
                 };
+                // Propagate "BEM element" marker from the child edge's
+                // evidence so downstream heuristics (e.g., ExclusiveWrapper)
+                // can identify collapsed BEM element children. This is critical
+                // for cross-block families like Modal where Step 8.6 creates
+                // edges from an internal sub-root (ModalBox) to BEM element
+                // children (ModalBody/Header/Footer). Without propagation,
+                // the marker is lost and ExclusiveWrapper detection fails.
+                let child_is_bem = child_edge
+                    .bem_evidence
+                    .as_ref()
+                    .is_some_and(|ev| ev.contains("BEM element"));
                 new_edges.push(semver_analyzer_core::types::sd::CompositionEdge {
                     parent: parent_edge.parent.clone(),
                     child: child_edge.child.clone(),
                     relationship: child_edge.relationship.clone(),
                     required: child_edge.required,
                     bem_evidence: Some(format!(
-                        "Collapsed through internal {}: {} → {} → {}",
-                        node, parent_edge.parent, node, child_edge.child
+                        "Collapsed through internal {}: {} → {} → {}{}",
+                        node,
+                        parent_edge.parent,
+                        node,
+                        child_edge.child,
+                        if child_is_bem { " (BEM element)" } else { "" }
                     )),
                     strength,
                     prop_name: child_edge.prop_name.clone(),

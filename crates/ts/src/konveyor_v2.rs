@@ -2056,6 +2056,62 @@ pub fn generate_family_strategies(
         //     migration path to this family's root.
         let deprecated_migration = build_deprecated_migration_context(&tree.root, report, sd);
 
+        // 11. Unmapped removed props: props removed from the root that don't
+        //     have an exact prop-name match on any child (not in prop_to_child).
+        //     Uses the shared classifier to determine where each prop should go.
+        let unmapped_removed_props = {
+            use crate::konveyor::classify_removed_props;
+            let mut unmapped = BTreeMap::new();
+
+            // Find the TypeSummary for this family root to get
+            // removed_members and child_components.
+            let type_summary = report
+                .packages
+                .iter()
+                .flat_map(|pkg| &pkg.type_summaries)
+                .find(|comp| comp.name == tree.root);
+
+            if let Some(comp) = type_summary {
+                let classifications =
+                    classify_removed_props(&comp.removed_members, &comp.child_components);
+                for c in &classifications {
+                    // Skip props already in prop_to_child (exact match)
+                    if prop_to_child.contains_key(&c.name) {
+                        continue;
+                    }
+                    // Skip retained props
+                    if retained_props.contains(&c.name) {
+                        continue;
+                    }
+                    let type_hint = c.old_type.as_deref().unwrap_or("unknown type");
+                    match (c.target_child.as_deref(), c.mechanism.as_str()) {
+                        (Some(child), "prop") => {
+                            unmapped.insert(
+                                c.name.clone(),
+                                format!("{} (as prop, {})", child, type_hint),
+                            );
+                        }
+                        (Some(child), "children") => {
+                            unmapped.insert(
+                                c.name.clone(),
+                                format!("{} (as children, {})", child, type_hint),
+                            );
+                        }
+                        (_, "removed") => {
+                            unmapped.insert(c.name.clone(), format!("removed ({})", type_hint));
+                        }
+                        _ => {
+                            unmapped.insert(
+                                c.name.clone(),
+                                format!("map to appropriate child component ({})", type_hint),
+                            );
+                        }
+                    }
+                }
+            }
+            unmapped
+        };
+
         // Only emit if we have meaningful data
         if target_jsx.is_empty()
             && retained_props.is_empty()
@@ -2073,6 +2129,7 @@ pub fn generate_family_strategies(
             target_structure: Some(target_jsx),
             retained_props,
             prop_to_child,
+            unmapped_removed_props,
             child_props_to_parent,
             removed_children,
             prop_value_changes,

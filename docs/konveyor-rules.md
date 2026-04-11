@@ -291,7 +291,7 @@ Fix strategies describe how to resolve each rule violation. They are written to 
 | `ImportPathChange` | Update import path | Yes |
 | `PropValueChange` | Change a prop's value | Partial |
 | `PropTypeChange` | Prop type changed, needs update | Partial |
-| `UpdateDependency` | Update package.json version | Yes |
+| `EnsureDependency` | Add or update package.json dependency | Yes |
 | `PropToChild` | Prop moved to child component | Review needed |
 | `ChildToProp` | Child component replaced by prop | Review needed |
 | `CompositionChange` | Component nesting changed | Review needed |
