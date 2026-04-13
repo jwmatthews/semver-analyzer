@@ -27,8 +27,10 @@ pub mod css_profile;
 pub mod konveyor_v2;
 pub mod sd_pipeline;
 pub mod source_profile;
+pub mod symbol_data;
 
 // Re-export key types for convenience
 pub use extract::OxcExtractor;
 pub use language::{TsCategory, TsEvidence, TsManifestChangeType, TsReportData, TypeScript};
+pub use symbol_data::TsSymbolData;
 pub use worktree::{ExtractionWarning, WorktreeGuard};

@@ -2,20 +2,35 @@
 //!
 //! These are language-agnostic: the per-language `Language` implementations
 //! populate them, and the language-agnostic `diff_surfaces_with_semantics()` engine consumes them.
+//!
+//! `Symbol<M>` and `ApiSurface<M>` are generic over a metadata type parameter `M`
+//! that carries language-specific per-symbol data. The default `M = ()` keeps the
+//! types backward-compatible for code that doesn't need language-specific metadata.
+//! TypeScript uses `TsSymbolData` (rendered components, CSS tokens).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
-/// Language-agnostic public API surface extracted from source code at a git ref.
-/// Used by TD (Top-Down) pipeline.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ApiSurface {
-    /// All exported symbols in the API surface.
-    pub symbols: Vec<Symbol>,
+/// Helper for `#[serde(skip_serializing_if)]` on the `language_data` field.
+/// Skips serialization when the value equals its `Default`, avoiding noise
+/// like `language_data: null` for `Symbol<()>` or empty `TsSymbolData`.
+fn is_default<T: Default + PartialEq>(val: &T) -> bool {
+    *val == T::default()
 }
 
-impl ApiSurface {
+/// Language-agnostic public API surface extracted from source code at a git ref.
+/// Used by TD (Top-Down) pipeline.
+///
+/// Generic over `M` for per-symbol language metadata. Defaults to `()`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(bound(serialize = "M: Serialize", deserialize = "M: Deserialize<'de>"))]
+pub struct ApiSurface<M: Default + Clone + PartialEq = ()> {
+    /// All exported symbols in the API surface.
+    pub symbols: Vec<Symbol<M>>,
+}
+
+impl<M: Default + Clone + PartialEq> ApiSurface<M> {
     /// Returns true if the surface has no symbols.
     pub fn is_empty(&self) -> bool {
         self.symbols.is_empty()
@@ -28,8 +43,16 @@ impl ApiSurface {
 }
 
 /// A single exported symbol in the API surface.
+///
+/// Generic over `M` for language-specific per-symbol metadata. The default
+/// `M = ()` keeps the type backward-compatible for code that doesn't need
+/// language-specific data (e.g., core diff tests, MinimalSemantics).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Symbol {
+#[serde(bound(
+    serialize = "M: Serialize + PartialEq",
+    deserialize = "M: Deserialize<'de>"
+))]
+pub struct Symbol<M: Default + Clone + PartialEq = ()> {
     /// Simple name (e.g., "createUser").
     pub name: String,
 
@@ -116,27 +139,20 @@ pub struct Symbol {
     // -- Members (for classes, interfaces, enums) --
     /// Child members (methods, properties, enum variants).
     /// Only populated for Class, Interface, and Enum kinds.
-    pub members: Vec<Symbol>,
+    pub members: Vec<Symbol<M>>,
 
-    // -- JSX render tree (for React components) --
-    /// Components from the same package that this component renders internally
-    /// in its JSX return tree. Determined by parsing the `.tsx` source file.
+    // -- Language-specific metadata --
+    /// Per-symbol data specific to the implementing language.
     ///
-    /// Used for hierarchy inference: components in the same family that do NOT
-    /// appear in this list are likely consumer-provided children.
+    /// - TypeScript: `TsSymbolData` (rendered components, CSS tokens)
+    /// - Other languages: `()` (no additional data)
     ///
-    /// Only populated for Function/Variable/Constant symbols that represent
-    /// React components with JSX render functions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rendered_components: Vec<String>,
-
-    /// CSS class tokens used by this component (e.g., `["inputGroup", "inputGroupItem"]`).
-    /// Extracted from `styles.xxx` references in component source files.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub css: Vec<String>,
+    /// Skipped in serialization when equal to Default (e.g., `()` or empty `TsSymbolData`).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub language_data: M,
 }
 
-impl Symbol {
+impl<M: Default + Clone + PartialEq> Symbol<M> {
     /// Create a new Symbol with required fields, defaulting optional fields.
     pub fn new(
         name: impl Into<String>,
@@ -164,8 +180,40 @@ impl Symbol {
             is_static: false,
             accessor_kind: None,
             members: Vec::new(),
-            rendered_components: Vec::new(),
-            css: Vec::new(),
+            language_data: M::default(),
+        }
+    }
+}
+
+impl<M: Default + Clone + PartialEq> Symbol<M> {
+    /// Convert this symbol's metadata type to a different type.
+    ///
+    /// Useful for converting between `Symbol<()>` (core/test) and
+    /// `Symbol<TsSymbolData>` (TypeScript extraction).
+    pub fn with_metadata<N: Default + Clone + PartialEq>(self) -> Symbol<N> {
+        Symbol {
+            name: self.name,
+            qualified_name: self.qualified_name,
+            kind: self.kind,
+            visibility: self.visibility,
+            file: self.file,
+            package: self.package,
+            import_path: self.import_path,
+            line: self.line,
+            signature: self.signature,
+            extends: self.extends,
+            implements: self.implements,
+            is_abstract: self.is_abstract,
+            type_dependencies: self.type_dependencies,
+            is_readonly: self.is_readonly,
+            is_static: self.is_static,
+            accessor_kind: self.accessor_kind,
+            members: self
+                .members
+                .into_iter()
+                .map(|m| m.with_metadata())
+                .collect(),
+            language_data: N::default(),
         }
     }
 }

@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
+use crate::TsSymbolData;
+
 // ── TypeScript language type ────────────────────────────────────────────
 
 /// The TypeScript language implementation.
@@ -121,8 +123,12 @@ pub struct TsReportData {
 
 // ── LanguageSemantics ───────────────────────────────────────────────────
 
-impl LanguageSemantics for TypeScript {
-    fn is_member_addition_breaking(&self, container: &Symbol, member: &Symbol) -> bool {
+impl LanguageSemantics<TsSymbolData> for TypeScript {
+    fn is_member_addition_breaking(
+        &self,
+        container: &Symbol<TsSymbolData>,
+        member: &Symbol<TsSymbolData>,
+    ) -> bool {
         // TypeScript uses structural typing. Adding a required member to an
         // interface or type alias breaks consumers because they must now
         // provide it. Adding an optional member is non-breaking.
@@ -142,7 +148,7 @@ impl LanguageSemantics for TypeScript {
         }
     }
 
-    fn same_family(&self, a: &Symbol, b: &Symbol) -> bool {
+    fn same_family(&self, a: &Symbol<TsSymbolData>, b: &Symbol<TsSymbolData>) -> bool {
         // React convention: components in the same directory are a family.
         // E.g., components/Modal/Modal.tsx and components/Modal/ModalHeader.tsx
         //
@@ -153,7 +159,7 @@ impl LanguageSemantics for TypeScript {
             == canonical_component_dir(&b.file.to_string_lossy())
     }
 
-    fn same_identity(&self, a: &Symbol, b: &Symbol) -> bool {
+    fn same_identity(&self, a: &Symbol<TsSymbolData>, b: &Symbol<TsSymbolData>) -> bool {
         // React convention: ButtonProps and Button are the same concept.
         // Strip the "Props" suffix before comparing.
         strip_props_suffix(&a.name) == strip_props_suffix(&b.name)
@@ -182,7 +188,7 @@ impl LanguageSemantics for TypeScript {
         dedup_default_exports(changes);
     }
 
-    fn hierarchy(&self) -> Option<&dyn HierarchySemantics> {
+    fn hierarchy(&self) -> Option<&dyn HierarchySemantics<TsSymbolData>> {
         Some(self)
     }
 
@@ -228,6 +234,7 @@ impl MessageFormatter for TypeScript {
 // ── Language ────────────────────────────────────────────────────────────
 
 impl Language for TypeScript {
+    type SymbolData = TsSymbolData;
     type Category = TsCategory;
     type ManifestChangeType = TsManifestChangeType;
     type Evidence = TsEvidence;
@@ -244,7 +251,7 @@ impl Language for TypeScript {
         repo: &Path,
         git_ref: &str,
         degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
-    ) -> Result<ApiSurface> {
+    ) -> Result<ApiSurface<TsSymbolData>> {
         let extractor = crate::extract::OxcExtractor::new();
         extractor.extract_at_ref(repo, git_ref, self.build_command.as_deref(), degradation)
     }
@@ -409,7 +416,7 @@ impl Language for TypeScript {
 
 // ── HierarchySemantics (React component hierarchy) ─────────────────────
 
-impl HierarchySemantics for TypeScript {
+impl HierarchySemantics<TsSymbolData> for TypeScript {
     fn family_source_paths(&self, repo: &Path, git_ref: &str, family_name: &str) -> Vec<String> {
         let output = std::process::Command::new("git")
             .args(["ls-tree", "-r", "--name-only", git_ref])
@@ -455,7 +462,7 @@ impl HierarchySemantics for TypeScript {
         source_files
     }
 
-    fn family_name_from_symbols(&self, symbols: &[&Symbol]) -> Option<String> {
+    fn family_name_from_symbols(&self, symbols: &[&Symbol<TsSymbolData>]) -> Option<String> {
         // Extract the component directory name from the first symbol's file path
         for sym in symbols {
             let path = sym.file.to_string_lossy();
@@ -466,7 +473,7 @@ impl HierarchySemantics for TypeScript {
         None
     }
 
-    fn is_hierarchy_candidate(&self, sym: &Symbol) -> bool {
+    fn is_hierarchy_candidate(&self, sym: &Symbol<TsSymbolData>) -> bool {
         // React components are PascalCase functions, classes, variables, or constants
         matches!(
             sym.kind,
@@ -859,7 +866,11 @@ fn file_prefix(qualified_name: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use semver_analyzer_core::Symbol as CoreSymbol;
     use semver_analyzer_core::{Parameter, Signature};
+
+    /// In tests, `Symbol` means `Symbol<TsSymbolData>` to match trait impls.
+    type Symbol = CoreSymbol<TsSymbolData>;
 
     fn sym(name: &str, kind: SymbolKind) -> Symbol {
         Symbol::new(name, name, kind, Visibility::Exported, "test.d.ts", 1)

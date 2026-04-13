@@ -13,7 +13,13 @@
 use semver_analyzer_core::*;
 use semver_analyzer_ts::jsx_diff::JsxChange;
 use semver_analyzer_ts::language::TypeScript;
+use semver_analyzer_ts::TsSymbolData;
 use serde::Serialize;
+
+// Type aliases for baseline tests: TypeScript implements LanguageSemantics<TsSymbolData>,
+// so diff functions require Symbol<TsSymbolData> and ApiSurface<TsSymbolData>.
+pub type Symbol = semver_analyzer_core::Symbol<TsSymbolData>;
+pub type ApiSurface = semver_analyzer_core::ApiSurface<TsSymbolData>;
 
 /// Semantic representation of a structural change, independent of
 /// internal enum types. Used for snapshot comparison across the

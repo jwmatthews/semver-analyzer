@@ -38,14 +38,14 @@ pub(crate) mod test_support {
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     pub struct TestLang;
 
-    impl LanguageSemantics for TestLang {
-        fn is_member_addition_breaking(&self, _c: &Symbol, _m: &Symbol) -> bool {
+    impl<M: Default + Clone + PartialEq> LanguageSemantics<M> for TestLang {
+        fn is_member_addition_breaking(&self, _c: &Symbol<M>, _m: &Symbol<M>) -> bool {
             false
         }
-        fn same_family(&self, _a: &Symbol, _b: &Symbol) -> bool {
+        fn same_family(&self, _a: &Symbol<M>, _b: &Symbol<M>) -> bool {
             false
         }
-        fn same_identity(&self, _a: &Symbol, _b: &Symbol) -> bool {
+        fn same_identity(&self, _a: &Symbol<M>, _b: &Symbol<M>) -> bool {
             false
         }
         fn visibility_rank(&self, _v: Visibility) -> u8 {
@@ -60,6 +60,7 @@ pub(crate) mod test_support {
     }
 
     impl Language for TestLang {
+        type SymbolData = ();
         type Category = String;
         type ManifestChangeType = String;
         type Evidence = String;

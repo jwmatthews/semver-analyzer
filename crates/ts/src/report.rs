@@ -10,15 +10,23 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use semver_analyzer_core::ApiSurface as CoreApiSurface;
+use semver_analyzer_core::Symbol as CoreSymbol;
 use semver_analyzer_core::{
     AddedExport, AnalysisMetadata, AnalysisReport, AnalysisResult, ApiChange, ApiChangeKind,
-    ApiChangeType, ApiSurface, BehavioralChange, ChangeSubject, ChildComponent,
-    ChildComponentStatus, Comparison, ComponentStatus, ComponentSummary, ConstantGroup,
-    ExpectedChild, FileChanges, FileStatus, HierarchyDelta, InferredRenamePatterns, LlmApiChange,
-    ManifestChange, MemberSummary, MigratedMember, MigrationTarget, PackageChanges,
-    RemovalDisposition, RemovedMember, StructuralChange, StructuralChangeType, SuffixRename,
-    Summary, Symbol, SymbolKind, TypeChange,
+    ApiChangeType, BehavioralChange, ChangeSubject, ChildComponent, ChildComponentStatus,
+    Comparison, ComponentStatus, ComponentSummary, ConstantGroup, ExpectedChild, FileChanges,
+    FileStatus, HierarchyDelta, InferredRenamePatterns, LlmApiChange, ManifestChange,
+    MemberSummary, MigratedMember, MigrationTarget, PackageChanges, RemovalDisposition,
+    RemovedMember, StructuralChange, StructuralChangeType, SuffixRename, Summary, SymbolKind,
+    TypeChange,
 };
+
+use crate::TsSymbolData;
+
+/// Type aliases: all Symbols/ApiSurfaces in report.rs carry `TsSymbolData`.
+type Symbol = CoreSymbol<TsSymbolData>;
+type ApiSurface = CoreApiSurface<TsSymbolData>;
 
 use crate::TypeScript;
 use semver_analyzer_konveyor_core::parse_union_string_values;
@@ -1850,11 +1858,11 @@ fn enrich_hierarchy_deltas(
         // Build a map of css token → component name from all symbols
         let mut token_to_component: HashMap<String, String> = HashMap::new();
         for sym in &new_surface.symbols {
-            if sym.css.is_empty() {
+            if sym.language_data.css.is_empty() {
                 continue;
             }
             // Use the first non-modifier token as the component's primary CSS token
-            for token in &sym.css {
+            for token in &sym.language_data.css {
                 token_to_component
                     .entry(token.clone())
                     .or_insert_with(|| sym.name.clone());
@@ -1875,12 +1883,12 @@ fn enrich_hierarchy_deltas(
                 let comp_sym = new_surface
                     .symbols
                     .iter()
-                    .find(|s| s.name == comp.name && !s.css.is_empty());
+                    .find(|s| s.name == comp.name && !s.language_data.css.is_empty());
                 let block_token = match comp_sym {
                     Some(sym) => {
                         // The block token is the one that matches just the block
                         // (no BEM element suffix). For InputGroup, that's "inputGroup".
-                        sym.css.first().cloned()
+                        sym.language_data.css.first().cloned()
                     }
                     None => continue,
                 };
@@ -2247,8 +2255,7 @@ mod tests {
     use super::*;
     use crate::TsManifestChangeType;
     use semver_analyzer_core::{
-        ApiSurface, BehavioralChange, BehavioralChangeKind, MemberMapping, Signature, Symbol,
-        SymbolKind, Visibility,
+        BehavioralChange, BehavioralChangeKind, MemberMapping, Signature, SymbolKind, Visibility,
     };
     use std::sync::Arc;
 
@@ -2413,11 +2420,9 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: TsSymbolData::default(),
                 }],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }],
         };
 
@@ -2507,11 +2512,9 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: TsSymbolData::default(),
                 }],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }
         }
 
@@ -2608,8 +2611,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }
         }
 
@@ -2670,8 +2672,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }
         }
 
@@ -2728,8 +2729,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }
         }
 
@@ -2818,8 +2818,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }
         }
 
@@ -3020,11 +3019,9 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: TsSymbolData::default(),
                 }],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }],
         };
 
@@ -3048,8 +3045,7 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }],
         };
 
@@ -3494,8 +3490,7 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: TsSymbolData::default(),
                 },
                 Symbol {
                     name: "children".to_string(),
@@ -3520,12 +3515,10 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: TsSymbolData::default(),
                 },
             ],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: TsSymbolData::default(),
         };
 
         let new_surface = ApiSurface {
@@ -3634,11 +3627,9 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: TsSymbolData::default(),
         };
 
         let new_surface = ApiSurface {
@@ -3724,11 +3715,9 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: TsSymbolData::default(),
         };
 
         let new_surface = ApiSurface {
@@ -3818,11 +3807,9 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: TsSymbolData::default(),
         };
 
         let new_surface = ApiSurface {
@@ -3928,11 +3915,9 @@ mod tests {
                 is_static: false,
                 accessor_kind: None,
                 members: vec![],
-                rendered_components: vec![],
-                css: vec![],
+                language_data: TsSymbolData::default(),
             }],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: TsSymbolData::default(),
         };
 
         // Deprecated ModalProps (old API re-exported in v6) — HAS header/footer
@@ -3977,8 +3962,7 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: TsSymbolData::default(),
                 },
                 Symbol {
                     name: "footer".to_string(),
@@ -4003,12 +3987,10 @@ mod tests {
                     is_static: false,
                     accessor_kind: None,
                     members: vec![],
-                    rendered_components: vec![],
-                    css: vec![],
+                    language_data: TsSymbolData::default(),
                 },
             ],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: TsSymbolData::default(),
         };
 
         // new_surface contains BOTH — simulating what the real extraction produces

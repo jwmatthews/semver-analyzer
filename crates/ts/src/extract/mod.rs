@@ -8,11 +8,19 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
+use semver_analyzer_core::ApiSurface as CoreApiSurface;
+use semver_analyzer_core::Symbol as CoreSymbol;
 use semver_analyzer_core::{
-    AccessorKind, ApiSurface, Parameter, Signature, Symbol, SymbolKind, TypeParameter, Visibility,
+    AccessorKind, Parameter, Signature, SymbolKind, TypeParameter, Visibility,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use crate::TsSymbolData;
+
+/// Type aliases: all Symbols/ApiSurfaces in the TS extractor carry `TsSymbolData`.
+type Symbol = CoreSymbol<TsSymbolData>;
+type ApiSurface = CoreApiSurface<TsSymbolData>;
 
 /// Extracts API surfaces from TypeScript `.d.ts` files using the OXC parser.
 ///
@@ -362,11 +370,11 @@ fn populate_rendered_components(symbols: &mut [Symbol], worktree_dir: &Path) {
 
         if let Some((rendered, css_tokens)) = cache.get(&tsx_relative) {
             if !rendered.is_empty() {
-                sym.rendered_components = rendered.clone();
+                sym.language_data.rendered_components = rendered.clone();
                 enriched += 1;
             }
             if !css_tokens.is_empty() {
-                sym.css = css_tokens.clone();
+                sym.language_data.css = css_tokens.clone();
             }
             continue;
         }
@@ -382,11 +390,11 @@ fn populate_rendered_components(symbols: &mut [Symbol], worktree_dir: &Path) {
         };
 
         if !rendered.is_empty() {
-            sym.rendered_components = rendered.clone();
+            sym.language_data.rendered_components = rendered.clone();
             enriched += 1;
         }
         if !css_tokens.is_empty() {
-            sym.css = css_tokens.clone();
+            sym.language_data.css = css_tokens.clone();
         }
         cache.insert(tsx_relative, (rendered, css_tokens));
     }
@@ -4023,25 +4031,27 @@ export const Dropdown: React.FC = ({ children }) => {
 
         // The Dropdown symbol should have rendered_components populated
         assert!(
-            !symbols[0].rendered_components.is_empty(),
+            !symbols[0].language_data.rendered_components.is_empty(),
             "Dropdown should have rendered_components"
         );
         assert!(
             symbols[0]
+                .language_data
                 .rendered_components
                 .contains(&"DropdownToggle".to_string()),
             "should contain DropdownToggle"
         );
         assert!(
             symbols[0]
+                .language_data
                 .rendered_components
                 .contains(&"DropdownMenu".to_string()),
             "should contain DropdownMenu"
         );
 
         // Interface and lowercase symbols should NOT have rendered_components
-        assert!(symbols[1].rendered_components.is_empty());
-        assert!(symbols[2].rendered_components.is_empty());
+        assert!(symbols[1].language_data.rendered_components.is_empty());
+        assert!(symbols[2].language_data.rendered_components.is_empty());
     }
 
     #[test]
@@ -4064,7 +4074,7 @@ export const Dropdown: React.FC = ({ children }) => {
         populate_rendered_components(&mut symbols, tmp.path());
 
         // Should gracefully handle missing file
-        assert!(symbols[0].rendered_components.is_empty());
+        assert!(symbols[0].language_data.rendered_components.is_empty());
     }
 
     #[test]
@@ -4110,10 +4120,11 @@ export const Modal = () => {
 
         // Both should get the same rendered_components (from cache)
         assert_eq!(
-            symbols[0].rendered_components,
-            symbols[1].rendered_components
+            symbols[0].language_data.rendered_components,
+            symbols[1].language_data.rendered_components
         );
         assert!(symbols[0]
+            .language_data
             .rendered_components
             .contains(&"ModalBody".to_string()));
     }

@@ -57,43 +57,47 @@ use rename::detect_renames;
 /// 4. **Unmatched** — remaining removed symbols are reported as removed, added as added.
 ///
 /// Star re-export symbols (`export * from './module'`) are filtered out.
-pub fn diff_surfaces_with_semantics(
-    old: &ApiSurface,
-    new: &ApiSurface,
-    semantics: &dyn LanguageSemantics,
-) -> Vec<StructuralChange> {
+pub fn diff_surfaces_with_semantics<M, S>(
+    old: &ApiSurface<M>,
+    new: &ApiSurface<M>,
+    semantics: &S,
+) -> Vec<StructuralChange>
+where
+    M: Default + Clone + PartialEq,
+    S: LanguageSemantics<M>,
+{
     let mut changes = Vec::new();
 
     // Filter out star re-export symbols — they represent `export * from '...'`
     // directives in barrel files.
-    let old_symbols: Vec<&Symbol> = old
+    let old_symbols: Vec<&Symbol<M>> = old
         .symbols
         .iter()
         .filter(|s| !is_star_reexport(s))
         .collect();
-    let new_symbols: Vec<&Symbol> = new
+    let new_symbols: Vec<&Symbol<M>> = new
         .symbols
         .iter()
         .filter(|s| !is_star_reexport(s))
         .collect();
 
     // Build lookup maps by qualified_name
-    let old_map: HashMap<&str, &Symbol> = old_symbols
+    let old_map: HashMap<&str, &Symbol<M>> = old_symbols
         .iter()
         .map(|s| (s.qualified_name.as_str(), *s))
         .collect();
-    let new_map: HashMap<&str, &Symbol> = new_symbols
+    let new_map: HashMap<&str, &Symbol<M>> = new_symbols
         .iter()
         .map(|s| (s.qualified_name.as_str(), *s))
         .collect();
 
     // Collect removed and added symbols (not matched by exact qualified_name)
-    let removed: Vec<&Symbol> = old_symbols
+    let removed: Vec<&Symbol<M>> = old_symbols
         .iter()
         .filter(|s| !new_map.contains_key(s.qualified_name.as_str()))
         .copied()
         .collect();
-    let added: Vec<&Symbol> = new_symbols
+    let added: Vec<&Symbol<M>> = new_symbols
         .iter()
         .filter(|s| !old_map.contains_key(s.qualified_name.as_str()))
         .copied()
@@ -277,14 +281,14 @@ pub fn diff_surfaces_with_semantics(
     // Symbols with the same name but DIFFERENT import paths (e.g., Chart
     // moved from root to /victory) are kept — they need to pass through
     // rename detection to emit Relocated changes.
-    let new_by_name: HashMap<&str, Vec<&Symbol>> = {
-        let mut map: HashMap<&str, Vec<&Symbol>> = HashMap::new();
+    let new_by_name: HashMap<&str, Vec<&Symbol<M>>> = {
+        let mut map: HashMap<&str, Vec<&Symbol<M>>> = HashMap::new();
         for s in new_symbols.iter() {
             map.entry(s.name.as_str()).or_default().push(s);
         }
         map
     };
-    let remaining_removed: Vec<&Symbol> = removed
+    let remaining_removed: Vec<&Symbol<M>> = removed
         .iter()
         .filter(|s| !relocated_old.contains(s.qualified_name.as_str()))
         .filter(|s| {
@@ -309,7 +313,7 @@ pub fn diff_surfaces_with_semantics(
         })
         .copied()
         .collect();
-    let remaining_added: Vec<&Symbol> = added
+    let remaining_added: Vec<&Symbol<M>> = added
         .iter()
         .filter(|s| !relocated_new.contains(s.qualified_name.as_str()))
         .copied()
@@ -468,7 +472,7 @@ pub fn diff_surfaces_with_semantics(
     // fingerprinting because they all share the same shape. Instead, split
     // names on `_`, lowercase, and match by segment set overlap (Jaccard).
     {
-        let token_remaining_removed: Vec<&Symbol> = removed
+        let token_remaining_removed: Vec<&Symbol<M>> = removed
             .iter()
             .filter(|s| {
                 !relocated_old.contains(s.qualified_name.as_str())
@@ -476,7 +480,7 @@ pub fn diff_surfaces_with_semantics(
             })
             .copied()
             .collect();
-        let token_remaining_added: Vec<&Symbol> = added
+        let token_remaining_added: Vec<&Symbol<M>> = added
             .iter()
             .filter(|s| {
                 !relocated_new.contains(s.qualified_name.as_str())
@@ -583,7 +587,7 @@ pub fn diff_surfaces_with_semantics(
     // patterns and annotates the existing SymbolRemoved changes with
     // migration target metadata.
     {
-        let final_removed: Vec<&Symbol> = removed
+        let final_removed: Vec<&Symbol<M>> = removed
             .iter()
             .filter(|s| {
                 !relocated_old.contains(s.qualified_name.as_str())
@@ -734,7 +738,10 @@ fn derive_import_subpath(package: Option<&str>, qualified_name: &str) -> String 
 /// Compare two API surfaces using minimal semantics (no language-specific rules).
 ///
 /// For language-aware diffing, use `diff_surfaces_with_semantics` instead.
-pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange> {
+pub fn diff_surfaces<M: Default + Clone + PartialEq>(
+    old: &ApiSurface<M>,
+    new: &ApiSurface<M>,
+) -> Vec<StructuralChange> {
     diff_surfaces_with_semantics(old, new, &MinimalSemantics)
 }
 
@@ -745,12 +752,12 @@ pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange
 /// No union parsing, no post-processing.
 pub(crate) struct MinimalSemantics;
 
-impl LanguageSemantics for MinimalSemantics {
-    fn is_member_addition_breaking(&self, _container: &Symbol, _member: &Symbol) -> bool {
+impl<M: Default + Clone + PartialEq> LanguageSemantics<M> for MinimalSemantics {
+    fn is_member_addition_breaking(&self, _container: &Symbol<M>, _member: &Symbol<M>) -> bool {
         false
     }
 
-    fn same_family(&self, a: &Symbol, b: &Symbol) -> bool {
+    fn same_family(&self, a: &Symbol<M>, b: &Symbol<M>) -> bool {
         // Same directory = same family (generic, no TS assumptions)
         let a_dir = a
             .file
@@ -765,7 +772,7 @@ impl LanguageSemantics for MinimalSemantics {
         a_dir == b_dir
     }
 
-    fn same_identity(&self, a: &Symbol, b: &Symbol) -> bool {
+    fn same_identity(&self, a: &Symbol<M>, b: &Symbol<M>) -> bool {
         a.name == b.name
     }
 
@@ -785,13 +792,17 @@ impl LanguageSemantics for MinimalSemantics {
 //    and enums, require at least one sibling rename between the same two
 //    directories to validate the match
 
-fn validate_renames<'a>(
-    renames: &'a [rename::RenameMatch<'a>],
-    semantics: &dyn LanguageSemantics,
+fn validate_renames<'a, M, S>(
+    renames: &'a [rename::RenameMatch<'a, M>],
+    semantics: &S,
 ) -> (
-    Vec<&'a rename::RenameMatch<'a>>,
-    Vec<&'a rename::RenameMatch<'a>>,
-) {
+    Vec<&'a rename::RenameMatch<'a, M>>,
+    Vec<&'a rename::RenameMatch<'a, M>>,
+)
+where
+    M: Default + Clone + PartialEq,
+    S: LanguageSemantics<M>,
+{
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
 

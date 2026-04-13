@@ -156,18 +156,22 @@ mod tests {
     #[derive(Debug)]
     struct TestLang;
 
-    impl crate::traits::LanguageSemantics for TestLang {
+    impl<M: Default + Clone + PartialEq> crate::traits::LanguageSemantics<M> for TestLang {
         fn is_member_addition_breaking(
             &self,
-            _container: &crate::types::Symbol,
-            _member: &crate::types::Symbol,
+            _container: &crate::types::Symbol<M>,
+            _member: &crate::types::Symbol<M>,
         ) -> bool {
             false
         }
-        fn same_family(&self, _a: &crate::types::Symbol, _b: &crate::types::Symbol) -> bool {
+        fn same_family(&self, _a: &crate::types::Symbol<M>, _b: &crate::types::Symbol<M>) -> bool {
             false
         }
-        fn same_identity(&self, _a: &crate::types::Symbol, _b: &crate::types::Symbol) -> bool {
+        fn same_identity(
+            &self,
+            _a: &crate::types::Symbol<M>,
+            _b: &crate::types::Symbol<M>,
+        ) -> bool {
             false
         }
         fn visibility_rank(&self, _v: crate::types::Visibility) -> u8 {
@@ -182,6 +186,7 @@ mod tests {
     }
 
     impl Language for TestLang {
+        type SymbolData = ();
         type Category = TestCategory;
         type ManifestChangeType = TestManifest;
         type Evidence = TestEvidence;

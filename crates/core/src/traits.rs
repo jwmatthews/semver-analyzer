@@ -11,9 +11,9 @@
 //! | `BehaviorAnalyzer` | BU | No (language-agnostic, LLM-based) |
 
 use crate::types::{
-    ApiSurface, BehavioralChangeKind, BodyAnalysisResult, BreakingVerdict, Caller, ChangeSubject,
-    ChangedFunction, EvidenceType, ExpectedChild, FunctionSpec, Reference, SdPipelineResult,
-    StructuralChange, StructuralChangeType, Symbol, SymbolKind, TestDiff, TestFile, Visibility,
+    ApiSurface, BehavioralChangeKind, BodyAnalysisResult, BreakingVerdict, Caller, ChangedFunction,
+    EvidenceType, ExpectedChild, FunctionSpec, Reference, SdPipelineResult, StructuralChange,
+    Symbol, SymbolKind, TestDiff, TestFile, Visibility,
 };
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Serialize};
@@ -94,7 +94,7 @@ pub trait BehaviorAnalyzer {
 /// These encode the places where "is this breaking?" or "are these related?"
 /// differ fundamentally by language. The diff engine calls these methods
 /// instead of hardcoding language-specific rules.
-pub trait LanguageSemantics {
+pub trait LanguageSemantics<M: Default + Clone + PartialEq = ()> {
     /// Is adding this member to this container a breaking change?
     ///
     /// This is the single rule that differs most fundamentally by language:
@@ -103,7 +103,7 @@ pub trait LanguageSemantics {
     /// - Java: breaking for abstract methods, not for default methods.
     /// - C#: breaking for abstract members on interfaces.
     /// - Python: breaking for abstract methods on Protocol/ABC.
-    fn is_member_addition_breaking(&self, container: &Symbol, member: &Symbol) -> bool;
+    fn is_member_addition_breaking(&self, container: &Symbol<M>, member: &Symbol<M>) -> bool;
 
     /// Are these two symbols part of the same logical family/group?
     ///
@@ -114,7 +114,7 @@ pub trait LanguageSemantics {
     /// - Go: same package
     /// - Java: same package
     /// - Python: same module
-    fn same_family(&self, a: &Symbol, b: &Symbol) -> bool;
+    fn same_family(&self, a: &Symbol<M>, b: &Symbol<M>) -> bool;
 
     /// Are these two symbols the same concept, possibly at different paths?
     ///
@@ -126,7 +126,7 @@ pub trait LanguageSemantics {
     /// - TypeScript: `Button` and `ButtonProps` (component + its props interface)
     /// - Go: `Client` and `ClientOptions` (struct + its configuration)
     /// - Java: `UserService` and `UserServiceImpl` (interface + implementation)
-    fn same_identity(&self, a: &Symbol, b: &Symbol) -> bool;
+    fn same_identity(&self, a: &Symbol<M>, b: &Symbol<M>) -> bool;
 
     /// Numeric rank for a visibility level (higher = more visible).
     ///
@@ -185,7 +185,7 @@ pub trait LanguageSemantics {
     ///
     /// The orchestrator uses this to prepare data for LLM hierarchy inference.
     /// The trait is NOT responsible for LLM calls or prompt construction.
-    fn hierarchy(&self) -> Option<&dyn HierarchySemantics> {
+    fn hierarchy(&self) -> Option<&dyn HierarchySemantics<M>> {
         None
     }
 
@@ -229,7 +229,7 @@ pub trait LanguageSemantics {
 /// TODO: Reconsider — the methods that take repo/git_ref currently require
 /// language impls to know about git. A future refactor should have the
 /// orchestrator own all git plumbing and pass content to pure-logic methods.
-pub trait HierarchySemantics {
+pub trait HierarchySemantics<M: Default + Clone + PartialEq = ()> {
     /// Get file paths belonging to a component family directory.
     ///
     /// Given a family name (e.g., "Dropdown"), returns relative paths to
@@ -240,7 +240,7 @@ pub trait HierarchySemantics {
     ///
     /// TypeScript/React: extracts the component directory name
     /// (e.g., "Dropdown" from "packages/react-core/src/components/Dropdown/...")
-    fn family_name_from_symbols(&self, symbols: &[&Symbol]) -> Option<String>;
+    fn family_name_from_symbols(&self, symbols: &[&Symbol<M>]) -> Option<String>;
 
     /// Detect cross-family relationships (e.g., React context imports).
     ///
@@ -272,7 +272,7 @@ pub trait HierarchySemantics {
     ///
     /// TypeScript/React: PascalCase Variable/Class/Function/Constant
     /// (React components are PascalCase functions or classes).
-    fn is_hierarchy_candidate(&self, sym: &Symbol) -> bool;
+    fn is_hierarchy_candidate(&self, sym: &Symbol<M>) -> bool;
 
     /// Minimum number of exported types for a family to qualify
     /// for hierarchy inference. Default: 2.
@@ -280,386 +280,21 @@ pub trait HierarchySemantics {
         2
     }
 
-    /// Compute component hierarchy deterministically from three signals:
+    /// Compute component hierarchy deterministically.
     ///
-    /// 1. **Prop absorption** (`structural_changes`): If a parent component
-    ///    had props removed, and those props now exist on a new family member,
-    ///    that member is a consumer child of the parent.
-    ///
-    /// 2. **Cross-family extends mapping** (`rendered_components` + `extends`):
-    ///    If component A renders component X from a different family, and
-    ///    component B's props interface extends X's props interface, then B
-    ///    is a consumer child of A (B wraps X, which is rendered by A).
-    ///
-    /// 3. **Internal rendering** (`rendered_components`): If a parent renders
-    ///    a child internally, that child is prop-passed, not a direct JSX child.
+    /// The default implementation returns an empty map. Language implementations
+    /// that support component hierarchy (e.g., TypeScript/React) override this
+    /// with the full algorithm using language-specific metadata.
     ///
     /// The method works on the NEW surface and structural changes. It returns
     /// the expected hierarchy for the new version.
     fn compute_deterministic_hierarchy(
         &self,
-        new_surface: &ApiSurface,
+        new_surface: &ApiSurface<M>,
         structural_changes: &[StructuralChange],
     ) -> HashMap<String, HashMap<String, Vec<ExpectedChild>>> {
-        use std::collections::{BTreeMap, HashSet};
-
-        // ── Index: group hierarchy candidates by family ──────────────
-
-        let mut families: HashMap<String, Vec<&Symbol>> = HashMap::new();
-        for sym in &new_surface.symbols {
-            if !self.is_hierarchy_candidate(sym) {
-                continue;
-            }
-            if let Some(family) = self.family_name_from_symbols(&[sym]) {
-                families.entry(family).or_default().push(sym);
-            }
-        }
-
-        // ── Index: interface extends map ─────────────────────────────
-        //
-        // Maps interface name → what it extends.
-        // e.g., "DropdownProps" → "MenuProps"
-        // Also maps "DropdownListProps" → "MenuListProps".
-        let mut iface_extends: HashMap<&str, &str> = HashMap::new();
-        for sym in &new_surface.symbols {
-            if sym.kind == SymbolKind::Interface {
-                if let Some(ext) = &sym.extends {
-                    iface_extends.insert(&sym.name, ext.as_str());
-                }
-            }
-        }
-
-        // ── Index: component → props interface name ──────────────────
-        //
-        // Convention: component "Dropdown" → props interface "DropdownProps".
-        // We verify the interface actually exists in the surface.
-        let iface_names: HashSet<&str> = new_surface
-            .symbols
-            .iter()
-            .filter(|s| s.kind == SymbolKind::Interface)
-            .map(|s| s.name.as_str())
-            .collect();
-
-        // ── Index: props interface → component name ──────────────────
-        //
-        // Reverse mapping: "MenuProps" → "Menu", "MenuListProps" → "MenuList"
-        // Used for cross-family extends resolution.
-        let mut props_to_component: HashMap<String, &str> = HashMap::new();
-        for sym in &new_surface.symbols {
-            if !self.is_hierarchy_candidate(sym) {
-                continue;
-            }
-            let props_name = format!("{}Props", sym.name);
-            if iface_names.contains(props_name.as_str()) {
-                props_to_component.insert(props_name, &sym.name);
-            }
-        }
-
-        // ── Signal 1: Prop absorption ────────────────────────────────
-        //
-        // For each parent interface with removed members, find new family
-        // members whose props interface has matching member names.
-        // parent_component → set of child component names that absorbed props.
-
-        // First, collect removed members per parent symbol.
-        // StructuralChange for "Modal.title" means member "title" removed
-        // from the symbol named "Modal" (or its Props interface).
-        let mut removed_props_by_parent: HashMap<String, HashSet<String>> = HashMap::new();
-        for change in structural_changes {
-            if let StructuralChangeType::Removed(ChangeSubject::Member { name, .. }) =
-                &change.change_type
-            {
-                // The parent is the symbol that lost the member.
-                // change.symbol is "Modal.title" → parent is "Modal"
-                // OR change.symbol is "ModalProps" and member is "title"
-                let parent = if let Some((p, _)) = change.symbol.rsplit_once('.') {
-                    // "ModalProps.title" → "ModalProps" → strip "Props" → "Modal"
-                    p.strip_suffix("Props").unwrap_or(p).to_string()
-                } else {
-                    // Just "ModalProps" → strip "Props" → "Modal"
-                    change
-                        .symbol
-                        .strip_suffix("Props")
-                        .unwrap_or(&change.symbol)
-                        .to_string()
-                };
-                removed_props_by_parent
-                    .entry(parent)
-                    .or_default()
-                    .insert(name.clone());
-            }
-        }
-
-        // For each family, check which new members absorbed removed props.
-        let mut absorption_children: HashMap<String, BTreeMap<String, Vec<String>>> =
-            HashMap::new();
-
-        for members in families.values() {
-            for parent in members.iter() {
-                let removed = match removed_props_by_parent.get(&parent.name) {
-                    Some(r) if !r.is_empty() => r,
-                    _ => continue,
-                };
-
-                // Find family members that have matching prop names
-                for candidate in members.iter() {
-                    if candidate.name == parent.name {
-                        continue;
-                    }
-
-                    // Check candidate's own members
-                    let candidate_props: HashSet<&str> =
-                        candidate.members.iter().map(|m| m.name.as_str()).collect();
-
-                    // Also check the candidate's Props interface members
-                    let props_iface_name = format!("{}Props", candidate.name);
-                    let iface_props: HashSet<&str> = new_surface
-                        .symbols
-                        .iter()
-                        .find(|s| s.name == props_iface_name && s.kind == SymbolKind::Interface)
-                        .map(|s| s.members.iter().map(|m| m.name.as_str()).collect())
-                        .unwrap_or_default();
-
-                    let all_candidate_props: HashSet<&str> =
-                        candidate_props.union(&iface_props).copied().collect();
-
-                    let absorbed: Vec<String> = removed
-                        .iter()
-                        .filter(|prop| all_candidate_props.contains(prop.as_str()))
-                        .cloned()
-                        .collect();
-
-                    if !absorbed.is_empty() {
-                        absorption_children
-                            .entry(parent.name.clone())
-                            .or_default()
-                            .insert(candidate.name.clone(), absorbed);
-                    }
-                }
-            }
-        }
-
-        // ── Signal 2: Cross-family extends mapping ───────────────────
-        //
-        // If Dropdown renders Menu (from Menu family), and DropdownList's
-        // props extend MenuListProps → DropdownList maps to MenuList.
-        // If Menu's hierarchy says "Menu renders MenuList internally" (or
-        // MenuList is a known child of Menu), then DropdownList is a child
-        // of Dropdown by the same relationship.
-        //
-        // Build: for each family, a map of
-        //   component → {rendered_external_component → external_component's family component}
-        // Then: for each family member whose props extend an external component's
-        // props, it maps to that external component.
-
-        // extends_map: family member → external component it wraps
-        // e.g., "Dropdown" → "Menu", "DropdownList" → "MenuList"
-        let mut extends_map: HashMap<&str, &str> = HashMap::new();
-        for members in families.values() {
-            for sym in members {
-                let props_name = format!("{}Props", sym.name);
-                if let Some(ext_iface) = iface_extends.get(props_name.as_str()) {
-                    // Strip Omit<...> wrapper if present — just get the base name
-                    let ext_clean = ext_iface
-                        .strip_prefix("Omit<")
-                        .and_then(|s| s.split(',').next())
-                        .unwrap_or(ext_iface);
-                    if let Some(ext_component) = props_to_component.get(ext_clean) {
-                        // Only cross-family: the extended component should NOT be
-                        // in the same family.
-                        let ext_family = self.family_name_from_symbols(&[
-                            // Find the actual Symbol for the extended component
-                            new_surface
-                                .symbols
-                                .iter()
-                                .find(|s| s.name.as_str() == *ext_component)
-                                .unwrap_or(sym),
-                        ]);
-                        let own_family = self.family_name_from_symbols(&[sym]);
-                        if ext_family != own_family {
-                            extends_map.insert(&sym.name, ext_component);
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── Combine signals into hierarchy ───────────────────────────
-
-        let mut result: HashMap<String, HashMap<String, Vec<ExpectedChild>>> = HashMap::new();
-
-        for (family_name, members) in &families {
-            let member_names: HashSet<&str> = members.iter().map(|s| s.name.as_str()).collect();
-            let mut family_hierarchy: HashMap<String, Vec<ExpectedChild>> = HashMap::new();
-
-            // What each component renders from the family (Signal 3: internal rendering)
-            let mut renders_family: HashMap<&str, HashSet<&str>> = HashMap::new();
-            for sym in members {
-                let family_renders: HashSet<&str> = sym
-                    .rendered_components
-                    .iter()
-                    .filter(|r| {
-                        member_names.contains(r.as_str()) && r.as_str() != sym.name.as_str()
-                    })
-                    .map(|r| r.as_str())
-                    .collect();
-                if !family_renders.is_empty() {
-                    renders_family.insert(&sym.name, family_renders);
-                }
-            }
-
-            for parent in members.iter() {
-                let mut children: BTreeMap<&str, ExpectedChild> = BTreeMap::new();
-
-                // ── Signal 1: absorption ─────────────────────────────
-                // Children that absorbed removed props from this parent.
-                if let Some(absorbed) = absorption_children.get(&parent.name) {
-                    for child_name in absorbed.keys() {
-                        if !member_names.contains(child_name.as_str()) {
-                            continue;
-                        }
-                        // Is this child rendered internally by parent? → prop-passed
-                        let parent_renders = renders_family.get(parent.name.as_str());
-                        let is_rendered = parent_renders
-                            .map(|r| r.contains(child_name.as_str()))
-                            .unwrap_or(false);
-
-                        let child = if is_rendered {
-                            // Parent renders it internally → prop-passed
-                            ExpectedChild {
-                                name: child_name.clone(),
-                                required: false,
-                                mechanism: "prop".to_string(),
-                                prop_name: None,
-                            }
-                        } else {
-                            // Parent does NOT render it → direct JSX child
-                            ExpectedChild::new(child_name, false)
-                        };
-                        children.insert(child_name.as_str(), child);
-                    }
-                }
-
-                // ── Signal 2: cross-family extends mapping ───────────
-                // If this parent extends an external component (e.g.,
-                // Dropdown extends Menu) AND renders it internally, find
-                // which family members extend the external component's
-                // children.
-                //
-                // The "renders it internally" check prevents inverse
-                // mappings: DropdownList extends MenuList but does NOT
-                // render Menu, so it should not map Menu's children as
-                // its own children.
-                if let Some(ext_parent) = extends_map.get(parent.name.as_str()) {
-                    // Gate: parent must render the external parent in its JSX,
-                    // AND the external parent must be a container (renders
-                    // family members). Without the container check, leaf
-                    // wrappers like DropdownList (renders MenuList) would
-                    // incorrectly claim siblings as children.
-                    let renders_ext_parent = parent
-                        .rendered_components
-                        .iter()
-                        .any(|r| r.as_str() == *ext_parent);
-
-                    // Check that ext_parent is a container in its family:
-                    // it must render at least one component from the same
-                    // external family.
-                    let ext_parent_sym = new_surface
-                        .symbols
-                        .iter()
-                        .find(|s| s.name.as_str() == *ext_parent);
-                    let ext_parent_is_container = ext_parent_sym
-                        .map(|ep| {
-                            let ep_family = self.family_name_from_symbols(&[ep]);
-                            ep.rendered_components.iter().any(|rc| {
-                                new_surface
-                                    .symbols
-                                    .iter()
-                                    .filter(|s| self.is_hierarchy_candidate(s))
-                                    .any(|s| {
-                                        s.name.as_str() == rc.as_str()
-                                            && self.family_name_from_symbols(&[s]) == ep_family
-                                    })
-                            })
-                        })
-                        .unwrap_or(false);
-
-                    if !renders_ext_parent || !ext_parent_is_container {
-                        // Skip: either this component doesn't render the
-                        // external parent, or the external parent isn't a
-                        // container in its family.
-                    } else if let Some(ext_sym) = ext_parent_sym {
-                        // For each family member that extends an external component,
-                        // check if that external component is rendered by the
-                        // external parent OR is a known child of it.
-                        for candidate in members.iter() {
-                            if candidate.name == parent.name {
-                                continue;
-                            }
-                            if children.contains_key(candidate.name.as_str()) {
-                                continue; // Already found via absorption
-                            }
-
-                            // Does this candidate extend something from the external family?
-                            if let Some(ext_child) = extends_map.get(candidate.name.as_str()) {
-                                // ext_child is the external component this candidate wraps.
-                                // Is it rendered by the external parent?
-                                let ext_renders_child =
-                                    ext_sym.rendered_components.contains(&ext_child.to_string());
-
-                                // Only add the child if:
-                                // 1. The external parent does NOT render it
-                                //    (consumers must provide it as JSX child)
-                                // 2. The candidate's external component is
-                                //    NOT itself a container (to prevent
-                                //    mapping parents as children — e.g.,
-                                //    Menu should not be a child of MenuGroup)
-                                if !ext_renders_child {
-                                    // Check: is ext_child a container?
-                                    let ext_child_sym = new_surface
-                                        .symbols
-                                        .iter()
-                                        .find(|s| s.name.as_str() == *ext_child);
-                                    let ext_child_is_container = ext_child_sym
-                                        .map(|ec| {
-                                            let ec_family = self.family_name_from_symbols(&[ec]);
-                                            ec.rendered_components.iter().any(|rc| {
-                                                new_surface
-                                                    .symbols
-                                                    .iter()
-                                                    .filter(|s| self.is_hierarchy_candidate(s))
-                                                    .any(|s| {
-                                                        s.name.as_str() == rc.as_str()
-                                                            && self.family_name_from_symbols(&[s])
-                                                                == ec_family
-                                                    })
-                                            })
-                                        })
-                                        .unwrap_or(false);
-
-                                    if !ext_child_is_container {
-                                        children.insert(
-                                            &candidate.name,
-                                            ExpectedChild::new(&candidate.name, false),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    } // else renders_ext_parent
-                }
-
-                if !children.is_empty() {
-                    family_hierarchy.insert(parent.name.clone(), children.into_values().collect());
-                }
-            }
-
-            if !family_hierarchy.is_empty() {
-                result.insert(family_name.clone(), family_hierarchy);
-            }
-        }
-
-        result
+        let _ = (new_surface, structural_changes);
+        HashMap::new()
     }
 }
 
@@ -753,7 +388,23 @@ pub trait MessageFormatter {
 /// Code that only needs semantic rules can take `&dyn LanguageSemantics`
 /// (no generic parameter). Code that needs the associated types takes
 /// `L: Language`.
-pub trait Language: LanguageSemantics + MessageFormatter + Send + Sync + 'static {
+pub trait Language:
+    LanguageSemantics<Self::SymbolData> + MessageFormatter + Send + Sync + 'static
+{
+    /// Per-symbol metadata type carried in `Symbol<M>.language_data`.
+    ///
+    /// TypeScript: `TsSymbolData` (rendered components, CSS tokens).
+    /// Languages without per-symbol metadata: `()`.
+    type SymbolData: Debug
+        + Clone
+        + Default
+        + PartialEq
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + Send
+        + Sync;
+
     /// Behavioral change categories for this language.
     type Category: Debug + Clone + Serialize + DeserializeOwned + Eq + std::hash::Hash + Send + Sync;
 
@@ -820,7 +471,7 @@ pub trait Language: LanguageSemantics + MessageFormatter + Send + Sync + 'static
         repo: &Path,
         git_ref: &str,
         degradation: Option<&crate::diagnostics::DegradationTracker>,
-    ) -> Result<ApiSurface>;
+    ) -> Result<ApiSurface<Self::SymbolData>>;
 
     /// Parse the diff between two git refs and identify all functions
     /// whose bodies changed (public AND private).
@@ -937,11 +588,15 @@ pub trait Language: LanguageSemantics + MessageFormatter + Send + Sync + 'static
 ///
 /// This is the primary entry point for the TD (Top-Down) pipeline.
 /// The `semantics` parameter provides language-specific rules.
-pub fn diff_surfaces_with_semantics(
-    old: &ApiSurface,
-    new: &ApiSurface,
-    semantics: &dyn LanguageSemantics,
-) -> Vec<StructuralChange> {
+pub fn diff_surfaces_with_semantics<M, S>(
+    old: &ApiSurface<M>,
+    new: &ApiSurface<M>,
+    semantics: &S,
+) -> Vec<StructuralChange>
+where
+    M: Default + Clone + PartialEq,
+    S: LanguageSemantics<M>,
+{
     crate::diff::diff_surfaces_with_semantics(old, new, semantics)
 }
 
@@ -950,20 +605,23 @@ pub fn diff_surfaces_with_semantics(
 /// This uses `MinimalSemantics` which is language-agnostic: no member additions
 /// are breaking, no union parsing, no post-processing. For language-aware
 /// diffing, use `diff_surfaces_with_semantics` with a `LanguageSemantics` impl.
-pub fn diff_surfaces(old: &ApiSurface, new: &ApiSurface) -> Vec<StructuralChange> {
+pub fn diff_surfaces<M: Default + Clone + PartialEq>(
+    old: &ApiSurface<M>,
+    new: &ApiSurface<M>,
+) -> Vec<StructuralChange> {
     crate::diff::diff_surfaces(old, new)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{SymbolKind, Visibility};
+    use crate::types::{ChangeSubject, StructuralChangeType, SymbolKind, Visibility};
     use std::path::PathBuf;
 
     /// Minimal HierarchySemantics impl for testing.
     struct TestHierarchy;
 
-    impl HierarchySemantics for TestHierarchy {
+    impl<M: Default + Clone + PartialEq> HierarchySemantics<M> for TestHierarchy {
         fn family_source_paths(
             &self,
             _repo: &Path,
@@ -973,7 +631,7 @@ mod tests {
             Vec::new()
         }
 
-        fn family_name_from_symbols(&self, symbols: &[&Symbol]) -> Option<String> {
+        fn family_name_from_symbols(&self, symbols: &[&Symbol<M>]) -> Option<String> {
             symbols.first().and_then(|s| {
                 s.file
                     .parent()
@@ -1000,7 +658,7 @@ mod tests {
             None
         }
 
-        fn is_hierarchy_candidate(&self, sym: &Symbol) -> bool {
+        fn is_hierarchy_candidate(&self, sym: &Symbol<M>) -> bool {
             matches!(
                 sym.kind,
                 SymbolKind::Variable | SymbolKind::Function | SymbolKind::Constant
@@ -1011,7 +669,7 @@ mod tests {
     // ─── Test helpers ────────────────────────────────────────────────
 
     fn make_component(name: &str, family: &str, rendered: Vec<&str>) -> Symbol {
-        let mut sym = Symbol::new(
+        let sym = Symbol::new(
             name,
             format!("src/components/{}/{}.{}", family, name, name),
             SymbolKind::Variable,
@@ -1019,7 +677,7 @@ mod tests {
             PathBuf::from(format!("src/components/{}/{}.d.ts", family, name)),
             1,
         );
-        sym.rendered_components = rendered.into_iter().map(|s| s.to_string()).collect();
+        let _ = rendered; // rendered_components moved to language_data in genericization
         sym
     }
 
@@ -1111,332 +769,13 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Signal 1: Prop absorption (Modal v5→v6 pattern)
+    // Signal 1–3 tests moved to crates/ts/src/language.rs
     // ═══════════════════════════════════════════════════════════════════
     //
-    // Modal had props (title, description, actions, footer, bodyAriaRole, etc.)
-    // that were removed. These props now exist on new child components:
-    //   - ModalHeader absorbed: title, description, help, titleIconVariant, titleLabel
-    //   - ModalBody absorbed: bodyAriaRole (as "role")
-    //   - ModalFooter absorbed: actions, footer
-    //
-    // Since Modal does NOT render ModalHeader/ModalBody/ModalFooter
-    // internally (they're not in rendered_components), they are direct
-    // JSX children (mechanism = "child").
-
-    #[test]
-    fn signal1_modal_v6_absorption() {
-        let h = TestHierarchy;
-
-        // New surface: v6 Modal family
-        let new_surface = ApiSurface {
-            symbols: vec![
-                make_component("Modal", "Modal", vec!["ModalContent"]),
-                make_component(
-                    "ModalHeader",
-                    "Modal",
-                    vec!["ModalBoxDescription", "ModalBoxTitle"],
-                ),
-                make_component("ModalBody", "Modal", vec![]),
-                make_component("ModalFooter", "Modal", vec![]),
-                // ModalProps interface with no extends (standalone)
-                make_interface(
-                    "ModalProps",
-                    "Modal",
-                    None,
-                    vec!["children", "className", "isOpen", "onClose", "variant"],
-                ),
-                // ModalHeaderProps has the absorbed props
-                make_interface(
-                    "ModalHeaderProps",
-                    "Modal",
-                    None,
-                    vec![
-                        "children",
-                        "className",
-                        "title",
-                        "description",
-                        "help",
-                        "titleIconVariant",
-                        "titleScreenReaderText",
-                    ],
-                ),
-                // ModalBodyProps has bodyAriaRole as "role"
-                make_interface(
-                    "ModalBodyProps",
-                    "Modal",
-                    None,
-                    vec!["children", "className", "role"],
-                ),
-                // ModalFooterProps has the absorbed actions
-                make_interface(
-                    "ModalFooterProps",
-                    "Modal",
-                    None,
-                    vec!["children", "className"],
-                ),
-            ],
-        };
-
-        // Structural changes: Modal had these props removed
-        let changes = vec![
-            removed_member("ModalProps", "title"),
-            removed_member("ModalProps", "description"),
-            removed_member("ModalProps", "help"),
-            removed_member("ModalProps", "titleIconVariant"),
-            removed_member("ModalProps", "titleLabel"),
-            removed_member("ModalProps", "bodyAriaRole"),
-            removed_member("ModalProps", "actions"),
-            removed_member("ModalProps", "footer"),
-            removed_member("ModalProps", "header"),
-            removed_member("ModalProps", "showClose"),
-            removed_member("ModalProps", "hasNoBodyWrapper"),
-        ];
-
-        let result = h.compute_deterministic_hierarchy(&new_surface, &changes);
-
-        // Modal should have consumer children from absorption
-        assert!(
-            has_entry(&result, "Modal", "Modal"),
-            "Modal should be a parent"
-        );
-        let modal_children = child_names(&result, "Modal", "Modal");
-
-        // ModalHeader absorbed title, description, help, titleIconVariant
-        assert!(
-            modal_children.contains(&"ModalHeader".to_string()),
-            "ModalHeader absorbed props from Modal"
-        );
-
-        // ModalBody absorbed bodyAriaRole (as "role" — but "bodyAriaRole" is in removed set
-        // and doesn't match "role" on ModalBody. However "actions" maps to ModalFooter
-        // since ModalFooterProps doesn't have "actions" either... Let's check what DOES match)
-
-        // ModalFooter: its props are [children, className] — "actions" and "footer"
-        // are NOT in ModalFooterProps in our test. So ModalFooter won't be detected
-        // via absorption unless "children" matches a removed prop name.
-        // In the real pipeline, "children" is a removed prop name? No. "footer" is.
-        // "footer" is not in ModalFooterProps members. So this test correctly shows
-        // that absorption only works when the prop names actually match.
-
-        // ModalHeader has "title", "description", "help", "titleIconVariant" which
-        // match removed props from ModalProps → detected as child
-        assert!(
-            modal_children.contains(&"ModalHeader".to_string()),
-            "ModalHeader absorbed title/description/help/titleIconVariant from Modal"
-        );
-
-        // Since Modal doesn't render ModalHeader internally → mechanism = "child"
-        assert_eq!(
-            child_mechanism(&result, "Modal", "Modal", "ModalHeader"),
-            Some("child".to_string()),
-            "ModalHeader is a direct JSX child (not rendered internally)"
-        );
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Signal 2: Cross-family extends (Dropdown wraps Menu)
-    // ═══════════════════════════════════════════════════════════════════
-    //
-    // Dropdown.tsx renders Menu and MenuContent (from Menu family).
-    // DropdownProps extends MenuProps.
-    // DropdownListProps extends MenuListProps.
-    // DropdownItemProps extends MenuItemProps.
-    // DropdownGroupProps extends MenuGroupProps.
-    //
-    // Menu renders MenuContent internally. MenuContent is NOT rendered
-    // by Dropdown's family members as a consumer child, but Menu's
-    // relationship to MenuList/MenuGroup tells us:
-    //   - Menu does NOT render MenuList/MenuGroup internally → they are
-    //     consumer children of Menu
-    //   - By extends mapping: DropdownList (extends MenuList) is a consumer
-    //     child of Dropdown (extends Menu)
-
-    #[test]
-    fn signal2_dropdown_cross_family_extends() {
-        let h = TestHierarchy;
-
-        let new_surface = ApiSurface {
-            symbols: vec![
-                // Dropdown family components
-                make_component(
-                    "Dropdown",
-                    "Dropdown",
-                    vec!["Menu", "MenuContent", "Popper"],
-                ),
-                make_component("DropdownGroup", "Dropdown", vec!["MenuGroup"]),
-                make_component("DropdownItem", "Dropdown", vec!["MenuItem"]),
-                make_component("DropdownList", "Dropdown", vec!["MenuList"]),
-                // Dropdown family interfaces with extends
-                make_interface(
-                    "DropdownProps",
-                    "Dropdown",
-                    Some("MenuProps"),
-                    vec!["children", "className", "toggle", "isOpen", "onSelect"],
-                ),
-                make_interface(
-                    "DropdownGroupProps",
-                    "Dropdown",
-                    Some("MenuGroupProps"),
-                    vec!["children", "label"],
-                ),
-                make_interface(
-                    "DropdownItemProps",
-                    "Dropdown",
-                    Some("MenuItemProps"),
-                    vec!["children", "value", "isDisabled"],
-                ),
-                make_interface(
-                    "DropdownListProps",
-                    "Dropdown",
-                    Some("MenuListProps"),
-                    vec!["children"],
-                ),
-                // Menu family components (different directory = different family)
-                // Menu renders MenuContext (a React context provider) internally.
-                // This makes Menu a "container" in its family — it renders at
-                // least one family member.
-                make_component("Menu", "Menu", vec!["MenuContext"]),
-                make_component("MenuContext", "Menu", vec![]),
-                make_component("MenuContent", "Menu", vec![]),
-                make_component("MenuList", "Menu", vec![]),
-                make_component("MenuItem", "Menu", vec![]),
-                make_component("MenuGroup", "Menu", vec!["MenuList"]),
-                // Menu family interfaces
-                make_interface(
-                    "MenuProps",
-                    "Menu",
-                    None,
-                    vec!["children", "className", "onSelect"],
-                ),
-                make_interface("MenuListProps", "Menu", None, vec!["children"]),
-                make_interface("MenuItemProps", "Menu", None, vec!["children", "value"]),
-                make_interface("MenuGroupProps", "Menu", None, vec!["children", "label"]),
-            ],
-        };
-
-        let result = h.compute_deterministic_hierarchy(&new_surface, &[]);
-
-        // Dropdown extends Menu. Menu does NOT render MenuList, MenuItem, MenuGroup
-        // internally → they are consumer children of Menu.
-        // By extends mapping:
-        //   DropdownList (extends MenuList) → consumer child of Dropdown
-        //   DropdownItem (extends MenuItem) → consumer child of Dropdown
-        //   DropdownGroup (extends MenuGroup) → consumer child of Dropdown
-        assert!(
-            has_entry(&result, "Dropdown", "Dropdown"),
-            "Dropdown should be a parent via extends mapping"
-        );
-
-        let dropdown_children = child_names(&result, "Dropdown", "Dropdown");
-
-        // Dropdown should contain children whose external components are
-        // NOT containers. MenuList and MenuItem are leaves (render nothing
-        // from Menu family), so DropdownList and DropdownItem map as children.
-        // MenuGroup IS a container (renders MenuList), so DropdownGroup is
-        // NOT a direct child of Dropdown — it has its own hierarchy.
-        assert!(
-            dropdown_children.contains(&"DropdownItem".to_string()),
-            "DropdownItem wraps MenuItem (leaf) → consumer child of Dropdown"
-        );
-        assert!(
-            dropdown_children.contains(&"DropdownList".to_string()),
-            "DropdownList wraps MenuList (leaf) → consumer child of Dropdown"
-        );
-        assert!(
-            !dropdown_children.contains(&"DropdownGroup".to_string()),
-            "DropdownGroup wraps MenuGroup (container) → not a direct child of Dropdown"
-        );
-
-        // DropdownGroup IS a parent (MenuGroup renders MenuList, is a container).
-        // DropdownGroup should find DropdownItem as a child (MenuItem is a leaf,
-        // not rendered by MenuGroup).
-        assert!(
-            has_entry(&result, "Dropdown", "DropdownGroup"),
-            "DropdownGroup should be a parent"
-        );
-        let group_children = child_names(&result, "Dropdown", "DropdownGroup");
-        assert!(
-            group_children.contains(&"DropdownItem".to_string()),
-            "DropdownItem is a child of DropdownGroup"
-        );
-        // DropdownGroup should NOT list Dropdown or DropdownList as children
-        assert!(
-            !group_children.contains(&"Dropdown".to_string()),
-            "Dropdown is a container, not a child of DropdownGroup"
-        );
-
-        // DropdownList and DropdownItem should NOT be parents
-        assert!(
-            !has_entry(&result, "Dropdown", "DropdownList"),
-            "DropdownList should NOT be a parent (MenuList is not a container)"
-        );
-        assert!(
-            !has_entry(&result, "Dropdown", "DropdownItem"),
-            "DropdownItem should NOT be a parent"
-        );
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Signal 3: Internal rendering determines prop-passed mechanism
-    // ═══════════════════════════════════════════════════════════════════
-    //
-    // When a parent renders a child internally AND that child absorbed
-    // a removed prop, the mechanism should be "prop" (not "child").
-
-    #[test]
-    fn signal3_rendered_internally_means_prop_passed() {
-        let h = TestHierarchy;
-
-        // FormFieldGroup renders FormFieldGroupHeader internally (via header prop)
-        let new_surface = ApiSurface {
-            symbols: vec![
-                make_component(
-                    "FormFieldGroup",
-                    "Form",
-                    vec!["FormFieldGroupHeader"], // renders it internally!
-                ),
-                make_component("FormFieldGroupHeader", "Form", vec![]),
-                make_component("FormGroup", "Form", vec![]),
-                // Interfaces
-                make_interface(
-                    "FormFieldGroupProps",
-                    "Form",
-                    None,
-                    vec!["children", "header"],
-                ),
-                make_interface(
-                    "FormFieldGroupHeaderProps",
-                    "Form",
-                    None,
-                    vec!["titleText", "titleDescription"],
-                ),
-            ],
-        };
-
-        // FormFieldGroup had titleText and titleDescription removed
-        let changes = vec![
-            removed_member("FormFieldGroupProps", "titleText"),
-            removed_member("FormFieldGroupProps", "titleDescription"),
-        ];
-
-        let result = h.compute_deterministic_hierarchy(&new_surface, &changes);
-
-        // FormFieldGroupHeader absorbed titleText/titleDescription from FormFieldGroup
-        assert!(has_entry(&result, "Form", "FormFieldGroup"));
-        let children = child_names(&result, "Form", "FormFieldGroup");
-        assert!(
-            children.contains(&"FormFieldGroupHeader".to_string()),
-            "FormFieldGroupHeader absorbed props from FormFieldGroup"
-        );
-
-        // Since FormFieldGroup RENDERS FormFieldGroupHeader internally → prop-passed
-        assert_eq!(
-            child_mechanism(&result, "Form", "FormFieldGroup", "FormFieldGroupHeader"),
-            Some("prop".to_string()),
-            "FormFieldGroupHeader is rendered internally → prop-passed"
-        );
-    }
+    // The full hierarchy algorithm (prop absorption, cross-family extends,
+    // internal rendering) was moved to TypeScript's HierarchySemantics
+    // implementation during genericization. The tests live in the TS
+    // crate where they can access TsSymbolData.rendered_components.
 
     // ═══════════════════════════════════════════════════════════════════
     // Masthead: all leaves, no hierarchy

@@ -8,6 +8,7 @@ mod helpers;
 
 use helpers::*;
 use semver_analyzer_core::diff::diff_surfaces_with_semantics;
+use semver_analyzer_core::{SymbolKind, Visibility};
 use semver_analyzer_ts::TypeScript;
 
 fn diff(old: &ApiSurface, new: &ApiSurface) -> Vec<NormalizedChange> {
@@ -17,8 +18,6 @@ fn diff(old: &ApiSurface, new: &ApiSurface) -> Vec<NormalizedChange> {
         &TypeScript::default(),
     ))
 }
-
-use semver_analyzer_core::*;
 
 #[test]
 fn baseline_merge_child_into_parent_emptystate() {

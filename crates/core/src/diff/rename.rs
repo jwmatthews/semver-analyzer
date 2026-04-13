@@ -20,7 +20,7 @@ struct MemberFingerprint {
 }
 
 impl MemberFingerprint {
-    fn from_symbol(sym: &Symbol) -> Self {
+    fn from_symbol<M: Default + Clone + PartialEq>(sym: &Symbol<M>) -> Self {
         let (return_type, is_optional, param_count) = match &sym.signature {
             Some(sig) => (
                 sig.return_type.clone(),
@@ -44,7 +44,7 @@ impl MemberFingerprint {
     /// types match even when reference names changed.
     ///
     /// Example: `(ToolbarChip | string)[]` → `(_T_ | string)[]`
-    fn from_symbol_normalized(sym: &Symbol) -> Self {
+    fn from_symbol_normalized<M: Default + Clone + PartialEq>(sym: &Symbol<M>) -> Self {
         let (return_type, is_optional, param_count) = match &sym.signature {
             Some(sig) => (
                 sig.return_type
@@ -90,7 +90,7 @@ impl MemberFingerprint {
     /// string literal values with placeholders. This catches renames where
     /// the enum values also changed (e.g., spacer → gap where
     /// `'spacerNone'` → `'gapNone'`).
-    fn from_symbol_deep_normalized(sym: &Symbol) -> Self {
+    fn from_symbol_deep_normalized<M: Default + Clone + PartialEq>(sym: &Symbol<M>) -> Self {
         let (return_type, is_optional, param_count) = match &sym.signature {
             Some(sig) => (
                 sig.return_type
@@ -274,9 +274,9 @@ fn normalize_type_structure_deep(type_str: &str) -> String {
 }
 
 /// A detected rename: old name → new name, with the matched symbols.
-pub(super) struct RenameMatch<'a> {
-    pub old: &'a Symbol,
-    pub new: &'a Symbol,
+pub(super) struct RenameMatch<'a, M: Default + Clone + PartialEq = ()> {
+    pub old: &'a Symbol<M>,
+    pub new: &'a Symbol<M>,
 }
 
 /// Detect renames among removed and added symbol lists.
@@ -287,17 +287,17 @@ pub(super) struct RenameMatch<'a> {
 /// 3. When exactly one removed matches one added → automatic rename.
 /// 4. When multiple match, score by name similarity and greedily assign.
 /// 5. Require a minimum similarity threshold to avoid false matches.
-pub(super) fn detect_renames<'a>(
-    removed: &[&'a Symbol],
-    added: &[&'a Symbol],
-    same_family: impl Fn(&Symbol, &Symbol) -> bool,
-) -> Vec<RenameMatch<'a>> {
+pub(super) fn detect_renames<'a, M: Default + Clone + PartialEq>(
+    removed: &[&'a Symbol<M>],
+    added: &[&'a Symbol<M>],
+    same_family: impl Fn(&Symbol<M>, &Symbol<M>) -> bool,
+) -> Vec<RenameMatch<'a, M>> {
     if removed.is_empty() || added.is_empty() {
         return Vec::new();
     }
 
     // Group added symbols by fingerprint
-    let mut added_by_fp: HashMap<MemberFingerprint, Vec<(usize, &'a Symbol)>> = HashMap::new();
+    let mut added_by_fp: HashMap<MemberFingerprint, Vec<(usize, &'a Symbol<M>)>> = HashMap::new();
     for (ai, sym) in added.iter().enumerate() {
         let fp = MemberFingerprint::from_symbol(sym);
         added_by_fp.entry(fp).or_default().push((ai, sym));
@@ -339,8 +339,8 @@ pub(super) fn detect_renames<'a>(
     const PRIMITIVE_AMBIGUOUS_MIN_SIMILARITY: f64 = 0.45;
 
     // Compute the effective similarity threshold for a candidate pair.
-    let effective_threshold = |rsym: &Symbol,
-                               asym: &Symbol,
+    let effective_threshold = |rsym: &Symbol<M>,
+                               asym: &Symbol<M>,
                                fp: &MemberFingerprint,
                                removed_count: usize,
                                added_count: usize|
@@ -385,7 +385,7 @@ pub(super) fn detect_renames<'a>(
     // names with placeholders, then fingerprint on the normalized shape.
     // This matches `(ToolbarChip | string)[]` with `(ToolbarLabel | string)[]`
     // but rejects `boolean` vs `number` or `SplitButtonOptions` vs `ReactNode[]`.
-    let mut structural_fp: HashMap<MemberFingerprint, Vec<(usize, &Symbol)>> = HashMap::new();
+    let mut structural_fp: HashMap<MemberFingerprint, Vec<(usize, &Symbol<M>)>> = HashMap::new();
     for (ai, sym) in added.iter().enumerate() {
         let fp = MemberFingerprint::from_symbol_normalized(sym);
         structural_fp.entry(fp).or_default().push((ai, sym));
@@ -425,7 +425,7 @@ pub(super) fn detect_renames<'a>(
     // name. E.g., spacer: { default?: 'spacerNone' | 'spacerSm' } →
     // gap: { default?: 'gapNone' | 'gapSm' | 'gapXl' }. After deep
     // normalization, both become { _p_: '_V_'; _p_: '_V_'; ... }.
-    let mut deep_fp: HashMap<MemberFingerprint, Vec<(usize, &Symbol)>> = HashMap::new();
+    let mut deep_fp: HashMap<MemberFingerprint, Vec<(usize, &Symbol<M>)>> = HashMap::new();
     for (ai, sym) in added.iter().enumerate() {
         let fp = MemberFingerprint::from_symbol_deep_normalized(sym);
         deep_fp.entry(fp).or_default().push((ai, sym));
@@ -475,8 +475,8 @@ pub(super) fn detect_renames<'a>(
         const NAME_ONLY_SIMILARITY: f64 = 0.6;
 
         // Group removed and added by parent qualified name
-        let mut removed_by_parent: HashMap<&str, Vec<(usize, &Symbol)>> = HashMap::new();
-        let mut added_by_parent: HashMap<&str, Vec<(usize, &Symbol)>> = HashMap::new();
+        let mut removed_by_parent: HashMap<&str, Vec<(usize, &Symbol<M>)>> = HashMap::new();
+        let mut added_by_parent: HashMap<&str, Vec<(usize, &Symbol<M>)>> = HashMap::new();
 
         for (ri, rsym) in removed.iter().enumerate() {
             if rsym.kind != SymbolKind::Property {
@@ -559,14 +559,14 @@ pub(super) fn detect_renames<'a>(
 ///
 /// Uses an inverted index for efficiency: each segment maps to the added tokens
 /// that contain it, so we only compute Jaccard for candidates sharing segments.
-pub(super) fn detect_token_renames<'a>(
-    removed: &[&'a Symbol],
-    added: &[&'a Symbol],
-) -> Vec<RenameMatch<'a>> {
+pub(super) fn detect_token_renames<'a, M: Default + Clone + PartialEq>(
+    removed: &[&'a Symbol<M>],
+    added: &[&'a Symbol<M>],
+) -> Vec<RenameMatch<'a, M>> {
     use std::collections::{BTreeSet, HashSet};
 
     // Filter to constant/variable symbols only
-    let removed_tokens: Vec<(usize, &Symbol, BTreeSet<String>)> = removed
+    let removed_tokens: Vec<(usize, &Symbol<M>, BTreeSet<String>)> = removed
         .iter()
         .enumerate()
         .filter(|(_, s)| matches!(s.kind, SymbolKind::Constant | SymbolKind::Variable))
@@ -576,7 +576,7 @@ pub(super) fn detect_token_renames<'a>(
         })
         .collect();
 
-    let added_tokens: Vec<(usize, &Symbol, BTreeSet<String>)> = added
+    let added_tokens: Vec<(usize, &Symbol<M>, BTreeSet<String>)> = added
         .iter()
         .enumerate()
         .filter(|(_, s)| matches!(s.kind, SymbolKind::Constant | SymbolKind::Variable))
@@ -797,7 +797,7 @@ fn tokenize_name(name: &str) -> BTreeSet<String> {
 /// This function extracts the `"value"` field (e.g., `"#151515"`) from the
 /// `signature.return_type` string. Returns `None` if the signature is missing
 /// or doesn't contain a parseable value.
-fn extract_token_value(symbol: &Symbol) -> Option<String> {
+fn extract_token_value<M: Default + Clone + PartialEq>(symbol: &Symbol<M>) -> Option<String> {
     let return_type = symbol.signature.as_ref()?.return_type.as_deref()?;
 
     // Match ["value"]: "..." or "value": "..."
@@ -847,8 +847,7 @@ mod token_tests {
             is_static: false,
             accessor_kind: None,
             members: vec![],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         }
     }
 
@@ -1278,8 +1277,7 @@ mod token_tests {
             is_static: false,
             accessor_kind: None,
             members: vec![],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         }
     }
 
@@ -1469,8 +1467,7 @@ mod token_tests {
             is_static: false,
             accessor_kind: None,
             members: vec![],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         }
     }
 
@@ -1498,8 +1495,7 @@ mod token_tests {
             is_static: false,
             accessor_kind: None,
             members: vec![],
-            rendered_components: vec![],
-            css: vec![],
+            language_data: Default::default(),
         }
     }
 
