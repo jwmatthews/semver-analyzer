@@ -1,0 +1,23 @@
+---
+source: crates/ts/src/konveyor_v2.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: sd-composition-emptystate-removed-member-emptystateheader
+    labels:
+      - source=semver-analyzer
+      - change-type=composition
+      - package=@patternfly/react-core
+      - family=EmptyState
+    effort: 3
+    category: mandatory
+    description: EmptyStateHeader was removed from EmptyState family
+    message: "<EmptyStateHeader> has been removed from the EmptyState family.\nRemove usages or replace with the recommended alternative."
+    when:
+      frontend.referenced:
+        pattern: ^EmptyStateHeader$
+        location: JSX_COMPONENT
+        from: "@patternfly/react-core"
+  fix_strategy:
+    strategy: Manual
+    from: EmptyStateHeader

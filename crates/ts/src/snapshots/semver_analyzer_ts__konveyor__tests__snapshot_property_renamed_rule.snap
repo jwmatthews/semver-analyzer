@@ -1,0 +1,24 @@
+---
+source: crates/ts/src/konveyor.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: semver-src-components-modal-d-ts-modalprops-title-renamed
+    labels:
+      - source=semver-analyzer
+      - change-type=renamed
+      - kind=property
+      - has-codemod=true
+    effort: 1
+    category: mandatory
+    description: "Property 'title' was renamed to 'header'"
+    message: "Property 'ModalProps.title' was renamed (property): Property 'title' was renamed to 'header'\n\nFile: src/components/Modal.d.ts\nBefore: ModalProps.title\nAfter: ModalProps.header"
+    when:
+      frontend.referenced:
+        pattern: ^title$
+        location: JSX_PROP
+        component: ^ModalProps$
+  fix_strategy:
+    strategy: Rename
+    from: title
+    to: header

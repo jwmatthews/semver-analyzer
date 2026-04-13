@@ -1,0 +1,238 @@
+---
+source: crates/ts/src/konveyor_v2.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: sd-cf-table-table-req-tbody-and-thead
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 1
+    category: mandatory
+    description: "<Table> must contain Tbody or Thead children"
+    message: "<Table> must contain at least one Tbody or Thead child component.\n\nCorrect usage:\n  <Table>\n    <Tbody />\n  </Table>"
+    when:
+      frontend.referenced:
+        pattern: ^Table$
+        location: JSX_COMPONENT
+        requiresChild: ^(Tbody|Thead)$
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Table
+    replacement: "Tbody, Thead"
+- rule:
+    ruleID: sd-cf-table-tbody-in-table
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 1
+    category: mandatory
+    description: "<Tbody> must be a child of Table"
+    message: "<Tbody> must be used inside <Table>.\n\nCorrect usage:\n  <Table>\n    <Tbody />\n  </Table>"
+    when:
+      frontend.referenced:
+        pattern: ^Tbody$
+        location: JSX_COMPONENT
+        notParent: ^Table$
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Tbody
+    replacement: Table
+- rule:
+    ruleID: sd-cf-table-tbody-req-tr
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 1
+    category: mandatory
+    description: "<Tbody> must contain Tr children"
+    message: "<Tbody> must contain at least one Tr child component.\n\nCorrect usage:\n  <Tbody>\n    <Tr />\n  </Tbody>"
+    when:
+      frontend.referenced:
+        pattern: ^Tbody$
+        location: JSX_COMPONENT
+        requiresChild: ^(Tr)$
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Tbody
+    replacement: Tr
+- rule:
+    ruleID: sd-cf-table-td-in-tr
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 1
+    category: mandatory
+    description: "<Td> must be a child of Tr"
+    message: "<Td> must be used inside <Tr>.\n\nCorrect usage:\n  <Tr>\n    <Td />\n  </Tr>"
+    when:
+      frontend.referenced:
+        pattern: ^Td$
+        location: JSX_COMPONENT
+        notParent: ^Tr$
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Td
+    replacement: Tr
+- rule:
+    ruleID: sd-cf-table-td-not-in-tbody-use-tr
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 3
+    category: mandatory
+    description: "<Td> must be inside Tr, not directly in <Tbody>"
+    message: "<Td> should be wrapped in <Tr> inside <Tbody>.\n\nReplace:\n  <Tbody>\n    <Td />\n  </Tbody>\n\nWith:\n  <Tbody>\n    <Tr>\n      <Td />\n    </Tr>\n  </Tbody>"
+    when:
+      frontend.referenced:
+        pattern: ^Td$
+        location: JSX_COMPONENT
+        parent: ^Tbody$
+        parentFrom: "@patternfly/react-table"
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: CompositionChange
+    component: Td
+    replacement: Tr
+- rule:
+    ruleID: sd-cf-table-td-not-in-thead-use-tr
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 3
+    category: mandatory
+    description: "<Td> must be inside Tr, not directly in <Thead>"
+    message: "<Td> should be wrapped in <Tr> inside <Thead>.\n\nReplace:\n  <Thead>\n    <Td />\n  </Thead>\n\nWith:\n  <Thead>\n    <Tr>\n      <Td />\n    </Tr>\n  </Thead>"
+    when:
+      frontend.referenced:
+        pattern: ^Td$
+        location: JSX_COMPONENT
+        parent: ^Thead$
+        parentFrom: "@patternfly/react-table"
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: CompositionChange
+    component: Td
+    replacement: Tr
+- rule:
+    ruleID: sd-cf-table-thead-in-table
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 1
+    category: mandatory
+    description: "<Thead> must be a child of Table"
+    message: "<Thead> must be used inside <Table>.\n\nCorrect usage:\n  <Table>\n    <Thead />\n  </Table>"
+    when:
+      frontend.referenced:
+        pattern: ^Thead$
+        location: JSX_COMPONENT
+        notParent: ^Table$
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Thead
+    replacement: Table
+- rule:
+    ruleID: sd-cf-table-thead-req-tr
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 1
+    category: mandatory
+    description: "<Thead> must contain Tr children"
+    message: "<Thead> must contain at least one Tr child component.\n\nCorrect usage:\n  <Thead>\n    <Tr />\n  </Thead>"
+    when:
+      frontend.referenced:
+        pattern: ^Thead$
+        location: JSX_COMPONENT
+        requiresChild: ^(Tr)$
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Thead
+    replacement: Tr
+- rule:
+    ruleID: sd-cf-table-tr-in-tbody-or-thead
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 1
+    category: mandatory
+    description: "<Tr> must be a child of Tbody or Thead"
+    message: "<Tr> must be used inside Tbody or Thead.\n\nCorrect usage (either):\n  <Tbody>\n    <Tr />\n  </Tbody>\n  or\n  <Thead>\n    <Tr />\n  </Thead>"
+    when:
+      frontend.referenced:
+        pattern: ^Tr$
+        location: JSX_COMPONENT
+        notParent: ^(Tbody|Thead)$
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Tr
+    replacement: Tbody
+- rule:
+    ruleID: sd-cf-table-tr-not-in-table-use-tbody-or-thead
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 3
+    category: mandatory
+    description: "<Tr> must be inside Tbody or Thead, not directly in <Table>"
+    message: "<Tr> should be wrapped in Tbody or Thead inside <Table>.\n\nReplace:\n  <Table>\n    <Tr />\n  </Table>\n\nWith (either):\n  <Table>\n    <Tbody>\n      <Tr />\n    </Tbody>\n  </Table>\n  or\n  <Table>\n    <Thead>\n      <Tr />\n    </Thead>\n  </Table>"
+    when:
+      frontend.referenced:
+        pattern: ^Tr$
+        location: JSX_COMPONENT
+        parent: ^Table$
+        parentFrom: "@patternfly/react-table"
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: CompositionChange
+    component: Tr
+    replacement: Tbody
+- rule:
+    ruleID: sd-cf-table-tr-req-td
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-table
+      - family=Table
+    effort: 1
+    category: mandatory
+    description: "<Tr> must contain Td children"
+    message: "<Tr> must contain at least one Td child component.\n\nCorrect usage:\n  <Tr>\n    <Td />\n  </Tr>"
+    when:
+      frontend.referenced:
+        pattern: ^Tr$
+        location: JSX_COMPONENT
+        requiresChild: ^(Td)$
+        from: "@patternfly/react-table"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Tr
+    replacement: Td

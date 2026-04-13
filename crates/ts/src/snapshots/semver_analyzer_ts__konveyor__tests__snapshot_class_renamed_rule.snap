@@ -1,0 +1,27 @@
+---
+source: crates/ts/src/konveyor.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: semver-src-components-chip-d-ts-chip-renamed
+    labels:
+      - source=semver-analyzer
+      - change-type=renamed
+      - kind=class
+      - has-codemod=true
+    effort: 1
+    category: mandatory
+    description: "Class 'Chip' was renamed to 'Label'"
+    message: "Class 'Chip' was renamed (class): Class 'Chip' was renamed to 'Label'\n\nFile: src/components/Chip.d.ts\nBefore: Chip\nAfter: Label"
+    when:
+      or:
+        - frontend.referenced:
+            pattern: ^Chip$
+            location: JSX_COMPONENT
+        - frontend.referenced:
+            pattern: ^Chip$
+            location: IMPORT
+  fix_strategy:
+    strategy: Rename
+    from: Chip
+    to: Label

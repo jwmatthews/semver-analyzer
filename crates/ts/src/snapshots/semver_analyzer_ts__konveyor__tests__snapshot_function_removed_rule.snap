@@ -1,0 +1,21 @@
+---
+source: crates/ts/src/konveyor.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: semver-src-api-users-d-ts-createuser-removed
+    labels:
+      - source=semver-analyzer
+      - change-type=removed
+      - kind=function
+      - has-codemod=false
+    effort: 5
+    category: mandatory
+    description: "Exported function 'createUser' was removed"
+    message: "Function 'createUser' was removed (function): Exported function 'createUser' was removed\n\nFile: src/api/users.d.ts"
+    when:
+      frontend.referenced:
+        pattern: ^createUser$
+        location: FUNCTION_CALL
+  fix_strategy:
+    strategy: Manual

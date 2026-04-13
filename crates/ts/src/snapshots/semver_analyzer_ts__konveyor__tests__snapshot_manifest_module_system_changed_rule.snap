@@ -1,0 +1,20 @@
+---
+source: crates/ts/src/konveyor.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: semver-manifest-type-module-system-changed
+    labels:
+      - source=semver-analyzer
+      - change-type=manifest
+      - manifest-field=type
+    effort: 7
+    category: mandatory
+    description: Module system changed from CommonJS to ESM
+    message: "Module system changed: Module system changed from CommonJS to ESM\n\nBefore: commonjs\nAfter: module\nConvert require() calls to ESM import statements."
+    when:
+      builtin.filecontent:
+        pattern: "\\brequire\\s*\\("
+        filePattern: "*.{ts,tsx,js,jsx}"
+  fix_strategy:
+    strategy: Manual

@@ -1,0 +1,34 @@
+---
+source: crates/ts/src/konveyor_v2.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: sd-css-removed-options-menu
+    labels:
+      - source=semver-analyzer
+      - change-type=css-removal
+      - impact=visual-regression
+    effort: 3
+    category: mandatory
+    description: "CSS component class 'pf-c-options-menu' was removed in PF v6"
+    message: "This CSS references the 'pf-c-options-menu' component class which was removed in PatternFly v6.\n\nThe OptionsMenu component was rebuilt and no longer uses this CSS class. This CSS override is dead and should be removed.\n\nCheck if the behavior you were overriding is now available via a component prop instead."
+    when:
+      frontend.cssclass:
+        pattern: pf-(v5|v6)-c-options-menu
+        filePattern: ".*\\.css$"
+  fix_strategy: ~
+- rule:
+    ruleID: sd-css-removed-select
+    labels:
+      - source=semver-analyzer
+      - change-type=css-removal
+      - impact=visual-regression
+    effort: 3
+    category: mandatory
+    description: "CSS component class 'pf-c-select' was removed in PF v6"
+    message: "This CSS references the 'pf-c-select' component class which was removed in PatternFly v6.\n\nThe Select component was rebuilt and no longer uses this CSS class. This CSS override is dead and should be removed.\n\nCheck if the behavior you were overriding is now available via a component prop instead."
+    when:
+      frontend.cssclass:
+        pattern: pf-(v5|v6)-c-select
+        filePattern: ".*\\.css$"
+  fix_strategy: ~

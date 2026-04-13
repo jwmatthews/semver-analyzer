@@ -1,0 +1,23 @@
+---
+source: crates/ts/src/konveyor.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: semver-src-components-nav-d-ts-navprops-variant-type-changed-val-tertiary
+    labels:
+      - source=semver-analyzer
+      - change-type=prop-value-change
+      - kind=property
+      - has-codemod=true
+    effort: 1
+    category: mandatory
+    description: "Value 'tertiary' removed from 'NavProps.variant'"
+    message: "The value 'tertiary' is no longer accepted for 'NavProps.variant'. This value has been removed with no direct replacement.\n\nFile: src/components/Nav.d.ts"
+    when:
+      frontend.referenced:
+        pattern: ^variant$
+        location: JSX_PROP
+        component: ^NavProps$
+        value: ^tertiary$
+  fix_strategy:
+    strategy: PropValueChange

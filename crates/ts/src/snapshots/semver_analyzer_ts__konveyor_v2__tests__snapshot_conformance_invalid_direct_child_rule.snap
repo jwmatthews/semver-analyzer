@@ -1,0 +1,110 @@
+---
+source: crates/ts/src/konveyor_v2.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: sd-cf-nav-item-in-list
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-core
+      - family=Nav
+    effort: 1
+    category: mandatory
+    description: "<NavItem> must be a child of NavList"
+    message: "<NavItem> must be used inside <NavList>.\n\nCorrect usage:\n  <NavList>\n    <NavItem />\n  </NavList>"
+    when:
+      frontend.referenced:
+        pattern: ^NavItem$
+        location: JSX_COMPONENT
+        notParent: ^NavList$
+        from: "@patternfly/react-core"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: NavItem
+    replacement: NavList
+- rule:
+    ruleID: sd-cf-nav-item-not-in-nav-use-list
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-core
+      - family=Nav
+    effort: 3
+    category: mandatory
+    description: "<NavItem> must be inside NavList, not directly in <Nav>"
+    message: "<NavItem> should be wrapped in <NavList> inside <Nav>.\n\nReplace:\n  <Nav>\n    <NavItem />\n  </Nav>\n\nWith:\n  <Nav>\n    <NavList>\n      <NavItem />\n    </NavList>\n  </Nav>"
+    when:
+      frontend.referenced:
+        pattern: ^NavItem$
+        location: JSX_COMPONENT
+        parent: ^Nav$
+        parentFrom: "@patternfly/react-core"
+        from: "@patternfly/react-core"
+  fix_strategy:
+    strategy: CompositionChange
+    component: NavItem
+    replacement: NavList
+- rule:
+    ruleID: sd-cf-nav-list-in-nav
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-core
+      - family=Nav
+    effort: 1
+    category: mandatory
+    description: "<NavList> must be a child of Nav"
+    message: "<NavList> must be used inside <Nav>.\n\nCorrect usage:\n  <Nav>\n    <NavList />\n  </Nav>"
+    when:
+      frontend.referenced:
+        pattern: ^NavList$
+        location: JSX_COMPONENT
+        notParent: ^Nav$
+        from: "@patternfly/react-core"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: NavList
+    replacement: Nav
+- rule:
+    ruleID: sd-cf-nav-list-req-item
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-core
+      - family=Nav
+    effort: 1
+    category: mandatory
+    description: "<NavList> must contain NavItem children"
+    message: "<NavList> must contain at least one NavItem child component.\n\nCorrect usage:\n  <NavList>\n    <NavItem />\n  </NavList>"
+    when:
+      frontend.referenced:
+        pattern: ^NavList$
+        location: JSX_COMPONENT
+        requiresChild: ^(NavItem)$
+        from: "@patternfly/react-core"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: NavList
+    replacement: NavItem
+- rule:
+    ruleID: sd-cf-nav-nav-req-list
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-core
+      - family=Nav
+    effort: 1
+    category: mandatory
+    description: "<Nav> must contain NavList children"
+    message: "<Nav> must contain at least one NavList child component.\n\nCorrect usage:\n  <Nav>\n    <NavList />\n  </Nav>"
+    when:
+      frontend.referenced:
+        pattern: ^Nav$
+        location: JSX_COMPONENT
+        requiresChild: ^(NavList)$
+        from: "@patternfly/react-core"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Nav
+    replacement: NavList

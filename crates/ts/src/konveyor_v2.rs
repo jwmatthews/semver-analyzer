@@ -5521,4 +5521,159 @@ mod tests {
             panic!("Expected FrontendReferenced condition");
         }
     }
+
+    // ── Insta snapshot tests for v2 YAML output safety ─────────────────
+    //
+    // These snapshots capture the exact YAML serialization of v2 rules
+    // (composition, conformance, CSS removal, deprecated migration).
+    // Any change to serde field names, condition shapes, or rule
+    // structure will show as a snapshot diff.
+
+    /// Wrapper that captures both the serialized rule and its fix_strategy
+    /// (which is normally skipped by serde on KonveyorRule).
+    #[derive(Debug, serde::Serialize)]
+    struct RuleSnapshot {
+        rule: KonveyorRule,
+        fix_strategy: Option<FixStrategyEntry>,
+    }
+
+    impl RuleSnapshot {
+        fn from_rule(mut rule: KonveyorRule) -> Self {
+            let fix_strategy = rule.fix_strategy.take();
+            Self { rule, fix_strategy }
+        }
+    }
+
+    fn snapshot_rules(mut rules: Vec<KonveyorRule>) -> Vec<RuleSnapshot> {
+        // Sort by rule_id for deterministic snapshot ordering — the generator
+        // iterates over HashSet/HashMap which has non-deterministic order.
+        rules.sort_by(|a, b| a.rule_id.cmp(&b.rule_id));
+        rules.into_iter().map(RuleSnapshot::from_rule).collect()
+    }
+
+    fn make_edge(
+        parent: &str,
+        child: &str,
+        strength: semver_analyzer_core::types::sd::EdgeStrength,
+    ) -> semver_analyzer_core::types::sd::CompositionEdge {
+        semver_analyzer_core::types::sd::CompositionEdge {
+            parent: parent.into(),
+            child: child.into(),
+            relationship: ChildRelationship::DirectChild,
+            required: false,
+            bem_evidence: None,
+            strength,
+            prop_name: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_conformance_not_parent_rules() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Table".into(), "@patternfly/react-table".into());
+        pkgs.insert("Thead".into(), "@patternfly/react-table".into());
+        pkgs.insert("Tbody".into(), "@patternfly/react-table".into());
+        pkgs.insert("Tr".into(), "@patternfly/react-table".into());
+        pkgs.insert("Td".into(), "@patternfly/react-table".into());
+
+        use semver_analyzer_core::types::sd::EdgeStrength;
+
+        let tree = CompositionTree {
+            root: "Table".into(),
+            family_members: vec![
+                "Table".into(),
+                "Thead".into(),
+                "Tbody".into(),
+                "Tr".into(),
+                "Td".into(),
+            ],
+            edges: vec![
+                make_edge("Table", "Thead", EdgeStrength::Required),
+                make_edge("Table", "Tbody", EdgeStrength::Required),
+                make_edge("Thead", "Tr", EdgeStrength::Required),
+                make_edge("Tbody", "Tr", EdgeStrength::Required),
+                make_edge("Tr", "Td", EdgeStrength::Required),
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    #[test]
+    fn snapshot_conformance_requires_child_rule() {
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Tabs".into(), "@patternfly/react-core".into());
+        pkgs.insert("Tab".into(), "@patternfly/react-core".into());
+        pkgs.insert("TabContent".into(), "@patternfly/react-core".into());
+
+        use semver_analyzer_core::types::sd::EdgeStrength;
+
+        let tree = CompositionTree {
+            root: "Tabs".into(),
+            family_members: vec!["Tabs".into(), "Tab".into(), "TabContent".into()],
+            edges: vec![
+                make_edge("Tabs", "Tab", EdgeStrength::Required),
+                make_edge("Tabs", "TabContent", EdgeStrength::Required),
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    #[test]
+    fn snapshot_css_class_removal_rules() {
+        let removed_blocks = vec!["select".to_string(), "options-menu".to_string()];
+        let rules = generate_css_class_removal_rules(&removed_blocks);
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    #[test]
+    fn snapshot_composition_removed_member_rule() {
+        let sd = SdPipelineResult {
+            composition_changes: vec![semver_analyzer_core::types::sd::CompositionChange {
+                family: "EmptyState".into(),
+                change_type: CompositionChangeType::FamilyMemberRemoved {
+                    member: "EmptyStateHeader".into(),
+                },
+                description: "EmptyStateHeader was removed from EmptyState family".into(),
+                before_pattern: None,
+                after_pattern: None,
+            }],
+            component_packages: {
+                let mut m = HashMap::new();
+                m.insert("EmptyState".into(), "@patternfly/react-core".into());
+                m.insert("EmptyStateHeader".into(), "@patternfly/react-core".into());
+                m
+            },
+            ..SdPipelineResult::default()
+        };
+
+        let pkg_map = sd.component_packages.clone();
+        let rules = generate_composition_change_rules(&sd, &pkg_map);
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    #[test]
+    fn snapshot_conformance_invalid_direct_child_rule() {
+        use semver_analyzer_core::types::sd::EdgeStrength;
+
+        let mut pkgs = test_pkg_map();
+        pkgs.insert("Nav".into(), "@patternfly/react-core".into());
+        pkgs.insert("NavList".into(), "@patternfly/react-core".into());
+        pkgs.insert("NavItem".into(), "@patternfly/react-core".into());
+
+        let tree = CompositionTree {
+            root: "Nav".into(),
+            family_members: vec!["Nav".into(), "NavList".into(), "NavItem".into()],
+            edges: vec![
+                make_edge("Nav", "NavList", EdgeStrength::Required),
+                make_edge("NavList", "NavItem", EdgeStrength::Required),
+            ],
+        };
+
+        let rules = generate_conformance_rules(&[tree], &[], &pkgs);
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
 }

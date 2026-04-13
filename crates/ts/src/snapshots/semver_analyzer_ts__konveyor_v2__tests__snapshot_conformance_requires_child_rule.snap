@@ -1,0 +1,67 @@
+---
+source: crates/ts/src/konveyor_v2.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: sd-cf-tabs-tab-in-tabs
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-core
+      - family=Tabs
+    effort: 1
+    category: mandatory
+    description: "<Tab> must be a child of Tabs"
+    message: "<Tab> must be used inside <Tabs>.\n\nCorrect usage:\n  <Tabs>\n    <Tab />\n  </Tabs>"
+    when:
+      frontend.referenced:
+        pattern: ^Tab$
+        location: JSX_COMPONENT
+        notParent: ^Tabs$
+        from: "@patternfly/react-core"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Tab
+    replacement: Tabs
+- rule:
+    ruleID: sd-cf-tabs-tabcontent-in-tabs
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-core
+      - family=Tabs
+    effort: 1
+    category: mandatory
+    description: "<TabContent> must be a child of Tabs"
+    message: "<TabContent> must be used inside <Tabs>.\n\nCorrect usage:\n  <Tabs>\n    <TabContent />\n  </Tabs>"
+    when:
+      frontend.referenced:
+        pattern: ^TabContent$
+        location: JSX_COMPONENT
+        notParent: ^Tabs$
+        from: "@patternfly/react-core"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: TabContent
+    replacement: Tabs
+- rule:
+    ruleID: sd-cf-tabs-tabs-req-tab-and-tabcontent
+    labels:
+      - source=semver-analyzer
+      - change-type=conformance
+      - package=@patternfly/react-core
+      - family=Tabs
+    effort: 1
+    category: mandatory
+    description: "<Tabs> must contain Tab or TabContent children"
+    message: "<Tabs> must contain at least one Tab or TabContent child component.\n\nCorrect usage:\n  <Tabs>\n    <Tab />\n  </Tabs>"
+    when:
+      frontend.referenced:
+        pattern: ^Tabs$
+        location: JSX_COMPONENT
+        requiresChild: ^(Tab|TabContent)$
+        from: "@patternfly/react-core"
+  fix_strategy:
+    strategy: LlmAssisted
+    component: Tabs
+    replacement: "Tab, TabContent"

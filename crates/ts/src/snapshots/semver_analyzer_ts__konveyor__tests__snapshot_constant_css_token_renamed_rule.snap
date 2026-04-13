@@ -1,0 +1,25 @@
+---
+source: crates/ts/src/konveyor.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: semver-packages-react-tokens-src-tokens-d-ts-global-success-color-100-renamed
+    labels:
+      - source=semver-analyzer
+      - change-type=renamed
+      - kind=constant
+      - has-codemod=true
+      - package=@patternfly/react-tokens
+    effort: 1
+    category: mandatory
+    description: "CSS token 'global_success_color_100' renamed to 't_global_color_status_success_100'"
+    message: "Constant 'global_success_color_100' was renamed (constant): CSS token 'global_success_color_100' renamed to 't_global_color_status_success_100'\n\nFile: packages/react-tokens/src/tokens.d.ts\nBefore: variable: global_success_color_100: { name: --pf-v5-global--success-color--100, value: #3e8635 }\nAfter: variable: t_global_color_status_success_100: { name: --pf-t--global--color--status--success--100, value: #3e8635 }"
+    when:
+      frontend.referenced:
+        pattern: "^variable: global_success_color_100: \\{ name: --pf-v5-global--success-color--100, value: #3e8635 \\}$"
+        location: IMPORT
+        from: "@patternfly/react-tokens"
+  fix_strategy:
+    strategy: Rename
+    from: global_success_color_100
+    to: t_global_color_status_success_100

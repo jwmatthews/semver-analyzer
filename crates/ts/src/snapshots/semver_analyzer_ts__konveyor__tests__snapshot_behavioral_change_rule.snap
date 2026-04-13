@@ -1,0 +1,20 @@
+---
+source: crates/ts/src/konveyor.rs
+expression: snapshot_rules(rules)
+---
+- rule:
+    ruleID: semver-src-components-select-ts-select-handleselect-behavioral
+    labels:
+      - source=semver-analyzer
+      - ai-generated
+      - change-type=behavioral
+    effort: 3
+    category: mandatory
+    description: Selection callback now fires asynchronously
+    message: "Behavioral change in 'Select.handleSelect': Selection callback now fires asynchronously\n\nFile: src/components/Select.ts\nReview all usages to ensure compatibility with the new behavior."
+    when:
+      builtin.filecontent:
+        pattern: "\\bSelect\\b"
+        filePattern: "*.{ts,tsx}"
+  fix_strategy:
+    strategy: LlmAssisted

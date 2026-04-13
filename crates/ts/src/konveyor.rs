@@ -10056,4 +10056,238 @@ mod tests {
             val_rules.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
         );
     }
+
+    // ── Insta snapshot tests for YAML output safety ─────────────────────
+    //
+    // These snapshots capture the exact YAML serialization of KonveyorRule
+    // output. Any change to serde field names, condition shapes, or rule
+    // structure will show as a snapshot diff — providing a safety net for
+    // the genericization refactoring.
+    //
+    // fix_strategy is #[serde(skip)] on KonveyorRule, so we use a wrapper
+    // struct to capture it alongside the rule YAML.
+
+    /// Wrapper that captures both the serialized rule and its fix_strategy
+    /// (which is normally skipped by serde).
+    #[derive(Debug, serde::Serialize)]
+    struct RuleSnapshot {
+        rule: KonveyorRule,
+        fix_strategy: Option<FixStrategyEntry>,
+    }
+
+    impl RuleSnapshot {
+        fn from_rule(mut rule: KonveyorRule) -> Self {
+            let fix_strategy = rule.fix_strategy.take();
+            Self { rule, fix_strategy }
+        }
+    }
+
+    fn snapshot_rules(rules: Vec<KonveyorRule>) -> Vec<RuleSnapshot> {
+        rules.into_iter().map(RuleSnapshot::from_rule).collect()
+    }
+
+    #[test]
+    fn snapshot_function_removed_rule() {
+        let changes = vec![make_file_changes(
+            "src/api/users.d.ts",
+            vec![make_api_change(
+                "createUser",
+                ApiChangeKind::Function,
+                ApiChangeType::Removed,
+                "Exported function 'createUser' was removed",
+            )],
+            vec![],
+        )];
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx,js,jsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    #[test]
+    fn snapshot_class_renamed_rule() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/components/Chip.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "Chip".to_string(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Class,
+                change: ApiChangeType::Renamed,
+                before: Some("Chip".to_string()),
+                after: Some("Label".to_string()),
+                description: "Class 'Chip' was renamed to 'Label'".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx,js,jsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    #[test]
+    fn snapshot_type_changed_with_union_values() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/components/Nav.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "NavProps.variant".to_string(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::TypeChanged,
+                before: Some("'default' | 'horizontal' | 'tertiary'".to_string()),
+                after: Some("'default' | 'horizontal'".to_string()),
+                description: "Removed 'tertiary' from variant union".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    #[test]
+    fn snapshot_property_renamed_rule() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("src/components/Modal.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "ModalProps.title".to_string(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Property,
+                change: ApiChangeType::Renamed,
+                before: Some("ModalProps.title".to_string()),
+                after: Some("ModalProps.header".to_string()),
+                description: "Property 'title' was renamed to 'header'".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    #[test]
+    fn snapshot_manifest_module_system_changed_rule() {
+        let manifest = vec![ManifestChange {
+            field: "type".to_string(),
+            change_type: TsManifestChangeType::ModuleSystemChanged,
+            before: Some("commonjs".to_string()),
+            after: Some("module".to_string()),
+            description: "Module system changed from CommonJS to ESM".to_string(),
+            is_breaking: true,
+        }];
+        let report = make_report(vec![], manifest);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx,js,jsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    #[test]
+    fn snapshot_constant_css_token_renamed_rule() {
+        let changes = vec![FileChanges {
+            file: PathBuf::from("packages/react-tokens/src/tokens.d.ts"),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            breaking_api_changes: vec![ApiChange {
+                symbol: "global_success_color_100".to_string(),
+                qualified_name: String::new(),
+                kind: ApiChangeKind::Constant,
+                change: ApiChangeType::Renamed,
+                before: Some(
+                    "variable: global_success_color_100: { name: --pf-v5-global--success-color--100, value: #3e8635 }"
+                        .to_string(),
+                ),
+                after: Some(
+                    "variable: t_global_color_status_success_100: { name: --pf-t--global--color--status--success--100, value: #3e8635 }"
+                        .to_string(),
+                ),
+                description: "CSS token 'global_success_color_100' renamed to 't_global_color_status_success_100'".to_string(),
+                migration_target: None,
+                removal_disposition: None,
+                renders_element: None,
+            }],
+            breaking_behavioral_changes: vec![],
+            container_changes: vec![],
+        }];
+        let report = make_report(changes, vec![]);
+        let mut pkg_cache = HashMap::new();
+        pkg_cache.insert(
+            "react-tokens".to_string(),
+            "@patternfly/react-tokens".to_string(),
+        );
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &pkg_cache,
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
+
+    #[test]
+    fn snapshot_behavioral_change_rule() {
+        let changes = vec![make_file_changes(
+            "src/components/Select.ts",
+            vec![],
+            vec![make_behavioral(
+                "Select.handleSelect",
+                None,
+                "Selection callback now fires asynchronously",
+            )],
+        )];
+        let report = make_report(changes, vec![]);
+        let rules = generate_rules(
+            &report,
+            "*.{ts,tsx}",
+            &HashMap::new(),
+            &RenamePatterns::empty(),
+            &HashMap::new(),
+        );
+        insta::assert_yaml_snapshot!(snapshot_rules(rules));
+    }
 }
