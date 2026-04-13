@@ -744,8 +744,42 @@ pub fn build_composition_tree_v2(
                         continue;
                     }
 
-                    // Match to best flex parent. Prefer one with existing edge
-                    // from another signal, then longest CSS element name.
+                    // Determine if the child has explicit sizing (width/max-height).
+                    // Sized children belong in rigid containers, not wrapping toolbars.
+                    let child_has_sizing = profiles.get(child_name).is_some_and(|cp| {
+                        cp.css_tokens_used.iter().any(|token| {
+                            let raw = if let Some(rest) = token.strip_prefix("styles.") {
+                                if rest.starts_with("modifiers.") {
+                                    return false;
+                                }
+                                rest
+                            } else {
+                                token.as_str()
+                            };
+                            let block_camel = &css_prof.block;
+                            if let Some(suffix) = raw.strip_prefix(block_camel.as_str()) {
+                                if suffix.is_empty() {
+                                    return false;
+                                }
+                                let mut el = suffix.to_string();
+                                if let Some(c) = el.get_mut(0..1) {
+                                    c.make_ascii_lowercase();
+                                }
+                                let el_kebab = camel_to_kebab(&el);
+                                if let Some(info) = css_prof.elements.get(&el_kebab) {
+                                    return info.has_sizing;
+                                }
+                            }
+                            false
+                        })
+                    });
+
+                    // Match to best flex parent. Tiebreaker order:
+                    // 1. Existing edge from another signal
+                    // 2. Rigid container (flex_shrink_zero && !flex_wrap) preferred
+                    //    for children with has_sizing — sized elements like logos
+                    //    belong in rigid brand containers, not wrapping toolbars
+                    // 3. Longest CSS element name (fallback)
                     let best = flex_parents
                         .iter()
                         .filter(|(p, _)| p != child_name)
@@ -754,7 +788,15 @@ pub fn build_composition_tree_v2(
                                 .edges
                                 .iter()
                                 .any(|e| e.parent == *p && e.child == *child_name);
-                            (has_other_edge as usize, el.len())
+                            let rigidity = if child_has_sizing {
+                                let info = css_prof.elements.get(el.as_str());
+                                let is_rigid =
+                                    info.is_some_and(|i| i.flex_shrink_zero && !i.flex_wrap);
+                                is_rigid as usize
+                            } else {
+                                0
+                            };
+                            (has_other_edge as usize, rigidity, el.len())
                         });
 
                     if let Some((best_parent, _)) = best {
