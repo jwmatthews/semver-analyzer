@@ -67,10 +67,10 @@ impl TsDiffParser {
                             line: func.line,
                             kind: func.kind,
                             visibility: func.visibility,
-                            old_body: String::new(),
-                            new_body: func.body,
-                            old_signature: String::new(),
-                            new_signature: func.signature,
+                            old_body: None,
+                            new_body: Some(func.body),
+                            old_signature: None,
+                            new_signature: Some(func.signature),
                         });
                     }
                 }
@@ -88,10 +88,10 @@ impl TsDiffParser {
                             line: func.line,
                             kind: func.kind,
                             visibility: func.visibility,
-                            old_body: func.body,
-                            new_body: String::new(),
-                            old_signature: func.signature,
-                            new_signature: String::new(),
+                            old_body: Some(func.body),
+                            new_body: None,
+                            old_signature: Some(func.signature),
+                            new_signature: None,
                         });
                     }
                 }
@@ -707,10 +707,10 @@ fn diff_functions_in_file(
                     line: new_fn.line,
                     kind: new_fn.kind,
                     visibility: new_fn.visibility,
-                    old_body: old_fn.body.clone(),
-                    new_body: new_fn.body.clone(),
-                    old_signature: old_fn.signature.clone(),
-                    new_signature: new_fn.signature.clone(),
+                    old_body: Some(old_fn.body.clone()),
+                    new_body: Some(new_fn.body.clone()),
+                    old_signature: Some(old_fn.signature.clone()),
+                    new_signature: Some(new_fn.signature.clone()),
                 });
             }
         } else {
@@ -722,10 +722,10 @@ fn diff_functions_in_file(
                 line: old_fn.line,
                 kind: old_fn.kind,
                 visibility: old_fn.visibility,
-                old_body: old_fn.body.clone(),
-                new_body: String::new(),
-                old_signature: old_fn.signature.clone(),
-                new_signature: String::new(),
+                old_body: Some(old_fn.body.clone()),
+                new_body: None,
+                old_signature: Some(old_fn.signature.clone()),
+                new_signature: None,
             });
         }
     }
@@ -740,10 +740,10 @@ fn diff_functions_in_file(
                 line: new_fn.line,
                 kind: new_fn.kind,
                 visibility: new_fn.visibility,
-                old_body: String::new(),
-                new_body: new_fn.body.clone(),
-                old_signature: String::new(),
-                new_signature: new_fn.signature.clone(),
+                old_body: None,
+                new_body: Some(new_fn.body.clone()),
+                old_signature: None,
+                new_signature: Some(new_fn.signature.clone()),
             });
         }
     }
@@ -1194,8 +1194,12 @@ function greet(name: string): string {
         let changes = diff_functions_in_file(old, new, Path::new("src/greet.ts")).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].name, "greet");
-        assert!(changes[0].old_body.contains("\"Hello, \""));
-        assert!(changes[0].new_body.contains("${name}"));
+        assert!(changes[0]
+            .old_body
+            .as_deref()
+            .unwrap()
+            .contains("\"Hello, \""));
+        assert!(changes[0].new_body.as_deref().unwrap().contains("${name}"));
     }
 
     #[test]
@@ -1255,8 +1259,8 @@ function added(): void {
         let changes = diff_functions_in_file(old, new, Path::new("src/funcs.ts")).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].name, "added");
-        assert!(changes[0].old_body.is_empty());
-        assert!(!changes[0].new_body.is_empty());
+        assert!(changes[0].old_body.is_none());
+        assert!(changes[0].new_body.is_some());
     }
 
     #[test]
@@ -1278,8 +1282,8 @@ function kept(): void {
         let changes = diff_functions_in_file(old, new, Path::new("src/funcs.ts")).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].name, "removed");
-        assert!(!changes[0].old_body.is_empty());
-        assert!(changes[0].new_body.is_empty());
+        assert!(changes[0].old_body.is_some());
+        assert!(changes[0].new_body.is_none());
     }
 
     #[test]
@@ -1297,8 +1301,16 @@ function process(input: string, options?: Options): string {
 "#;
         let changes = diff_functions_in_file(old, new, Path::new("src/process.ts")).unwrap();
         assert_eq!(changes.len(), 1);
-        assert!(changes[0].old_signature.contains("input: string)"));
-        assert!(changes[0].new_signature.contains("options?: Options"));
+        assert!(changes[0]
+            .old_signature
+            .as_deref()
+            .unwrap()
+            .contains("input: string)"));
+        assert!(changes[0]
+            .new_signature
+            .as_deref()
+            .unwrap()
+            .contains("options?: Options"));
     }
 
     // ── line_number tests ───────────────────────────────────────────

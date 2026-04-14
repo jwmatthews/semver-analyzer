@@ -2147,6 +2147,8 @@ pub fn api_kind_label(kind: &ApiChangeKind) -> &'static str {
         ApiChangeKind::Trait => "trait",
         ApiChangeKind::TypeAlias => "type-alias",
         ApiChangeKind::Constant => "constant",
+        ApiChangeKind::Enum => "enum",
+        ApiChangeKind::Constructor => "constructor",
         ApiChangeKind::Field => "field",
         ApiChangeKind::Property => "property",
         ApiChangeKind::ModuleExport => "module-export",

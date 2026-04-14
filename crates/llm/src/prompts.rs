@@ -273,16 +273,8 @@ pub fn build_file_behavioral_prompt(
             } else {
                 "internal"
             },
-            if f.old_signature.is_empty() {
-                "(added)"
-            } else {
-                &f.old_signature
-            },
-            if f.new_signature.is_empty() {
-                "(removed)"
-            } else {
-                &f.new_signature
-            },
+            f.old_signature.as_deref().unwrap_or("(added)"),
+            f.new_signature.as_deref().unwrap_or("(removed)"),
         ));
     }
 
@@ -572,10 +564,10 @@ mod tests {
             line: 10,
             kind: semver_analyzer_core::SymbolKind::Function,
             visibility: semver_analyzer_core::Visibility::Exported,
-            old_body: "{ return <div>old</div>; }".into(),
-            new_body: "{ return <section>new</section>; }".into(),
-            old_signature: "function Modal(props: ModalProps): JSX.Element".into(),
-            new_signature: "function Modal(props: ModalProps): JSX.Element".into(),
+            old_body: Some("{ return <div>old</div>; }".into()),
+            new_body: Some("{ return <section>new</section>; }".into()),
+            old_signature: Some("function Modal(props: ModalProps): JSX.Element".into()),
+            new_signature: Some("function Modal(props: ModalProps): JSX.Element".into()),
         }];
 
         let prompt = build_file_behavioral_prompt(

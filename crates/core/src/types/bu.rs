@@ -44,19 +44,20 @@ pub struct ChangedFunction {
     pub visibility: Visibility,
 
     /// The function body source text in the OLD version.
-    /// Empty string if the function was added (not present in old).
-    pub old_body: String,
+    /// `None` if the function was added (not present in old).
+    pub old_body: Option<String>,
 
     /// The function body source text in the NEW version.
-    /// Empty string if the function was removed (not present in new).
-    pub new_body: String,
+    /// `None` if the function was removed (not present in new).
+    pub new_body: Option<String>,
 
     /// The function signature in the OLD version.
-    /// e.g., "function createUser(email: string, options?: CreateUserOptions): Promise<User>"
-    pub old_signature: String,
+    /// `None` if the function was added.
+    pub old_signature: Option<String>,
 
     /// The function signature in the NEW version.
-    pub new_signature: String,
+    /// `None` if the function was removed.
+    pub new_signature: Option<String>,
 }
 
 // ── Test Diff (TestAnalyzer output) ─────────────────────────────────────
@@ -369,10 +370,10 @@ mod tests {
             line: 10,
             kind: SymbolKind::Function,
             visibility: Visibility::Exported,
-            old_body: "{ return db.insert(email); }".into(),
-            new_body: "{ return db.insert(email.toLowerCase()); }".into(),
-            old_signature: "function createUser(email: string): Promise<User>".into(),
-            new_signature: "function createUser(email: string): Promise<User>".into(),
+            old_body: Some("{ return db.insert(email); }".into()),
+            new_body: Some("{ return db.insert(email.toLowerCase()); }".into()),
+            old_signature: Some("function createUser(email: string): Promise<User>".into()),
+            new_signature: Some("function createUser(email: string): Promise<User>".into()),
         };
 
         let json = serde_json::to_string(&cf).unwrap();

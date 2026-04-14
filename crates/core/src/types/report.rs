@@ -214,6 +214,9 @@ pub enum ApiChangeKind {
     Trait,
     TypeAlias,
     Constant,
+    #[serde(rename = "enum")]
+    Enum,
+    Constructor,
     Field,
     Property,
     ModuleExport,
@@ -231,8 +234,9 @@ impl From<super::surface::SymbolKind> for ApiChangeKind {
             SymbolKind::TypeAlias => ApiChangeKind::TypeAlias,
             SymbolKind::Constant | SymbolKind::Variable => ApiChangeKind::Constant,
             SymbolKind::Property => ApiChangeKind::Property,
-            SymbolKind::Enum | SymbolKind::EnumMember => ApiChangeKind::Constant,
-            SymbolKind::Constructor => ApiChangeKind::Method,
+            SymbolKind::Enum => ApiChangeKind::Enum,
+            SymbolKind::EnumMember => ApiChangeKind::Constant,
+            SymbolKind::Constructor => ApiChangeKind::Constructor,
             SymbolKind::GetAccessor | SymbolKind::SetAccessor => ApiChangeKind::Property,
             SymbolKind::Namespace => ApiChangeKind::ModuleExport,
         }
@@ -319,7 +323,7 @@ pub struct ContainerChange {
     /// The new container/parent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_container: Option<String>,
-    /// Description of the change from the LLM.
+    /// Human-readable description of the containment change.
     pub description: String,
 }
 

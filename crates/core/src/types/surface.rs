@@ -241,12 +241,16 @@ pub enum SymbolKind {
 }
 
 /// Export visibility level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Defaults to `Public` — the most common visibility for API symbols
+/// across languages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
     /// Directly exported (`export function ...` or `export { ... }`).
     Exported,
     /// Public class member (not `private` or `protected`).
+    #[default]
     Public,
     /// Accessible to subclasses. Java: `protected`. C#: `protected`. Python: `_prefix`.
     Protected,

@@ -444,9 +444,9 @@ impl<L: Language> Analyzer<L> {
                     // create a worktree, build it, and use the built path for CSS
                     // profile extraction. Otherwise fall back to the raw dir path.
                     // Create a worktree for the dep repo (e.g., CSS repo).
-                    // Use `create_only` — the dep repo may not be a TypeScript
-                    // project (no tsconfig.json, no package manager detection).
-                    // The caller-provided build command handles install + build.
+                     // Use `create_only` — the dep repo may not be the same
+                     // language (no language-specific build tool detection).
+                     // The caller-provided build command handles install + build.
                     let dep_worktree_guard = if let (Some(dep_dir), Some(dep_to)) =
                         (&dep_css_dir_sd, &dep_to_sd)
                     {
@@ -824,7 +824,7 @@ impl<L: Language> Analyzer<L> {
                 continue;
             }
 
-            if func.old_body.is_empty() || func.new_body.is_empty() {
+            if func.old_body.is_none() || func.new_body.is_none() {
                 continue;
             }
 
@@ -889,7 +889,7 @@ impl<L: Language> Analyzer<L> {
         let mut body_change_count = 0;
         if let Some(body_analyzer) = lang.body_analyzer() {
             for func in &changed_fns {
-                if func.old_body.is_empty() || func.new_body.is_empty() {
+                if func.old_body.is_none() || func.new_body.is_none() {
                     continue;
                 }
                 if func.visibility != Visibility::Exported && func.visibility != Visibility::Public
@@ -898,8 +898,8 @@ impl<L: Language> Analyzer<L> {
                 }
 
                 let results = body_analyzer.analyze_changed_body(
-                    &func.old_body,
-                    &func.new_body,
+                    func.old_body.as_deref().unwrap_or(""),
+                    func.new_body.as_deref().unwrap_or(""),
                     &func.name,
                     &func.file.to_string_lossy(),
                 );
@@ -945,7 +945,7 @@ impl<L: Language> Analyzer<L> {
             // Group functions by file
             let mut by_file: BTreeMap<String, Vec<&ChangedFunction>> = BTreeMap::new();
             for func in &changed_fns {
-                if func.old_body.is_empty() || func.new_body.is_empty() {
+                if func.old_body.is_none() || func.new_body.is_none() {
                     continue;
                 }
                 let file_key = func.file.to_string_lossy().to_string();
