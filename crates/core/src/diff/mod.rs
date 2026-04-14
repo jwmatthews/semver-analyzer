@@ -30,7 +30,7 @@ use crate::types::{ApiSurface, ChangeSubject, StructuralChange, StructuralChange
 use std::collections::{HashMap, HashSet};
 
 use compare::diff_symbol;
-use helpers::{is_star_reexport, kind_label, symbol_summary};
+use helpers::{kind_label, symbol_summary};
 use migration::detect_migrations;
 use relocate::{detect_relocations, RelocationType};
 use rename::detect_renames;
@@ -68,17 +68,17 @@ where
 {
     let mut changes = Vec::new();
 
-    // Filter out star re-export symbols — they represent `export * from '...'`
-    // directives in barrel files.
+    // Filter out symbols that the language wants to skip (e.g., TypeScript
+    // star re-exports `export * from '...'` in barrel files).
     let old_symbols: Vec<&Symbol<M>> = old
         .symbols
         .iter()
-        .filter(|s| !is_star_reexport(s))
+        .filter(|s| !semantics.should_skip_symbol(s))
         .collect();
     let new_symbols: Vec<&Symbol<M>> = new
         .symbols
         .iter()
-        .filter(|s| !is_star_reexport(s))
+        .filter(|s| !semantics.should_skip_symbol(s))
         .collect();
 
     // Build lookup maps by qualified_name
@@ -107,7 +107,24 @@ where
     // Match removed+added symbols by canonical path (stripping /deprecated/
     // and /next/). This catches "moved to deprecated" patterns and runs
     // BEFORE rename detection to reduce the search space.
-    let (relocations, _skip_removed, _skip_added) = detect_relocations(&removed, &added);
+    let (relocations, _skip_removed, _skip_added) = detect_relocations(
+        &removed,
+        &added,
+        |qname| semantics.canonical_name_for_relocation(qname),
+        |old_qname, new_qname| {
+            if let Some(label) = semantics.classify_relocation(old_qname, new_qname) {
+                match label {
+                    "moved to deprecated" => RelocationType::MovedToDeprecated,
+                    "promoted from deprecated" => RelocationType::PromotedFromDeprecated,
+                    "promoted from next" => RelocationType::PromotedFromNext,
+                    "moved to next" => RelocationType::MovedToNext,
+                    _ => RelocationType::Relocated,
+                }
+            } else {
+                RelocationType::Relocated
+            }
+        },
+    );
 
     let relocated_old: HashSet<&str> = relocations
         .iter()
@@ -298,16 +315,15 @@ where
             };
             // Keep if the same-named symbol has a DIFFERENT import path
             // (needs Relocated detection, not migration).
-            // Treat /deprecated and /next as equivalent to the base path —
+            // Use canonical_name_for_relocation to treat lifecycle modifiers
+            // (e.g., /deprecated/, /next/) as equivalent to the base path —
             // moving from @pkg/deprecated to @pkg is a migration, not a
             // consumer-visible import change.
             let old_import = s.import_path.as_ref().or(s.package.as_ref());
-            let old_base =
-                old_import.map(|p| p.trim_end_matches("/deprecated").trim_end_matches("/next"));
+            let old_base = old_import.map(|p| semantics.canonical_name_for_relocation(p));
             !new_syms.iter().any(|ns| {
                 let new_import = ns.import_path.as_ref().or(ns.package.as_ref());
-                let new_base =
-                    new_import.map(|p| p.trim_end_matches("/deprecated").trim_end_matches("/next"));
+                let new_base = new_import.map(|p| semantics.canonical_name_for_relocation(p));
                 old_base == new_base
             })
         })
@@ -490,7 +506,9 @@ where
             .collect();
 
         let token_renames =
-            rename::detect_token_renames(&token_remaining_removed, &token_remaining_added);
+            rename::detect_token_renames(&token_remaining_removed, &token_remaining_added, |sym| {
+                semantics.extract_rename_fallback_key(sym)
+            });
 
         for rm in &token_renames {
             renamed_old.insert(rm.old.qualified_name.as_str());
@@ -645,11 +663,11 @@ where
                         // Derive import paths from qualified names to detect
                         // subpath differences (e.g., /deprecated/) that the
                         // package fields alone may not distinguish.
-                        let old_import = derive_import_subpath(
+                        let old_import = semantics.derive_import_subpath(
                             mig.target.removed_package.as_deref(),
                             &mig.target.removed_qualified_name,
                         );
-                        let new_import = derive_import_subpath(
+                        let new_import = semantics.derive_import_subpath(
                             mig.target.replacement_package.as_deref(),
                             &mig.target.replacement_qualified_name,
                         );
@@ -670,20 +688,24 @@ where
                         String::new()
                     };
 
+                    let label = semantics.member_label();
                     let mut desc = format!(
-                        "{} was removed — migrate to `{}`.{}\n  Matching props (use on `{}` instead): {}",
+                        "{} was removed — migrate to `{}`.{}\n  Matching {} (use on `{}` instead): {}",
                         base,
                         mig.target.replacement_symbol,
                         import_hint,
+                        label,
                         mig.target.replacement_symbol,
                         matching_names.join(", "),
                     );
                     if !removed_names.is_empty() {
                         desc.push_str(&format!(
-                            "\n  Removed props with no direct equivalent: {}\
-                             \n  NOTE: Only address removed props that your code actually uses. \
-                             If a removed prop is not referenced in the file, ignore it.",
+                            "\n  Removed {} with no direct equivalent: {}\
+                             \n  NOTE: Only address removed {} that your code actually uses. \
+                             If not referenced in the file, ignore it.",
+                            label,
                             removed_names.join(", "),
+                            label,
                         ));
                     }
                     // When the base type (extends clause) changed, warn that
@@ -711,28 +733,6 @@ where
     semantics.post_process(&mut changes);
 
     changes
-}
-
-/// Derive the import path from a package name and qualified name.
-///
-/// When the package field alone doesn't distinguish subpaths (e.g., both
-/// old and new are `@patternfly/react-core`), this function inspects the
-/// qualified name for known subpath segments like `/deprecated/` or `/next/`
-/// and appends them to the package name.
-///
-/// Example:
-///   package = "@patternfly/react-core"
-///   qualified = "packages/react-core/src/deprecated/components/Select/SelectOption.SelectOptionProps"
-///   → "@patternfly/react-core/deprecated"
-fn derive_import_subpath(package: Option<&str>, qualified_name: &str) -> String {
-    let base = package.unwrap_or("unknown");
-    if qualified_name.contains("/deprecated/") {
-        format!("{}/deprecated", base)
-    } else if qualified_name.contains("/next/") {
-        format!("{}/next", base)
-    } else {
-        base.to_string()
-    }
 }
 
 /// Compare two API surfaces using minimal semantics (no language-specific rules).
@@ -778,6 +778,44 @@ impl<M: Default + Clone + PartialEq> LanguageSemantics<M> for MinimalSemantics {
 
     fn visibility_rank(&self, v: crate::types::Visibility) -> u8 {
         helpers::visibility_rank(v)
+    }
+
+    fn should_skip_symbol(&self, sym: &Symbol<M>) -> bool {
+        // Filter star re-exports for testing compatibility.
+        sym.name == "*"
+    }
+
+    fn canonical_name_for_relocation(&self, qualified_name: &str) -> String {
+        // Strip /deprecated/ and /next/ for testing compatibility.
+        qualified_name
+            .replace("/deprecated/", "/")
+            .replace("/next/", "/")
+    }
+
+    fn classify_relocation(&self, old_qname: &str, new_qname: &str) -> Option<&'static str> {
+        let old_deprecated = old_qname.contains("/deprecated/");
+        let new_deprecated = new_qname.contains("/deprecated/");
+        let old_next = old_qname.contains("/next/");
+        let new_next = new_qname.contains("/next/");
+
+        match (old_deprecated, new_deprecated, old_next, new_next) {
+            (false, true, _, _) => Some("moved to deprecated"),
+            (true, false, _, _) => Some("promoted from deprecated"),
+            (_, _, true, false) => Some("promoted from next"),
+            (_, _, false, true) => Some("moved to next"),
+            _ => None,
+        }
+    }
+
+    fn derive_import_subpath(&self, package: Option<&str>, qualified_name: &str) -> String {
+        let base = package.unwrap_or("unknown");
+        if qualified_name.contains("/deprecated/") {
+            format!("{}/deprecated", base)
+        } else if qualified_name.contains("/next/") {
+            format!("{}/next", base)
+        } else {
+            base.to_string()
+        }
     }
 }
 

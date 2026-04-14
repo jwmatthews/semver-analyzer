@@ -1,6 +1,5 @@
 ---
 source: crates/ts/tests/baseline_migration.rs
-assertion_line: 60
 expression: "diff(&old, &new)"
 ---
 - symbol: EmptyStateHeaderProps
@@ -8,7 +7,7 @@ expression: "diff(&old, &new)"
   kind: Interface
   change_type: "Removed(Symbol { kind: Interface })"
   is_breaking: true
-  description: "Exported interface `EmptyStateHeaderProps` was removed — migrate to `EmptyStateProps`.\n  Matching props (use on `EmptyStateProps` instead): headingLevel, icon, titleClassName, titleText\n  Removed props with no direct equivalent: children, className\n  NOTE: Only address removed props that your code actually uses. If a removed prop is not referenced in the file, ignore it."
+  description: "Exported interface `EmptyStateHeaderProps` was removed — migrate to `EmptyStateProps`.\n  Matching props (use on `EmptyStateProps` instead): headingLevel, icon, titleClassName, titleText\n  Removed props with no direct equivalent: children, className\n  NOTE: Only address removed props that your code actually uses. If not referenced in the file, ignore it."
   before: "interface: EmptyStateHeaderProps"
   after: ~
   has_migration_target: true

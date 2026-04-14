@@ -175,6 +175,89 @@ pub trait LanguageSemantics<M: Default + Clone + PartialEq = ()> {
         )
     }
 
+    /// Should this symbol be excluded from diff analysis?
+    ///
+    /// Called by the diff engine to filter out symbols that should not be
+    /// compared. The most common case is TypeScript's `export * from '...'`
+    /// star re-export directives.
+    ///
+    /// TypeScript: `sym.name == "*"` (star re-exports)
+    /// Default: `false` (all symbols are analyzed)
+    fn should_skip_symbol(&self, _sym: &Symbol<M>) -> bool {
+        false
+    }
+
+    /// Human-readable label for members when building migration descriptions.
+    ///
+    /// TypeScript: `"props"` (component properties)
+    /// Go: `"fields"` (struct fields)
+    /// Default: `"members"`
+    fn member_label(&self) -> &'static str {
+        "members"
+    }
+
+    /// Extract a fallback key for rename matching from a symbol's metadata.
+    ///
+    /// When fingerprint-based rename detection fails, the diff engine uses
+    /// this method to extract an alternative matching key. For TypeScript
+    /// CSS tokens, this parses the resolved CSS value from the `.d.ts`
+    /// type annotation (e.g., the string `"#151515"` from a CSS variable).
+    ///
+    /// TypeScript: parses `["value"]: "..."` from the return type annotation
+    /// Default: `None` (no fallback key)
+    fn extract_rename_fallback_key(&self, _sym: &Symbol<M>) -> Option<String> {
+        None
+    }
+
+    /// Normalize a qualified name for relocation detection.
+    ///
+    /// Strips language-specific path segments that represent lifecycle
+    /// modifiers (e.g., TypeScript's `/deprecated/` and `/next/` directories).
+    /// Symbols with matching canonical names are detected as relocations
+    /// rather than separate removals and additions.
+    ///
+    /// TypeScript: strips `/deprecated/` and `/next/` segments
+    /// Default: returns the name unchanged
+    fn canonical_name_for_relocation(&self, qualified_name: &str) -> String {
+        qualified_name.to_string()
+    }
+
+    /// Classify a relocation based on old and new qualified names.
+    ///
+    /// Returns a human-readable label describing the relocation direction
+    /// (e.g., "moved to deprecated exports", "promoted from next to stable").
+    /// Returns `None` for generic relocations with no special classification.
+    ///
+    /// TypeScript: detects `/deprecated/` and `/next/` transitions
+    /// Default: `None` (no classification)
+    fn classify_relocation(&self, _old_qname: &str, _new_qname: &str) -> Option<&'static str> {
+        None
+    }
+
+    /// Derive the import subpath for a symbol, used in migration descriptions.
+    ///
+    /// When a symbol moves between submodules (e.g., from main exports to
+    /// `/deprecated/` exports), the import path changes. This method derives
+    /// the effective import path from the package name and qualified name.
+    ///
+    /// TypeScript: appends `/deprecated` or `/next` based on qualified name
+    /// Default: returns the package name unchanged
+    fn derive_import_subpath(&self, package: Option<&str>, _qualified_name: &str) -> String {
+        package.unwrap_or("unknown").to_string()
+    }
+
+    /// Produce additional structural changes by diffing language-specific
+    /// metadata on two matched symbols.
+    ///
+    /// Called by the diff engine for each pair of symbols that matched by
+    /// qualified name. The default implementation returns no changes.
+    ///
+    /// TypeScript: could diff `rendered_components` or `css` metadata.
+    /// Default: empty (no language-specific metadata diffing)
+    fn diff_language_data(&self, _old: &Symbol<M>, _new: &Symbol<M>) -> Vec<StructuralChange> {
+        vec![]
+    }
+
     /// Post-process the change list before returning from diff_surfaces.
     ///
     /// TypeScript: dedup default export changes.

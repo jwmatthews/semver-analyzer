@@ -562,6 +562,7 @@ pub(super) fn detect_renames<'a, M: Default + Clone + PartialEq>(
 pub(super) fn detect_token_renames<'a, M: Default + Clone + PartialEq>(
     removed: &[&'a Symbol<M>],
     added: &[&'a Symbol<M>],
+    fallback_key_fn: impl Fn(&Symbol<M>) -> Option<String>,
 ) -> Vec<RenameMatch<'a, M>> {
     use std::collections::{BTreeSet, HashSet};
 
@@ -699,7 +700,7 @@ pub(super) fn detect_token_renames<'a, M: Default + Clone + PartialEq>(
             if used_added.contains(&ai_local) {
                 continue;
             }
-            if let Some(val) = extract_token_value(sym) {
+            if let Some(val) = fallback_key_fn(sym) {
                 value_to_added.entry(val).or_default().push(ai_local);
             }
         }
@@ -709,7 +710,7 @@ pub(super) fn detect_token_renames<'a, M: Default + Clone + PartialEq>(
             if used_removed.contains(&ri_local) {
                 continue;
             }
-            let old_value = match extract_token_value(sym) {
+            let old_value = match fallback_key_fn(sym) {
                 Some(v) => v,
                 None => continue,
             };
@@ -787,46 +788,32 @@ fn tokenize_name(name: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Extract the CSS value from a token symbol's signature.
-///
-/// Token `.d.ts` files have type annotations like:
-/// ```text
-/// { ["name"]: "--pf-v5-global--Color--dark-100"; ["value"]: "#151515"; ["var"]: "var(...)" }
-/// ```
-///
-/// This function extracts the `"value"` field (e.g., `"#151515"`) from the
-/// `signature.return_type` string. Returns `None` if the signature is missing
-/// or doesn't contain a parseable value.
-fn extract_token_value<M: Default + Clone + PartialEq>(symbol: &Symbol<M>) -> Option<String> {
-    let return_type = symbol.signature.as_ref()?.return_type.as_deref()?;
-
-    // Match ["value"]: "..." or "value": "..."
-    // The value is a string literal embedded in the TypeScript object type.
-    let value_start = return_type
-        .find("[\"value\"]")
-        .or_else(|| return_type.find("\"value\""))?;
-    let after_key = &return_type[value_start..];
-
-    // Find the colon, then the opening quote, then the closing quote
-    let colon_pos = after_key.find(':')?;
-    let after_colon = &after_key[colon_pos + 1..];
-    let open_quote = after_colon.find('"')?;
-    let after_open = &after_colon[open_quote + 1..];
-    let close_quote = after_open.find('"')?;
-
-    let value = after_open[..close_quote].to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
 #[cfg(test)]
 mod token_tests {
     use super::*;
     use crate::types::{Signature, Symbol, SymbolKind, Visibility};
     use std::path::PathBuf;
+
+    /// Test helper: extract CSS value from a token symbol's signature.
+    /// Moved from the main module to test-only since this is TS-specific logic.
+    fn extract_token_value(symbol: &Symbol) -> Option<String> {
+        let return_type = symbol.signature.as_ref()?.return_type.as_deref()?;
+        let value_start = return_type
+            .find("[\"value\"]")
+            .or_else(|| return_type.find("\"value\""))?;
+        let after_key = &return_type[value_start..];
+        let colon_pos = after_key.find(':')?;
+        let after_colon = &after_key[colon_pos + 1..];
+        let open_quote = after_colon.find('"')?;
+        let after_open = &after_colon[open_quote + 1..];
+        let close_quote = after_open.find('"')?;
+        let value = after_open[..close_quote].to_string();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
 
     fn make_token(name: &str, package: &str) -> Symbol {
         Symbol {
@@ -869,7 +856,7 @@ mod token_tests {
         let removed = vec![&old];
         let added = vec![&new];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].old.name, "global_Color_dark_100");
         assert_eq!(matches[0].new.name, "t_color_dark_100");
@@ -886,7 +873,7 @@ mod token_tests {
         let removed = vec![&old];
         let added = vec![&new];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].new.name, "t_chart_global_success_color_100");
     }
@@ -900,7 +887,7 @@ mod token_tests {
         let removed = vec![&old];
         let added = vec![&new];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         assert!(matches.is_empty(), "Should not match unrelated tokens");
     }
 
@@ -915,7 +902,7 @@ mod token_tests {
         let removed = vec![&old1, &old2];
         let added = vec![&new1, &new2];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         assert_eq!(matches.len(), 2);
 
         // Each old should match its corresponding new (100→100, 200→200)
@@ -947,7 +934,7 @@ mod token_tests {
         let removed = vec![&old1, &old2];
         let added = vec![&new];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         // Only one can match — the one with higher Jaccard wins
         assert_eq!(matches.len(), 1);
         // global_Color_dark_100 has Jaccard 3/5=0.6, global_BackgroundColor_dark_100 has 3/6=0.5
@@ -969,7 +956,7 @@ mod token_tests {
         let removed = vec![&old];
         let added = vec![&new];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         assert!(matches.is_empty());
     }
 
@@ -985,7 +972,7 @@ mod token_tests {
         let removed = vec![&old];
         let added = vec![&new];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         // Segments: {global, backgroundcolor, dark, 100} vs {t, backgroundcolor, dark, 100}
         // Intersection: {backgroundcolor, dark, 100} = 3, Union = 5, Jaccard = 0.6
         assert_eq!(matches.len(), 1);
@@ -1007,48 +994,8 @@ mod token_tests {
         sym
     }
 
-    #[test]
-    fn test_extract_token_value_basic() {
-        let sym = make_token_with_value(
-            "global_Color_dark_100",
-            "@patternfly/react-tokens",
-            "--pf-v5-global--Color--dark-100",
-            "#151515",
-        );
-        assert_eq!(extract_token_value(&sym), Some("#151515".to_string()));
-    }
-
-    #[test]
-    fn test_extract_token_value_calc() {
-        let sym = make_token_with_value(
-            "c_button_Width",
-            "@patternfly/react-tokens",
-            "--pf-v5-c-button--Width",
-            "calc(1.25rem * 2)",
-        );
-        assert_eq!(
-            extract_token_value(&sym),
-            Some("calc(1.25rem * 2)".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_token_value_no_signature() {
-        let sym = make_token("global_Color_dark_100", "@patternfly/react-tokens");
-        assert_eq!(extract_token_value(&sym), None);
-    }
-
-    #[test]
-    fn test_extract_token_value_no_value_field() {
-        let mut sym = make_token("foo", "@patternfly/react-tokens");
-        sym.signature = Some(Signature {
-            parameters: Vec::new(),
-            return_type: Some("string".to_string()),
-            type_parameters: Vec::new(),
-            is_async: false,
-        });
-        assert_eq!(extract_token_value(&sym), None);
-    }
+    // extract_token_value tests moved to TypeScript crate (language.rs)
+    // as they test TS-specific CSS value parsing.
 
     // ── Value-based matching tests ──────────────────────────────────
 
@@ -1072,7 +1019,7 @@ mod token_tests {
         let removed = vec![&old];
         let added = vec![&new];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         assert_eq!(matches.len(), 1, "Should match by value when names diverge");
         assert_eq!(matches[0].old.name, "global_Color_dark_100");
         assert_eq!(
@@ -1107,7 +1054,7 @@ mod token_tests {
         let removed = vec![&old];
         let added = vec![&new1, &new2];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         assert_eq!(matches.len(), 1, "Should match to the best candidate");
         assert_eq!(
             matches[0].new.name, "t_global_spacer_xl",
@@ -1140,7 +1087,7 @@ mod token_tests {
         let removed = vec![&old];
         let added = vec![&new_jaccard, &new_value];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         assert_eq!(matches.len(), 1);
         // Should match by Jaccard (name), not value
         assert_eq!(matches[0].new.name, "t_color_dark_100");
@@ -1173,7 +1120,7 @@ mod token_tests {
         let removed = vec![&old_component, &old_global];
         let added = vec![&new_token];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         // Only one should match — exclusive consumption
         assert_eq!(
             matches.len(),
@@ -1215,7 +1162,7 @@ mod token_tests {
         let removed = vec![&old1, &old2];
         let added = vec![&new_global, &new_component];
 
-        let matches = detect_token_renames(&removed, &added);
+        let matches = detect_token_renames(&removed, &added, extract_token_value);
         assert_eq!(matches.len(), 2);
 
         // global_spacer_md should match t_global_spacer_md (better overlap)
@@ -1323,7 +1270,7 @@ mod token_tests {
         let old_refs: Vec<&Symbol> = old_symbols.iter().collect();
         let new_refs: Vec<&Symbol> = new_symbols.iter().collect();
 
-        let matches = detect_token_renames(&old_refs, &new_refs);
+        let matches = detect_token_renames(&old_refs, &new_refs, extract_token_value);
 
         // 1. Should produce a meaningful number of matches
         assert!(

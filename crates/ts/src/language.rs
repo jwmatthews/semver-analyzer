@@ -211,6 +211,72 @@ impl LanguageSemantics<TsSymbolData> for TypeScript {
             symbol, old_path, symbol, new_path,
         )
     }
+
+    fn should_skip_symbol(&self, sym: &Symbol<TsSymbolData>) -> bool {
+        // Star re-exports (`export * from './module'`) are barrel-file
+        // directives, not actual API symbols.
+        sym.name == "*"
+    }
+
+    fn member_label(&self) -> &'static str {
+        "props"
+    }
+
+    fn extract_rename_fallback_key(&self, sym: &Symbol<TsSymbolData>) -> Option<String> {
+        // Token `.d.ts` files have type annotations like:
+        //   { ["name"]: "--pf-v5-global--Color--dark-100"; ["value"]: "#151515"; ["var"]: "var(...)" }
+        // Extract the "value" field for CSS-value-based rename matching.
+        let return_type = sym.signature.as_ref()?.return_type.as_deref()?;
+        let value_start = return_type
+            .find("[\"value\"]")
+            .or_else(|| return_type.find("\"value\""))?;
+        let after_key = &return_type[value_start..];
+        let colon_pos = after_key.find(':')?;
+        let after_colon = &after_key[colon_pos + 1..];
+        let open_quote = after_colon.find('"')?;
+        let after_open = &after_colon[open_quote + 1..];
+        let close_quote = after_open.find('"')?;
+        let value = after_open[..close_quote].to_string();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    fn canonical_name_for_relocation(&self, qualified_name: &str) -> String {
+        // Strip /deprecated/ and /next/ lifecycle segments so symbols
+        // moving between these directories are matched as relocations.
+        qualified_name
+            .replace("/deprecated/", "/")
+            .replace("/next/", "/")
+    }
+
+    fn classify_relocation(&self, old_qname: &str, new_qname: &str) -> Option<&'static str> {
+        let old_deprecated = old_qname.contains("/deprecated/");
+        let new_deprecated = new_qname.contains("/deprecated/");
+        let old_next = old_qname.contains("/next/");
+        let new_next = new_qname.contains("/next/");
+
+        match (old_deprecated, new_deprecated, old_next, new_next) {
+            (false, true, _, _) => Some("moved to deprecated"),
+            (true, false, _, _) => Some("promoted from deprecated"),
+            (_, _, true, false) => Some("promoted from next"),
+            (_, _, false, true) => Some("moved to next"),
+            _ => None,
+        }
+    }
+
+    fn derive_import_subpath(&self, package: Option<&str>, qualified_name: &str) -> String {
+        let base = package.unwrap_or("unknown");
+        if qualified_name.contains("/deprecated/") {
+            format!("{}/deprecated", base)
+        } else if qualified_name.contains("/next/") {
+            format!("{}/next", base)
+        } else {
+            base.to_string()
+        }
+    }
 }
 
 // ── MessageFormatter ────────────────────────────────────────────────────
@@ -1184,6 +1250,213 @@ mod tests {
                 "packages/react-core/dist/esm/components/EmptyState/EmptyStateHeader.d.ts"
             ),
             "packages/react-core/dist/esm/components/EmptyState"
+        );
+    }
+
+    // ── should_skip_symbol ──────────────────────────────────────
+
+    #[test]
+    fn star_reexport_skipped() {
+        let ts = TypeScript::default();
+        let sym = Symbol::new(
+            "*",
+            "pkg/index.*",
+            SymbolKind::Variable,
+            Visibility::Exported,
+            std::path::PathBuf::from("pkg/index.d.ts"),
+            1,
+        );
+        assert!(ts.should_skip_symbol(&sym));
+    }
+
+    #[test]
+    fn normal_symbol_not_skipped() {
+        let ts = TypeScript::default();
+        let sym = Symbol::new(
+            "Button",
+            "pkg/Button.Button",
+            SymbolKind::Variable,
+            Visibility::Exported,
+            std::path::PathBuf::from("pkg/Button.d.ts"),
+            1,
+        );
+        assert!(!ts.should_skip_symbol(&sym));
+    }
+
+    // ── extract_rename_fallback_key ─────────────────────────────
+
+    #[test]
+    fn extract_css_token_value_basic() {
+        let ts = TypeScript::default();
+        let mut sym = Symbol::new(
+            "global_Color_dark_100",
+            "pkg/global_Color_dark_100",
+            SymbolKind::Constant,
+            Visibility::Public,
+            std::path::PathBuf::from("pkg/global_Color_dark_100.d.ts"),
+            1,
+        );
+        sym.signature = Some(semver_analyzer_core::Signature {
+            parameters: Vec::new(),
+            return_type: Some(
+                "{ [\"name\"]: \"--pf-v5-global--Color--dark-100\"; [\"value\"]: \"#151515\"; [\"var\"]: \"var(--pf-v5-global--Color--dark-100)\" }"
+                .to_string(),
+            ),
+            type_parameters: Vec::new(),
+            is_async: false,
+        });
+        assert_eq!(
+            ts.extract_rename_fallback_key(&sym),
+            Some("#151515".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_css_token_value_no_signature() {
+        let ts = TypeScript::default();
+        let sym = Symbol::new(
+            "global_Color_dark_100",
+            "pkg/global_Color_dark_100",
+            SymbolKind::Constant,
+            Visibility::Public,
+            std::path::PathBuf::from("pkg/global_Color_dark_100.d.ts"),
+            1,
+        );
+        assert_eq!(ts.extract_rename_fallback_key(&sym), None);
+    }
+
+    #[test]
+    fn extract_css_token_value_no_value_field() {
+        let ts = TypeScript::default();
+        let mut sym = Symbol::new(
+            "foo",
+            "pkg/foo",
+            SymbolKind::Constant,
+            Visibility::Public,
+            std::path::PathBuf::from("pkg/foo.d.ts"),
+            1,
+        );
+        sym.signature = Some(semver_analyzer_core::Signature {
+            parameters: Vec::new(),
+            return_type: Some("string".to_string()),
+            type_parameters: Vec::new(),
+            is_async: false,
+        });
+        assert_eq!(ts.extract_rename_fallback_key(&sym), None);
+    }
+
+    #[test]
+    fn extract_css_token_value_calc() {
+        let ts = TypeScript::default();
+        let mut sym = Symbol::new(
+            "c_button_Width",
+            "pkg/c_button_Width",
+            SymbolKind::Constant,
+            Visibility::Public,
+            std::path::PathBuf::from("pkg/c_button_Width.d.ts"),
+            1,
+        );
+        sym.signature = Some(semver_analyzer_core::Signature {
+            parameters: Vec::new(),
+            return_type: Some(
+                "{ [\"name\"]: \"--pf-v5-c-button--Width\"; [\"value\"]: \"calc(1.25rem * 2)\"; [\"var\"]: \"var(--pf-v5-c-button--Width)\" }"
+                .to_string(),
+            ),
+            type_parameters: Vec::new(),
+            is_async: false,
+        });
+        assert_eq!(
+            ts.extract_rename_fallback_key(&sym),
+            Some("calc(1.25rem * 2)".to_string())
+        );
+    }
+
+    // ── canonical_name_for_relocation ────────────────────────────
+
+    #[test]
+    fn canonical_strips_deprecated() {
+        let ts = TypeScript::default();
+        assert_eq!(
+            ts.canonical_name_for_relocation("pkg/dist/esm/deprecated/components/Chip/Chip.Chip"),
+            "pkg/dist/esm/components/Chip/Chip.Chip"
+        );
+    }
+
+    #[test]
+    fn canonical_strips_next() {
+        let ts = TypeScript::default();
+        assert_eq!(
+            ts.canonical_name_for_relocation("pkg/dist/esm/next/components/Modal/Modal.Modal"),
+            "pkg/dist/esm/components/Modal/Modal.Modal"
+        );
+    }
+
+    #[test]
+    fn canonical_preserves_normal_path() {
+        let ts = TypeScript::default();
+        let path = "pkg/dist/esm/components/Button/Button.Button";
+        assert_eq!(ts.canonical_name_for_relocation(path), path);
+    }
+
+    // ── classify_relocation ─────────────────────────────────────
+
+    #[test]
+    fn classify_moved_to_deprecated() {
+        let ts = TypeScript::default();
+        assert_eq!(
+            ts.classify_relocation(
+                "pkg/dist/esm/components/Chip/Chip.Chip",
+                "pkg/dist/esm/deprecated/components/Chip/Chip.Chip"
+            ),
+            Some("moved to deprecated")
+        );
+    }
+
+    #[test]
+    fn classify_promoted_from_deprecated() {
+        let ts = TypeScript::default();
+        assert_eq!(
+            ts.classify_relocation(
+                "pkg/dist/esm/deprecated/components/Modal/Modal.Modal",
+                "pkg/dist/esm/components/Modal/Modal.Modal"
+            ),
+            Some("promoted from deprecated")
+        );
+    }
+
+    #[test]
+    fn classify_relocated_generic() {
+        let ts = TypeScript::default();
+        assert_eq!(
+            ts.classify_relocation(
+                "pkg/dist/esm/components/Chip/Chip.Chip",
+                "pkg/dist/esm/components/Label/Chip.Chip"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_promoted_from_next() {
+        let ts = TypeScript::default();
+        assert_eq!(
+            ts.classify_relocation(
+                "pkg/dist/esm/next/components/Modal/ModalBody.ModalBody",
+                "pkg/dist/esm/components/Modal/ModalBody.ModalBody"
+            ),
+            Some("promoted from next")
+        );
+    }
+
+    #[test]
+    fn classify_moved_to_next() {
+        let ts = TypeScript::default();
+        assert_eq!(
+            ts.classify_relocation(
+                "pkg/dist/esm/components/Foo/Foo.Foo",
+                "pkg/dist/esm/next/components/Foo/Foo.Foo"
+            ),
+            Some("moved to next")
         );
     }
 }
