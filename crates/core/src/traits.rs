@@ -12,14 +12,15 @@
 
 use crate::types::{
     ApiSurface, BehavioralChangeKind, BodyAnalysisResult, BreakingVerdict, Caller, ChangedFunction,
-    EvidenceType, ExpectedChild, FunctionSpec, Reference, SdPipelineResult, StructuralChange,
-    Symbol, SymbolKind, TestDiff, TestFile, Visibility,
+    EvidenceType, ExpectedChild, FunctionSpec, Reference, StructuralChange, Symbol, SymbolKind,
+    TestDiff, TestFile, Visibility,
 };
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Debug;
 use std::path::Path;
+use std::sync::Arc;
 
 // ── BU Traits (language-agnostic, LLM-based) ───────────────────────────
 
@@ -424,6 +425,17 @@ pub trait Language:
     /// Language-specific report data.
     type ReportData: Debug + Clone + Serialize + DeserializeOwned + Send + Sync;
 
+    /// Language-specific analysis extensions.
+    ///
+    /// Carries pipeline results that are specific to this language
+    /// (e.g., SD pipeline results, hierarchy deltas for TypeScript).
+    /// Replaces the concrete `sd_result` and `hierarchy_deltas` fields
+    /// that were previously on `AnalysisReport`/`AnalysisResult`.
+    ///
+    /// TypeScript: `TsAnalysisExtensions` (SD result, hierarchy deltas).
+    /// Languages without extended analysis: `EmptyExtensions`.
+    type AnalysisExtensions: Debug + Clone + Default + Serialize + DeserializeOwned + Send + Sync;
+
     // ── Constants ────────────────────────────────────────────────────
 
     /// Symbol kinds that represent type definitions eligible for rename inference.
@@ -562,23 +574,48 @@ pub trait Language:
         qualified_name.to_string()
     }
 
-    // ── v2 SD (Source-Level Diff) pipeline ───────────────────────────
+    // ── v2 Extended Analysis pipeline ───────────────────────────────
 
-    /// Run the SD pipeline for this language.
+    /// Run language-specific extended analysis.
     ///
-    /// Reads component source files at both refs, extracts structured
-    /// profiles, diffs them, and optionally builds composition trees.
+    /// For TypeScript, this runs the SD (Source-Level Diff) pipeline:
+    /// reads component source files at both refs, extracts structured
+    /// profiles, diffs them, and builds composition trees.
     ///
-    /// Default implementation returns empty results (SD not supported).
-    /// TypeScript overrides this to provide full SD analysis.
-    fn run_source_diff(
+    /// Default implementation returns empty extensions (no extended analysis).
+    fn run_extended_analysis(
         &self,
         _repo: &Path,
         _from_ref: &str,
         _to_ref: &str,
         _dep_css_dir: Option<&Path>,
-    ) -> Result<SdPipelineResult> {
-        Ok(SdPipelineResult::default())
+    ) -> Result<Self::AnalysisExtensions> {
+        Ok(Self::AnalysisExtensions::default())
+    }
+
+    /// Post-process extensions after both TD and extended analysis complete.
+    ///
+    /// This is where language-specific cross-pipeline processing happens.
+    /// For TypeScript, this runs deprecated replacement detection (requires
+    /// both TD structural changes and SD source-level changes) and transforms
+    /// structural changes accordingly.
+    ///
+    /// Returns the (potentially modified) structural changes.
+    /// Default implementation is a no-op.
+    fn finalize_extensions(
+        &self,
+        _extensions: &mut Self::AnalysisExtensions,
+        structural_changes: Arc<Vec<StructuralChange>>,
+    ) -> Arc<Vec<StructuralChange>> {
+        structural_changes
+    }
+
+    /// Return log-friendly summary lines for the extended analysis results.
+    ///
+    /// The orchestrator calls this for progress/logging output.
+    /// Default implementation returns empty (no summary).
+    fn extensions_log_summary(&self, _extensions: &Self::AnalysisExtensions) -> Vec<String> {
+        vec![]
     }
 }
 

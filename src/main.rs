@@ -560,7 +560,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
     // Add dep-repo packages (e.g., @patternfly/patternfly CSS package) to the
     // cache so they get dependency-update rules even though they're from a
     // separate repo.
-    if let Some(ref sd) = report.sd_result {
+    if let Some(ref sd) = report.extensions.sd_result {
         for (name, version) in &sd.dep_repo_packages {
             let dir_name = name.rsplit('/').next().unwrap_or(name);
             pkg_info_cache
@@ -582,7 +582,7 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
 
     // SD rules — composition, conformance, context, prop↔child migration
     if !common.behavioral {
-        if let Some(ref sd) = report.sd_result {
+        if let Some(ref sd) = report.extensions.sd_result {
             let sd_rule_phase = reporter.start_phase("Generating SD rules");
             let sd_rules =
                 semver_analyzer_ts::konveyor_v2::generate_sd_rules(&report, sd, &pkg_cache);

@@ -740,40 +740,41 @@ pub fn generate_rules(
     // still map to their family root. Without this, P0C deprecated-import
     // rules for removed components would lack family= labels and not be
     // grouped with related composition/conformance rules.
-    let component_to_family: HashMap<String, String> = if let Some(ref sd) = report.sd_result {
-        let mut map = HashMap::new();
-        // Iterate both new and old composition trees. The new trees take
-        // precedence (inserted first), but old-tree members that were
-        // removed in v6 will still get mapped via or_insert.
-        let all_trees = sd
-            .composition_trees
-            .iter()
-            .chain(sd.old_composition_trees.iter());
-        for tree in all_trees {
-            // Skip deprecated families — they have separate rule namespaces
-            if tree.root.starts_with("deprecated/") {
-                continue;
-            }
-            // Map root and all family members (entry() avoids overwriting
-            // new-tree mappings with old-tree ones for the same component).
-            map.entry(tree.root.clone())
-                .or_insert_with(|| tree.root.clone());
-            for member in &tree.family_members {
-                map.entry(member.clone())
+    let component_to_family: HashMap<String, String> =
+        if let Some(ref sd) = report.extensions.sd_result {
+            let mut map = HashMap::new();
+            // Iterate both new and old composition trees. The new trees take
+            // precedence (inserted first), but old-tree members that were
+            // removed in v6 will still get mapped via or_insert.
+            let all_trees = sd
+                .composition_trees
+                .iter()
+                .chain(sd.old_composition_trees.iter());
+            for tree in all_trees {
+                // Skip deprecated families — they have separate rule namespaces
+                if tree.root.starts_with("deprecated/") {
+                    continue;
+                }
+                // Map root and all family members (entry() avoids overwriting
+                // new-tree mappings with old-tree ones for the same component).
+                map.entry(tree.root.clone())
                     .or_insert_with(|| tree.root.clone());
-            }
-            // Also map "XProps" variants (e.g., "ModalProps" → "Modal")
-            map.entry(format!("{}Props", tree.root))
-                .or_insert_with(|| tree.root.clone());
-            for member in &tree.family_members {
-                map.entry(format!("{}Props", member))
+                for member in &tree.family_members {
+                    map.entry(member.clone())
+                        .or_insert_with(|| tree.root.clone());
+                }
+                // Also map "XProps" variants (e.g., "ModalProps" → "Modal")
+                map.entry(format!("{}Props", tree.root))
                     .or_insert_with(|| tree.root.clone());
+                for member in &tree.family_members {
+                    map.entry(format!("{}Props", member))
+                        .or_insert_with(|| tree.root.clone());
+                }
             }
-        }
-        map
-    } else {
-        HashMap::new()
-    };
+            map
+        } else {
+            HashMap::new()
+        };
 
     // ── Pre-scan: collect components referenced in composition pattern changes ──
     //
@@ -1320,7 +1321,7 @@ pub fn generate_rules(
     // individual per-file rules for symbols covered by hierarchy or
     // deprecated migration rules are suppressed. The hierarchy rule
     // loop runs later but the coverage information is needed here.
-    for delta in &report.hierarchy_deltas {
+    for delta in &report.extensions.hierarchy_deltas {
         covered_components.insert(delta.component.clone());
         covered_components.insert(format!("{}Props", delta.component));
 
@@ -1532,6 +1533,7 @@ pub fn generate_rules(
     // child" without guidance on what to do instead — P0-C is still
     // needed for prop migration instructions in those cases.
     let hierarchy_covered_components: HashSet<String> = report
+        .extensions
         .hierarchy_deltas
         .iter()
         .filter(|d| !d.added_children.is_empty())
@@ -1623,7 +1625,7 @@ pub fn generate_rules(
                         && (comp.status == ComponentStatus::Removed
                             || comp.member_summary.total <= 2)
                     {
-                        if let Some(ref sd) = report.sd_result {
+                        if let Some(ref sd) = report.extensions.sd_result {
                             let source_family = comp.source_files.iter().find_map(|f| {
                                 let f_str = f.to_string_lossy();
                                 let parts: Vec<&str> = f_str.split('/').collect();
@@ -2757,7 +2759,7 @@ pub fn generate_dependency_update_rules(
     // Map: target_npm_package → Vec<(source_npm_package, Vec<member_names>)>
     let mut cross_pkg_migrations: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
 
-    if let Some(ref sd) = report.sd_result {
+    if let Some(ref sd) = report.extensions.sd_result {
         // Build a map of non-deprecated family names to their majority package.
         //
         // The root component name may collide with the deprecated family in
@@ -4556,8 +4558,11 @@ mod tests {
             packages: vec![],
             member_renames: HashMap::new(),
             inferred_rename_patterns: None,
-            hierarchy_deltas: Vec::new(),
-            sd_result: None,
+            extensions: crate::extensions::TsAnalysisExtensions {
+                sd_result: None,
+                hierarchy_deltas: Vec::new(),
+                new_hierarchies: Default::default(),
+            },
             metadata: AnalysisMetadata {
                 call_graph_analysis: "none".to_string(),
                 tool_version: "0.1.0".to_string(),

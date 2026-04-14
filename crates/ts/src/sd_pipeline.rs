@@ -23,7 +23,7 @@
 use crate::composition::{build_composition_tree_v2, DelegateContext};
 use crate::source_profile::{self, diff::diff_profiles};
 
-use semver_analyzer_core::types::sd::{
+use crate::sd_types::{
     ComponentSourceProfile, CompositionChange, CompositionChangeType, CompositionTree,
     ConformanceCheck, ConformanceCheckType, SdPipelineResult,
 };
@@ -824,11 +824,11 @@ fn group_by_family(files: &[ComponentFile]) -> BTreeMap<String, Vec<&ComponentFi
 /// names (e.g., deprecated/Modal uses the deprecated ModalContent profile,
 /// not the v6 ModalContent profile).
 fn collect_family_profiles(
-    all_profiles: &HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile>,
-    deprecated_profiles: &HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile>,
+    all_profiles: &HashMap<String, crate::sd_types::ComponentSourceProfile>,
+    deprecated_profiles: &HashMap<String, crate::sd_types::ComponentSourceProfile>,
     family_exports: &[String],
     family_name: &str,
-) -> HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile> {
+) -> HashMap<String, crate::sd_types::ComponentSourceProfile> {
     let is_deprecated_family = family_name.starts_with("deprecated/");
     family_exports
         .iter()
@@ -852,7 +852,7 @@ fn extract_family_profiles_at_ref(
     git_ref: &str,
     exports: &[String],
     family_files: &[&ComponentFile],
-) -> HashMap<String, semver_analyzer_core::types::sd::ComponentSourceProfile> {
+) -> HashMap<String, crate::sd_types::ComponentSourceProfile> {
     let mut profiles = HashMap::new();
     for name in exports {
         // Find the component file for this export
@@ -1102,13 +1102,13 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
         };
 
         // Collect parent and child edges for this node
-        let parent_edges: Vec<semver_analyzer_core::types::sd::CompositionEdge> = tree
+        let parent_edges: Vec<crate::sd_types::CompositionEdge> = tree
             .edges
             .iter()
             .filter(|e| e.child == node)
             .cloned()
             .collect();
-        let child_edges: Vec<semver_analyzer_core::types::sd::CompositionEdge> = tree
+        let child_edges: Vec<crate::sd_types::CompositionEdge> = tree
             .edges
             .iter()
             .filter(|e| e.parent == node)
@@ -1155,7 +1155,7 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
                 {
                     // Outer is Allowed (PMC=NO, CHP=NO): conditional —
                     // transitive edge is Allowed
-                    semver_analyzer_core::types::sd::EdgeStrength::Allowed
+                    crate::sd_types::EdgeStrength::Allowed
                 } else {
                     // Structural or Required outer: use standard collapse
                     parent_edge.strength.collapse_chain(&child_edge.strength)
@@ -1171,7 +1171,7 @@ fn collapse_internal_nodes(tree: &mut CompositionTree, exports: &HashSet<&str>) 
                     .bem_evidence
                     .as_ref()
                     .is_some_and(|ev| ev.contains("BEM element"));
-                new_edges.push(semver_analyzer_core::types::sd::CompositionEdge {
+                new_edges.push(crate::sd_types::CompositionEdge {
                     parent: parent_edge.parent.clone(),
                     child: child_edge.child.clone(),
                     relationship: child_edge.relationship.clone(),
@@ -1271,7 +1271,7 @@ fn diff_composition_trees(
         // Skip internal rendering edges — these are not consumer-facing
         // children. For example, Tab → TabTitleText via internal OverflowTab
         // is an implementation detail, not something consumers place in JSX.
-        if edge.relationship == semver_analyzer_core::types::sd::ChildRelationship::Internal {
+        if edge.relationship == crate::sd_types::ChildRelationship::Internal {
             continue;
         }
 
@@ -1301,7 +1301,7 @@ fn diff_composition_trees(
 /// Build a lookup map from (parent, child) to the edge for a composition tree.
 fn build_edge_map(
     tree: &CompositionTree,
-) -> HashMap<(String, String), &semver_analyzer_core::types::sd::CompositionEdge> {
+) -> HashMap<(String, String), &crate::sd_types::CompositionEdge> {
     tree.edges
         .iter()
         .map(|e| ((e.parent.clone(), e.child.clone()), e))
@@ -1373,7 +1373,7 @@ fn generate_conformance_checks(
         let node_depth = depth[node];
         for edge in &tree.edges {
             if edge.parent == node
-                && edge.relationship != semver_analyzer_core::types::sd::ChildRelationship::Internal
+                && edge.relationship != crate::sd_types::ChildRelationship::Internal
                 && !depth.contains_key(edge.child.as_str())
             {
                 depth.insert(edge.child.as_str(), node_depth + 1);
@@ -1415,9 +1415,7 @@ fn generate_conformance_checks(
         .collect();
     for (node, node_depth) in pass2_nodes {
         for edge in &tree.edges {
-            if edge.parent == node
-                && edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Required
-            {
+            if edge.parent == node && edge.strength == crate::sd_types::EdgeStrength::Required {
                 let child = edge.child.as_str();
                 let new_depth = node_depth + 1;
                 if let Some(&current) = depth.get(child) {
@@ -1431,14 +1429,14 @@ fn generate_conformance_checks(
 
     for edge in &tree.edges {
         // Skip internal edges (not consumer-facing)
-        if edge.relationship == semver_analyzer_core::types::sd::ChildRelationship::Internal {
+        if edge.relationship == crate::sd_types::ChildRelationship::Internal {
             continue;
         }
 
         // Skip Allowed edges — only Required edges generate conformance
         // checks. Allowed edges (from CSS descendant selectors, flex context)
         // document valid placements but don't enforce nesting.
-        if edge.strength == semver_analyzer_core::types::sd::EdgeStrength::Allowed {
+        if edge.strength == crate::sd_types::EdgeStrength::Allowed {
             continue;
         }
 
@@ -1491,8 +1489,7 @@ fn generate_conformance_checks(
                 let child_has_chp_to_grandparent = tree.edges.iter().any(|e| {
                     e.child == edge.child
                         && e.parent == *grandparent
-                        && e.relationship
-                            != semver_analyzer_core::types::sd::ChildRelationship::Internal
+                        && e.relationship != crate::sd_types::ChildRelationship::Internal
                         && e.strength.child_requires_parent()
                 });
                 if child_has_chp_to_grandparent {
@@ -1538,8 +1535,7 @@ fn generate_conformance_checks(
         .edges
         .iter()
         .filter(|e| {
-            e.parent == *root
-                && e.relationship == semver_analyzer_core::types::sd::ChildRelationship::DirectChild
+            e.parent == *root && e.relationship == crate::sd_types::ChildRelationship::DirectChild
         })
         .collect();
 
@@ -1578,7 +1574,7 @@ fn generate_conformance_checks(
         // Also add family members that self-wrap in one of the BEM children
         // (internal edges, e.g., InputGroupText internally renders InputGroupItem)
         for edge in &tree.edges {
-            if edge.relationship == semver_analyzer_core::types::sd::ChildRelationship::Internal
+            if edge.relationship == crate::sd_types::ChildRelationship::Internal
                 && bem_children.contains(&edge.child.as_str())
                 && !allowed.contains(&edge.parent)
             {
@@ -1770,7 +1766,7 @@ export { DropdownList } from './DropdownList';
 
     #[test]
     fn test_generate_conformance_checks() {
-        use semver_analyzer_core::types::sd::{ChildRelationship, CompositionEdge};
+        use crate::sd_types::{ChildRelationship, CompositionEdge};
 
         let tree = CompositionTree {
             root: "Dropdown".to_string(),
@@ -1786,7 +1782,7 @@ export { DropdownList } from './DropdownList';
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
                 CompositionEdge {
@@ -1795,7 +1791,7 @@ export { DropdownList } from './DropdownList';
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
             ],
@@ -1827,7 +1823,7 @@ export { DropdownList } from './DropdownList';
     /// valid without a Tab parent.
     #[test]
     fn test_conformance_checks_skip_back_edges() {
-        use semver_analyzer_core::types::sd::{ChildRelationship, CompositionEdge};
+        use crate::sd_types::{ChildRelationship, CompositionEdge};
 
         // Mimics the Tabs family: Tabs → Tab (direct_child), Tab → Tabs (direct_child)
         let tree = CompositionTree {
@@ -1840,7 +1836,7 @@ export { DropdownList } from './DropdownList';
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
                 // Back-edge: Tab → Tabs (for nested tabs)
@@ -1850,7 +1846,7 @@ export { DropdownList } from './DropdownList';
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
             ],
@@ -1895,7 +1891,7 @@ export { DropdownList } from './DropdownList';
     /// should not generate a "Tab requires TabTitleText as child" change.
     #[test]
     fn test_composition_changes_skip_internal_edges() {
-        use semver_analyzer_core::types::sd::{ChildRelationship, CompositionEdge};
+        use crate::sd_types::{ChildRelationship, CompositionEdge};
 
         let old_tree = CompositionTree {
             root: "Tabs".to_string(),
@@ -1910,7 +1906,7 @@ export { DropdownList } from './DropdownList';
                 relationship: ChildRelationship::DirectChild,
                 required: false,
                 bem_evidence: None,
-                strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                strength: crate::sd_types::EdgeStrength::Allowed,
                 prop_name: None,
             }],
         };
@@ -1929,7 +1925,7 @@ export { DropdownList } from './DropdownList';
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
                 // New internal edge (collapsed from Tab → OverflowTab → TabTitleText)
@@ -1942,7 +1938,7 @@ export { DropdownList } from './DropdownList';
                         "Collapsed through internal OverflowTab: Tab → OverflowTab → TabTitleText"
                             .to_string(),
                     ),
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
             ],
@@ -1985,7 +1981,7 @@ export { DropdownList } from './DropdownList';
     // ── CSS enrichment guard tests ──────────────────────────────────
 
     use crate::css_profile::{CssBlockProfile, CssElementInfo};
-    use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree};
+    use crate::sd_types::{CompositionEdge, CompositionTree};
     use std::collections::BTreeMap;
 
     #[allow(dead_code)]
@@ -2035,7 +2031,7 @@ export { DropdownList } from './DropdownList';
     /// profiles produces source-level changes tagged with `migration_from`.
     #[test]
     fn test_deprecated_migration_diff_produces_tagged_changes() {
-        use semver_analyzer_core::types::sd::SourceLevelCategory;
+        use crate::sd_types::SourceLevelCategory;
 
         // Deprecated Select rendered TextInput internally
         let mut deprecated_profile = ComponentSourceProfile::default();
@@ -2136,7 +2132,7 @@ export { DropdownList } from './DropdownList';
     /// changes. The `migration_from` field distinguishes them.
     #[test]
     fn test_migration_changes_separate_from_evolution_changes() {
-        use semver_analyzer_core::types::sd::SourceLevelCategory;
+        use crate::sd_types::SourceLevelCategory;
 
         // Same-component evolution: Select v5 → Select v6 (minor changes)
         let mut select_v5 = ComponentSourceProfile::default();
@@ -2224,9 +2220,7 @@ export { DropdownList } from './DropdownList';
     /// correctly propagate the 3-level chain into Modal → ModalBody, etc.
     #[test]
     fn test_collapse_three_level_internal_chain() {
-        use semver_analyzer_core::types::sd::{
-            ChildRelationship, CompositionEdge, CompositionTree, EdgeStrength,
-        };
+        use crate::sd_types::{ChildRelationship, CompositionEdge, CompositionTree, EdgeStrength};
 
         let mut tree = CompositionTree {
             root: "Modal".into(),
@@ -2635,17 +2629,17 @@ export { DropdownList } from './DropdownList';
     // ── Fix A: ExclusiveWrapper heuristic guard tests ────────────────────
 
     /// Helper: create a BEM element edge from parent to child.
-    fn bem_edge(parent: &str, child: &str) -> semver_analyzer_core::types::sd::CompositionEdge {
-        semver_analyzer_core::types::sd::CompositionEdge {
+    fn bem_edge(parent: &str, child: &str) -> crate::sd_types::CompositionEdge {
+        crate::sd_types::CompositionEdge {
             parent: parent.into(),
             child: child.into(),
-            relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
+            relationship: crate::sd_types::ChildRelationship::DirectChild,
             required: false,
             bem_evidence: Some(format!(
                 "BEM element fallback: {} is a BEM element of root's block",
                 child
             )),
-            strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+            strength: crate::sd_types::EdgeStrength::Allowed,
             prop_name: None,
         }
     }
@@ -2654,13 +2648,13 @@ export { DropdownList } from './DropdownList';
     fn non_bem_edge(
         parent: &str,
         child: &str,
-        strength: semver_analyzer_core::types::sd::EdgeStrength,
-    ) -> semver_analyzer_core::types::sd::CompositionEdge {
-        semver_analyzer_core::types::sd::CompositionEdge {
+        strength: crate::sd_types::EdgeStrength,
+    ) -> crate::sd_types::CompositionEdge {
+        crate::sd_types::CompositionEdge {
             parent: parent.into(),
             child: child.into(),
-            relationship: semver_analyzer_core::types::sd::ChildRelationship::DirectChild,
-            required: strength == semver_analyzer_core::types::sd::EdgeStrength::Required,
+            relationship: crate::sd_types::ChildRelationship::DirectChild,
+            required: strength == crate::sd_types::EdgeStrength::Required,
             bem_evidence: Some("CSS descendant: . .child".into()),
             strength,
             prop_name: None,
@@ -2705,7 +2699,7 @@ export { DropdownList } from './DropdownList';
     /// (CSS descendant), proving the root accepts non-wrapper children.
     #[test]
     fn test_exclusive_wrapper_skipped_with_non_bem_children() {
-        use semver_analyzer_core::types::sd::EdgeStrength;
+        use crate::sd_types::EdgeStrength;
 
         let tree = CompositionTree {
             root: "Toolbar".into(),

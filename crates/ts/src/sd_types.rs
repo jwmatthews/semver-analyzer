@@ -1,9 +1,8 @@
-//! Types for the SD (Source-Level Diff) pipeline (v2).
+//! TypeScript/React-specific types for the SD (Source-Level Diff) pipeline (v2).
 //!
-//! SD replaces most of the BU behavioral analysis pipeline with deterministic,
-//! AST-based source code analysis. Instead of diffing function bodies and
-//! guessing at behavioral changes, SD extracts structured profiles from each
-//! public component's source and diffs them as facts.
+//! Moved from `semver-analyzer-core::types::sd` during genericization (Phase 2).
+//! These types are 100% React/JSX/BEM/PatternFly concepts and belong in the
+//! TypeScript crate, not in the language-agnostic core.
 //!
 //! Key types:
 //! 1. `ComponentSourceProfile` — extracted from a single component's .tsx source

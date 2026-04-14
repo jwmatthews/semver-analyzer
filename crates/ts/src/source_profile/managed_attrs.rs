@@ -11,11 +11,11 @@
 //! The detection is generic — it works for any prop/helper/attribute pattern,
 //! not just OUIA.
 
+use crate::sd_types::ManagedAttributeBinding;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use semver_analyzer_core::types::sd::ManagedAttributeBinding;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Result of analyzing destructuring patterns in a function's parameters

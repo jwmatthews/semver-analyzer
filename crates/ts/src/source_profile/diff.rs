@@ -3,9 +3,7 @@
 //! Each change is deterministic — a fact derived from comparing two AST-extracted
 //! profiles. No confidence scores, no LLM involvement.
 
-use semver_analyzer_core::types::sd::{
-    ComponentSourceProfile, SourceLevelCategory, SourceLevelChange,
-};
+use crate::sd_types::{ComponentSourceProfile, SourceLevelCategory, SourceLevelChange};
 use std::collections::BTreeSet;
 
 /// Diff two component profiles and produce a list of source-level changes.
@@ -1179,7 +1177,7 @@ mod tests {
 
     #[test]
     fn test_diff_managed_attribute_added() {
-        use semver_analyzer_core::types::sd::ManagedAttributeBinding;
+        use crate::sd_types::ManagedAttributeBinding;
 
         let old = make_profile("MenuToggle");
         let mut new = make_profile("MenuToggle");
@@ -1210,7 +1208,7 @@ mod tests {
 
     #[test]
     fn test_diff_managed_attribute_removed() {
-        use semver_analyzer_core::types::sd::ManagedAttributeBinding;
+        use crate::sd_types::ManagedAttributeBinding;
 
         let mut old = make_profile("MenuToggle");
         old.managed_attributes.push(ManagedAttributeBinding {
@@ -1232,7 +1230,7 @@ mod tests {
 
     #[test]
     fn test_diff_managed_attribute_no_change() {
-        use semver_analyzer_core::types::sd::ManagedAttributeBinding;
+        use crate::sd_types::ManagedAttributeBinding;
 
         let binding = ManagedAttributeBinding {
             prop_name: "ouiaId".into(),

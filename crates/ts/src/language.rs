@@ -13,13 +13,14 @@ use semver_analyzer_core::{
     AnalysisReport, AnalysisResult, ApiSurface, BehavioralChangeKind, BodyAnalysisResult,
     BodyAnalysisSemantics, Caller, ChangedFunction, EvidenceType, HierarchySemantics, Language,
     LanguageSemantics, ManifestChange, MessageFormatter, Reference, RenameSemantics,
-    SdPipelineResult, StructuralChange, StructuralChangeType, Symbol, SymbolKind, TestDiff,
-    TestFile, Visibility,
+    StructuralChange, StructuralChangeType, Symbol, SymbolKind, TestDiff, TestFile, Visibility,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::extensions::TsAnalysisExtensions;
 use crate::TsSymbolData;
 
 // ── TypeScript language type ────────────────────────────────────────────
@@ -239,6 +240,7 @@ impl Language for TypeScript {
     type ManifestChangeType = TsManifestChangeType;
     type Evidence = TsEvidence;
     type ReportData = TsReportData;
+    type AnalysisExtensions = TsAnalysisExtensions;
 
     const RENAMEABLE_SYMBOL_KINDS: &'static [SymbolKind] =
         &[SymbolKind::Interface, SymbolKind::Class];
@@ -394,13 +396,13 @@ impl Language for TypeScript {
         || path_str.starts_with("dist/")
     }
 
-    fn run_source_diff(
+    fn run_extended_analysis(
         &self,
         repo: &Path,
         from_ref: &str,
         to_ref: &str,
         dep_css_dir: Option<&Path>,
-    ) -> Result<SdPipelineResult> {
+    ) -> Result<TsAnalysisExtensions> {
         let css_profiles = dep_css_dir.and_then(|dir| {
             crate::css_profile::extract_css_profiles_from_dir(dir)
                 .map_err(|e| {
@@ -410,7 +412,69 @@ impl Language for TypeScript {
                 .ok()
         });
 
-        crate::sd_pipeline::run_sd(repo, from_ref, to_ref, css_profiles.as_ref())
+        let sd_result = crate::sd_pipeline::run_sd(repo, from_ref, to_ref, css_profiles.as_ref())?;
+        Ok(TsAnalysisExtensions {
+            sd_result: Some(sd_result),
+            hierarchy_deltas: Vec::new(),
+            new_hierarchies: std::collections::HashMap::new(),
+        })
+    }
+
+    fn finalize_extensions(
+        &self,
+        extensions: &mut Self::AnalysisExtensions,
+        structural_changes: Arc<Vec<StructuralChange>>,
+    ) -> Arc<Vec<StructuralChange>> {
+        let sd = match extensions.sd_result.as_mut() {
+            Some(sd) => sd,
+            None => return structural_changes,
+        };
+
+        // Deprecated replacement detection via rendering swaps
+        let deprecated_replacements =
+            crate::deprecated_replacements::detect_deprecated_replacements(&structural_changes, sd);
+        if !deprecated_replacements.is_empty() {
+            for dr in &deprecated_replacements {
+                tracing::info!(
+                    old = %dr.old_component,
+                    new = %dr.new_component,
+                    evidence = ?dr.evidence_hosts,
+                    "Deprecated replacement detected via rendering swap"
+                );
+            }
+            sd.deprecated_replacements = deprecated_replacements;
+        }
+
+        // Transform structural changes
+        crate::deprecated_replacements::apply_deprecated_replacements(
+            structural_changes,
+            &sd.deprecated_replacements,
+        )
+    }
+
+    fn extensions_log_summary(&self, extensions: &Self::AnalysisExtensions) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(ref sd) = extensions.sd_result {
+            lines.push(format!(
+                "[SD] {} source-level changes, {} composition trees, {} conformance checks",
+                sd.source_level_changes.len(),
+                sd.composition_trees.len(),
+                sd.conformance_checks.len(),
+            ));
+            if !sd.composition_changes.is_empty() {
+                lines.push(format!(
+                    "[SD] {} composition changes detected",
+                    sd.composition_changes.len(),
+                ));
+            }
+            if !sd.deprecated_replacements.is_empty() {
+                lines.push(format!(
+                    "[SD] {} deprecated replacements detected via rendering swaps",
+                    sd.deprecated_replacements.len(),
+                ));
+            }
+        }
+        lines
     }
 }
 

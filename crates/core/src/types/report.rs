@@ -16,6 +16,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Empty analysis extensions for languages without extended analysis.
+///
+/// Used as the default `AnalysisExtensions` type for `Language` implementations
+/// that don't have language-specific pipeline results (e.g., test languages).
+/// Serializes as an empty JSON object `{}`, so `#[serde(flatten)]` on
+/// `AnalysisReport`/`AnalysisResult` adds no extra fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmptyExtensions {}
+
 /// Top-level analysis report (v2 harness format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -70,17 +79,16 @@ pub struct AnalysisReport<L: Language> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inferred_rename_patterns: Option<InferredRenamePatterns>,
 
-    /// Hierarchy changes between versions, computed by diffing LLM-inferred
-    /// component hierarchies from both refs. Each entry describes how a
-    /// component's expected children changed (added/removed children,
-    /// migrated props). None when --no-llm is set.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hierarchy_deltas: Vec<HierarchyDelta>,
-
-    /// SD (Source-Level Diff) pipeline results.
-    /// Populated by default; None when `--behavioral` is used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sd_result: Option<super::sd::SdPipelineResult>,
+    /// Language-specific analysis extensions.
+    ///
+    /// TypeScript: contains SD pipeline results (composition trees, conformance
+    /// checks, source-level changes) and hierarchy deltas.
+    /// Other languages: empty.
+    ///
+    /// Flattened into the parent JSON object for backward compatibility —
+    /// the fields appear at the top level, not nested under "extensions".
+    #[serde(flatten)]
+    pub extensions: L::AnalysisExtensions,
 
     /// Metadata about the analysis run.
     pub metadata: AnalysisMetadata,
@@ -958,13 +966,12 @@ pub struct AnalysisResult<L: Language> {
     pub new_surface: Arc<ApiSurface<L::SymbolData>>,
     pub inferred_rename_patterns: Option<InferredRenamePatterns>,
     pub container_changes: Vec<(String, Vec<ContainerChange>)>,
-    pub hierarchy_deltas: Vec<HierarchyDelta>,
-    pub new_hierarchies: HashMap<String, HashMap<String, Vec<ExpectedChild>>>,
 
-    // ── SD pipeline results (populated by default; None with --behavioral) ──
-    /// Source-level changes from the SD pipeline.
-    /// Empty when running the v1 (BU) pipeline.
-    pub sd_result: Option<super::sd::SdPipelineResult>,
+    /// Language-specific analysis extensions.
+    ///
+    /// TypeScript: contains SD pipeline results and hierarchy deltas.
+    /// Other languages: `EmptyExtensions`.
+    pub extensions: L::AnalysisExtensions,
 
     /// Non-fatal issues that degraded analysis quality.
     /// Populated by the orchestrator and rendered at end of run.

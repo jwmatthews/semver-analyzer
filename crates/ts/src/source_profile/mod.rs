@@ -23,11 +23,11 @@ use bem::{extract_style_tokens, parse_bem_structure, StyleToken};
 use children_slot::{has_children_prop, trace_children_slot_both};
 // clone_element detection is done inline during the main AST walk
 // (via clone_element::try_extract_clone_element_from_call)
+use crate::sd_types::ComponentSourceProfile;
 use managed_attrs::extract_managed_attributes;
 use prop_defaults::extract_prop_defaults;
 use prop_style::extract_prop_style_bindings;
 use react_api::detect_react_api_usage;
-use semver_analyzer_core::types::sd::ComponentSourceProfile;
 use std::collections::{BTreeMap, BTreeSet};
 
 use oxc_allocator::Allocator;
@@ -63,7 +63,7 @@ pub fn extract_profile(name: &str, file: &str, source: &str) -> ComponentSourceP
         .element_tags
         .keys()
         .filter(|tag| tag.starts_with(|c: char| c.is_uppercase()))
-        .map(|tag| semver_analyzer_core::types::sd::RenderedComponent {
+        .map(|tag| crate::sd_types::RenderedComponent {
             name: tag.clone(),
             conditional: !ast_info.unconditional_tags.contains(tag),
         })
@@ -217,7 +217,7 @@ struct FullSourceInfo {
 
     // ── cloneElement ────────────────────────────────────────────────
     /// Props injected via cloneElement, detected during AST walk.
-    clone_element_injections: Vec<semver_analyzer_core::types::sd::CloneElementInjection>,
+    clone_element_injections: Vec<crate::sd_types::CloneElementInjection>,
 }
 
 /// Extract all AST-level info from a full source file in a single parse.

@@ -10,6 +10,7 @@ pub mod call_graph;
 pub mod canon;
 pub mod cli;
 pub mod css_scan;
+pub mod deprecated_replacements;
 pub mod diff_parser;
 pub mod extract;
 pub mod git_utils;
@@ -24,12 +25,15 @@ pub mod worktree;
 // ── v2 SD (Source-Level Diff) pipeline modules ──────────────────────────
 pub mod composition;
 pub mod css_profile;
+pub mod extensions;
 pub mod konveyor_v2;
 pub mod sd_pipeline;
+pub mod sd_types;
 pub mod source_profile;
 pub mod symbol_data;
 
 // Re-export key types for convenience
+pub use extensions::TsAnalysisExtensions;
 pub use extract::OxcExtractor;
 pub use language::{TsCategory, TsEvidence, TsManifestChangeType, TsReportData, TypeScript};
 pub use symbol_data::TsSymbolData;

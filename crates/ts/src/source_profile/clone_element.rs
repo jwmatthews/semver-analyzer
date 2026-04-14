@@ -8,11 +8,11 @@
 //! which can then be matched against family members' declared props to infer
 //! parent-child relationships.
 
+use crate::sd_types::CloneElementInjection;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use semver_analyzer_core::types::sd::CloneElementInjection;
 
 /// Detect `cloneElement` prop injections in a component's source code.
 ///

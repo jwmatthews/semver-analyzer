@@ -11,7 +11,7 @@
 //! fires on exactly one thing (a specific prop, component, or import)
 //! and carries machine-readable fix_strategy metadata.
 
-use semver_analyzer_core::types::sd::{
+use crate::sd_types::{
     ChildRelationship, CompositionChangeType, CompositionTree, ConformanceCheck,
     ConformanceCheckType, SdPipelineResult, SourceLevelCategory, SourceLevelChange,
 };
@@ -3780,22 +3780,22 @@ mod tests {
                 "DropdownItem".into(),
             ],
             edges: vec![
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Dropdown".into(),
                     child: "DropdownList".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "DropdownList".into(),
                     child: "DropdownItem".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
             ],
@@ -3837,23 +3837,23 @@ mod tests {
             root: "Tabs".into(),
             family_members: vec!["Tabs".into(), "Tab".into()],
             edges: vec![
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Tabs".into(),
                     child: "Tab".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
                 // Recursive nesting: nested tabs inside a tab (Allowed, not Required)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Tab".into(),
                     child: "Tabs".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
             ],
@@ -3902,58 +3902,58 @@ mod tests {
                 "Th".into(),
             ],
             edges: vec![
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Table".into(),
                     child: "Thead".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Table".into(),
                     child: "Tbody".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Thead".into(),
                     child: "Tr".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Tbody".into(),
                     child: "Tr".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Tr".into(),
                     child: "Td".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Tr".into(),
                     child: "Th".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
             ],
@@ -4031,40 +4031,40 @@ mod tests {
             root: "Table".into(),
             family_members: vec!["Table".into(), "Thead".into(), "Tbody".into(), "Tr".into()],
             edges: vec![
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Table".into(),
                     child: "Thead".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Table".into(),
                     child: "Tbody".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Thead".into(),
                     child: "Tr".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Tbody".into(),
                     child: "Tr".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
             ],
@@ -4115,22 +4115,22 @@ mod tests {
                 "DropdownItem".into(),
             ],
             edges: vec![
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Dropdown".into(),
                     child: "DropdownList".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Wrapper,
+                    strength: crate::sd_types::EdgeStrength::Wrapper,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "DropdownList".into(),
                     child: "DropdownItem".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
             ],
@@ -4448,42 +4448,42 @@ mod tests {
             root: "Table".into(),
             family_members: vec!["Table".into(), "Thead".into(), "Tbody".into(), "Tr".into()],
             edges: vec![
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Table".into(),
                     child: "Thead".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Table".into(),
                     child: "Tbody".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
                 // Tbody→Tr is Required (e.g., CSS direct-child selector)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Tbody".into(),
                     child: "Tr".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
                 // Thead→Tr is Allowed (e.g., CSS descendant selector)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Thead".into(),
                     child: "Tr".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
             ],
@@ -4550,13 +4550,13 @@ mod tests {
         let tree = CompositionTree {
             root: "Menu".into(),
             family_members: vec!["Menu".into(), "MenuContent".into()],
-            edges: vec![semver_analyzer_core::types::sd::CompositionEdge {
+            edges: vec![crate::sd_types::CompositionEdge {
                 parent: "Menu".into(),
                 child: "MenuContent".into(),
                 relationship: ChildRelationship::DirectChild,
                 required: false,
                 bem_evidence: None,
-                strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                strength: crate::sd_types::EdgeStrength::Allowed,
                 prop_name: None,
             }],
         };
@@ -4596,22 +4596,22 @@ mod tests {
             edges: vec![
                 // AlertGroup is a secondary root — no incoming edges
                 // Wrapper: AlertGroup must contain Alert, Alert can exist standalone
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "AlertGroup".into(),
                     child: "Alert".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Wrapper,
+                    strength: crate::sd_types::EdgeStrength::Wrapper,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "AlertGroup".into(),
                     child: "AlertActionCloseButton".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Wrapper,
+                    strength: crate::sd_types::EdgeStrength::Wrapper,
                     prop_name: None,
                 },
             ],
@@ -4667,13 +4667,13 @@ mod tests {
             edges: vec![
                 // Structural edge TO the root: CHP=YES in the edge, but the
                 // root is standalone — the rule-gen filter must suppress this.
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "AlertGroup".into(),
                     child: "Alert".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                    strength: crate::sd_types::EdgeStrength::Structural,
                     prop_name: None,
                 },
             ],
@@ -4711,13 +4711,13 @@ mod tests {
         let tree = CompositionTree {
             root: "deprecated/DualListSelector".into(),
             family_members: vec!["DualListSelector".into(), "DualListSelectorPane".into()],
-            edges: vec![semver_analyzer_core::types::sd::CompositionEdge {
+            edges: vec![crate::sd_types::CompositionEdge {
                 parent: "DualListSelectorPane".into(),
                 child: "DualListSelector".into(),
                 relationship: ChildRelationship::DirectChild,
                 required: false,
                 bem_evidence: None,
-                strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                strength: crate::sd_types::EdgeStrength::Structural,
                 prop_name: None,
             }],
         };
@@ -4749,13 +4749,13 @@ mod tests {
         let deprecated_tree = CompositionTree {
             root: "deprecated/Wizard".into(),
             family_members: vec!["WizardNav".into(), "WizardNavItem".into()],
-            edges: vec![semver_analyzer_core::types::sd::CompositionEdge {
+            edges: vec![crate::sd_types::CompositionEdge {
                 parent: "WizardNav".into(),
                 child: "WizardNavItem".into(),
                 relationship: ChildRelationship::DirectChild,
                 required: true,
                 bem_evidence: None,
-                strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                strength: crate::sd_types::EdgeStrength::Required,
                 prop_name: None,
             }],
         };
@@ -4792,13 +4792,13 @@ mod tests {
         let v6_tree = CompositionTree {
             root: "Wizard".into(),
             family_members: vec!["WizardNav".into(), "WizardNavItem".into()],
-            edges: vec![semver_analyzer_core::types::sd::CompositionEdge {
+            edges: vec![crate::sd_types::CompositionEdge {
                 parent: "WizardNav".into(),
                 child: "WizardNavItem".into(),
                 relationship: ChildRelationship::DirectChild,
                 required: true,
                 bem_evidence: None,
-                strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                strength: crate::sd_types::EdgeStrength::Required,
                 prop_name: None,
             }],
         };
@@ -4831,13 +4831,13 @@ mod tests {
         let tree = CompositionTree {
             root: "deprecated/Table".into(),
             family_members: vec!["Body".into(), "Header".into()],
-            edges: vec![semver_analyzer_core::types::sd::CompositionEdge {
+            edges: vec![crate::sd_types::CompositionEdge {
                 parent: "Header".into(),
                 child: "Body".into(),
                 relationship: ChildRelationship::DirectChild,
                 required: false,
                 bem_evidence: None,
-                strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                strength: crate::sd_types::EdgeStrength::Structural,
                 prop_name: None,
             }],
         };
@@ -4877,31 +4877,31 @@ mod tests {
             root: "Table".into(),
             family_members: vec!["Table".into(), "Tbody".into(), "Tr".into(), "Td".into()],
             edges: vec![
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Table".into(),
                     child: "Tbody".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Tbody".into(),
                     child: "Tr".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Tr".into(),
                     child: "Td".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
             ],
@@ -4981,53 +4981,53 @@ mod tests {
             ],
             edges: vec![
                 // Card → CardHeader: Structural (CHP=YES)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Card".into(),
                     child: "CardHeader".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                    strength: crate::sd_types::EdgeStrength::Structural,
                     prop_name: None,
                 },
                 // Card → CardBody: Structural (CHP=YES)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Card".into(),
                     child: "CardBody".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                    strength: crate::sd_types::EdgeStrength::Structural,
                     prop_name: None,
                 },
                 // Card → CardFooter: Structural (CHP=YES)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Card".into(),
                     child: "CardFooter".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                    strength: crate::sd_types::EdgeStrength::Structural,
                     prop_name: None,
                 },
                 // CardHeader → CardBody: Allowed (CSS layout signal)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "CardHeader".into(),
                     child: "CardBody".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
                 // CardHeader → CardFooter: Allowed (CSS layout signal)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "CardHeader".into(),
                     child: "CardFooter".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
             ],
@@ -5094,73 +5094,73 @@ mod tests {
             ],
             edges: vec![
                 // DL → DLGroup: Required
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "DL".into(),
                     child: "DLGroup".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: true,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
                 // DLGroup → DLDesc: Structural (CHP=YES — real parent)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "DLGroup".into(),
                     child: "DLDesc".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Structural,
+                    strength: crate::sd_types::EdgeStrength::Structural,
                     prop_name: None,
                 },
                 // DLGroup → DLTerm: Allowed (CSS noise — peer)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "DLGroup".into(),
                     child: "DLTerm".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
                 // DLGroup → DLTermHelp: Allowed (CSS noise — peer)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "DLGroup".into(),
                     child: "DLTermHelp".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
                 // DLTerm → DLDesc: Allowed (CSS descendant noise — peers!)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "DLTerm".into(),
                     child: "DLDesc".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
                 // DLTermHelp → DLDesc: Allowed (CSS descendant noise — peers!)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "DLTermHelp".into(),
                     child: "DLDesc".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
                 // DLTermHelp → DLTerm: Allowed (CSS descendant noise — peers!)
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "DLTermHelp".into(),
                     child: "DLTerm".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+                    strength: crate::sd_types::EdgeStrength::Allowed,
                     prop_name: None,
                 },
             ],
@@ -5205,23 +5205,23 @@ mod tests {
                 "AccordionContent".into(),
             ],
             edges: vec![
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "Accordion".into(),
                     child: "AccordionItem".into(),
                     relationship: ChildRelationship::DirectChild,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
                 // Internal rendering: AccordionItem renders AccordionContent
-                semver_analyzer_core::types::sd::CompositionEdge {
+                crate::sd_types::CompositionEdge {
                     parent: "AccordionItem".into(),
                     child: "AccordionContent".into(),
                     relationship: ChildRelationship::Internal,
                     required: false,
                     bem_evidence: None,
-                    strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+                    strength: crate::sd_types::EdgeStrength::Required,
                     prop_name: None,
                 },
             ],
@@ -5241,27 +5241,27 @@ mod tests {
     // ── Fix B: requiresChild includes all valid children ────────────────
 
     /// Helper: create a Required non-internal edge.
-    fn req_edge(parent: &str, child: &str) -> semver_analyzer_core::types::sd::CompositionEdge {
-        semver_analyzer_core::types::sd::CompositionEdge {
+    fn req_edge(parent: &str, child: &str) -> crate::sd_types::CompositionEdge {
+        crate::sd_types::CompositionEdge {
             parent: parent.into(),
             child: child.into(),
             relationship: ChildRelationship::DirectChild,
             required: true,
             bem_evidence: None,
-            strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+            strength: crate::sd_types::EdgeStrength::Required,
             prop_name: None,
         }
     }
 
     /// Helper: create an Allowed non-internal edge.
-    fn allowed_edge(parent: &str, child: &str) -> semver_analyzer_core::types::sd::CompositionEdge {
-        semver_analyzer_core::types::sd::CompositionEdge {
+    fn allowed_edge(parent: &str, child: &str) -> crate::sd_types::CompositionEdge {
+        crate::sd_types::CompositionEdge {
             parent: parent.into(),
             child: child.into(),
             relationship: ChildRelationship::DirectChild,
             required: false,
             bem_evidence: None,
-            strength: semver_analyzer_core::types::sd::EdgeStrength::Allowed,
+            strength: crate::sd_types::EdgeStrength::Allowed,
             prop_name: None,
         }
     }
@@ -5419,14 +5419,14 @@ mod tests {
         parent: &str,
         child: &str,
         prop_name: &str,
-    ) -> semver_analyzer_core::types::sd::CompositionEdge {
-        semver_analyzer_core::types::sd::CompositionEdge {
+    ) -> crate::sd_types::CompositionEdge {
+        crate::sd_types::CompositionEdge {
             parent: parent.into(),
             child: child.into(),
             relationship: ChildRelationship::PropPassed,
             required: true,
             bem_evidence: None,
-            strength: semver_analyzer_core::types::sd::EdgeStrength::Required,
+            strength: crate::sd_types::EdgeStrength::Required,
             prop_name: Some(prop_name.into()),
         }
     }
@@ -5554,9 +5554,9 @@ mod tests {
     fn make_edge(
         parent: &str,
         child: &str,
-        strength: semver_analyzer_core::types::sd::EdgeStrength,
-    ) -> semver_analyzer_core::types::sd::CompositionEdge {
-        semver_analyzer_core::types::sd::CompositionEdge {
+        strength: crate::sd_types::EdgeStrength,
+    ) -> crate::sd_types::CompositionEdge {
+        crate::sd_types::CompositionEdge {
             parent: parent.into(),
             child: child.into(),
             relationship: ChildRelationship::DirectChild,
@@ -5576,7 +5576,7 @@ mod tests {
         pkgs.insert("Tr".into(), "@patternfly/react-table".into());
         pkgs.insert("Td".into(), "@patternfly/react-table".into());
 
-        use semver_analyzer_core::types::sd::EdgeStrength;
+        use crate::sd_types::EdgeStrength;
 
         let tree = CompositionTree {
             root: "Table".into(),
@@ -5607,7 +5607,7 @@ mod tests {
         pkgs.insert("Tab".into(), "@patternfly/react-core".into());
         pkgs.insert("TabContent".into(), "@patternfly/react-core".into());
 
-        use semver_analyzer_core::types::sd::EdgeStrength;
+        use crate::sd_types::EdgeStrength;
 
         let tree = CompositionTree {
             root: "Tabs".into(),
@@ -5632,7 +5632,7 @@ mod tests {
     #[test]
     fn snapshot_composition_removed_member_rule() {
         let sd = SdPipelineResult {
-            composition_changes: vec![semver_analyzer_core::types::sd::CompositionChange {
+            composition_changes: vec![crate::sd_types::CompositionChange {
                 family: "EmptyState".into(),
                 change_type: CompositionChangeType::FamilyMemberRemoved {
                     member: "EmptyStateHeader".into(),
@@ -5657,7 +5657,7 @@ mod tests {
 
     #[test]
     fn snapshot_conformance_invalid_direct_child_rule() {
-        use semver_analyzer_core::types::sd::EdgeStrength;
+        use crate::sd_types::EdgeStrength;
 
         let mut pkgs = test_pkg_map();
         pkgs.insert("Nav".into(), "@patternfly/react-core".into());

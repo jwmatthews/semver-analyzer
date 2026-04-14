@@ -10,7 +10,7 @@
 //! for consumers of the component family.
 
 use crate::css_profile::CssBlockProfile;
-use semver_analyzer_core::types::sd::{
+use crate::sd_types::{
     ChildRelationship, ComponentSourceProfile, CompositionEdge, CompositionTree, EdgeStrength,
 };
 use std::collections::{HashMap, HashSet};
@@ -3625,7 +3625,7 @@ mod tests {
     /// These indicate peers with shared prop vocabulary, not hierarchy.
     #[test]
     fn test_clone_element_bidirectional_pairs_removed() {
-        use semver_analyzer_core::types::sd::CloneElementInjection;
+        use crate::sd_types::CloneElementInjection;
 
         // Three components: Root, SubA, SubB.
         // SubA and SubB both inject the same props (height, width)
@@ -3701,7 +3701,7 @@ mod tests {
     /// from a prior step (e.g., Step 1 internal rendering).
     #[test]
     fn test_clone_element_skipped_when_reverse_exists() {
-        use semver_analyzer_core::types::sd::CloneElementInjection;
+        use crate::sd_types::CloneElementInjection;
 
         // Root renders Sub (Step 1). Sub uses cloneElement to inject
         // props that Root declares. Without the reverse-edge check,
@@ -3746,7 +3746,7 @@ mod tests {
 
     #[test]
     fn test_clone_element_skipped_when_no_children_prop() {
-        use semver_analyzer_core::types::sd::CloneElementInjection;
+        use crate::sd_types::CloneElementInjection;
 
         // ActionsColumn scenario: parent uses cloneElement on internally-
         // created elements (dropdown items), NOT on consumer children.
@@ -3785,7 +3785,7 @@ mod tests {
 
     #[test]
     fn test_clone_element_works_when_has_children_prop() {
-        use semver_analyzer_core::types::sd::CloneElementInjection;
+        use crate::sd_types::CloneElementInjection;
 
         // ToggleGroup scenario: parent uses cloneElement on consumer-
         // provided children. has_children_prop = true → edge is created.
@@ -3833,7 +3833,7 @@ mod tests {
     /// instead of Structural (CHP=YES, PMC=NO).
     #[test]
     fn test_clone_element_react_element_children_uses_wrapper_strength() {
-        use semver_analyzer_core::types::sd::CloneElementInjection;
+        use crate::sd_types::CloneElementInjection;
 
         let mut parent = make_profile("ChartDonutThreshold");
         parent.has_children_prop = true;
@@ -3877,7 +3877,7 @@ mod tests {
     /// This is the common case (AlertGroup, DataListItem, Breadcrumb, etc.).
     #[test]
     fn test_clone_element_react_node_children_uses_structural_strength() {
-        use semver_analyzer_core::types::sd::CloneElementInjection;
+        use crate::sd_types::CloneElementInjection;
 
         let mut parent = make_profile("ToggleGroup");
         parent.has_children_prop = true;
@@ -4878,7 +4878,7 @@ mod tests {
     /// the root→Item edge should survive suppress_root_edges_with_intermediate.
     #[test]
     fn test_suppress_preserves_root_edge_when_intermediate_is_optional() {
-        use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree, EdgeStrength};
+        use crate::sd_types::{CompositionEdge, CompositionTree, EdgeStrength};
 
         let mut tree = CompositionTree {
             root: "SimpleList".into(),
@@ -4955,7 +4955,7 @@ mod tests {
     /// so root→MenuItem should be suppressed.
     #[test]
     fn test_suppress_removes_root_edge_when_intermediate_is_required() {
-        use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree, EdgeStrength};
+        use crate::sd_types::{CompositionEdge, CompositionTree, EdgeStrength};
 
         let mut tree = CompositionTree {
             root: "Menu".into(),
@@ -5029,7 +5029,7 @@ mod tests {
     /// wrapper is optional — options can go directly in <select>.
     #[test]
     fn test_suppress_preserves_dom_nesting_edge_when_intermediate_not_pmc() {
-        use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree, EdgeStrength};
+        use crate::sd_types::{CompositionEdge, CompositionTree, EdgeStrength};
 
         let mut tree = CompositionTree {
             root: "FormSelect".into(),
@@ -5120,7 +5120,7 @@ mod tests {
     /// <tr> must go through <tbody>.
     #[test]
     fn test_suppress_removes_dom_nesting_edge_when_intermediate_is_pmc() {
-        use semver_analyzer_core::types::sd::{CompositionEdge, CompositionTree, EdgeStrength};
+        use crate::sd_types::{CompositionEdge, CompositionTree, EdgeStrength};
 
         let mut tree = CompositionTree {
             root: "Table".into(),

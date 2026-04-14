@@ -191,6 +191,7 @@ mod tests {
         type ManifestChangeType = TestManifest;
         type Evidence = TestEvidence;
         type ReportData = TestReportData;
+        type AnalysisExtensions = crate::types::EmptyExtensions;
         const RENAMEABLE_SYMBOL_KINDS: &'static [crate::types::SymbolKind] = &[];
         const NAME: &'static str = "test";
         const MANIFEST_FILES: &'static [&'static str] = &[];
@@ -286,8 +287,7 @@ mod tests {
                 packages: vec![],
                 member_renames: std::collections::HashMap::new(),
                 inferred_rename_patterns: None,
-                hierarchy_deltas: vec![],
-                sd_result: None,
+                extensions: crate::types::EmptyExtensions {},
                 metadata: crate::types::AnalysisMetadata {
                     call_graph_analysis: String::new(),
                     tool_version: String::new(),
