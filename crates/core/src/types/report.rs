@@ -345,7 +345,7 @@ pub struct PackageChanges<L: Language> {
 
     /// Per-type summaries with pre-aggregated change data.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub type_summaries: Vec<ComponentSummary<L>>,
+    pub type_summaries: Vec<TypeSummary<L>>,
 
     /// Pre-grouped bulk constant/token changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -363,11 +363,11 @@ pub struct PackageChanges<L: Language> {
 /// rescanning the full report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct ComponentSummary<L: Language> {
-    /// Type name (e.g., "Modal").
+pub struct TypeSummary<L: Language> {
+    /// Type name (e.g., "Button", "UserService").
     pub name: String,
 
-    /// Definition name (e.g., "ModalProps").
+    /// Definition name (e.g., "ButtonProps", "UserServiceConfig").
     pub definition_name: String,
 
     /// Overall status of this type.
@@ -384,41 +384,37 @@ pub struct ComponentSummary<L: Language> {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_changes: Vec<TypeChange>,
 
-    /// Migration target if the component/interface was removed and a
-    /// replacement was detected via member overlap analysis.
+    /// Migration target if the type was removed and a replacement was
+    /// detected via member overlap analysis.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration_target: Option<MigrationTarget>,
 
-    /// Behavioral changes pre-grouped for this component.
+    /// Behavioral changes pre-grouped for this type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub behavioral_changes: Vec<BehavioralChange<L>>,
 
-    /// Discovered child/sibling components (e.g., ModalHeader added
-    /// alongside Modal being modified).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub child_components: Vec<ChildComponent>,
+    /// Language-specific data for this type summary.
+    ///
+    /// TypeScript: `TsReportData` containing child components,
+    /// expected children (composition hierarchy), etc.
+    /// Other languages: empty/placeholder.
+    #[serde(flatten)]
+    pub language_data: L::ReportData,
 
-    /// Expected direct children of this component, derived from LLM
-    /// hierarchy inference on the component family's source code.
-    /// Each entry is a component name that can be looked up in another
-    /// `ComponentSummary` within the same package.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub expected_children: Vec<ExpectedChild>,
-
-    /// Source files containing this component's definitions.
+    /// Source files containing this type's definitions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_files: Vec<PathBuf>,
 }
 
-/// Overall status of a component across the version change.
+/// Overall status of a type across the version change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentStatus {
-    /// Component exists in both versions but has changes.
+    /// Type exists in both versions but has changes.
     Modified,
-    /// Component was removed (interface gone or mostly removed).
+    /// Type was removed (interface/class gone or mostly removed).
     Removed,
-    /// Component was added in the new version.
+    /// Type was added in the new version.
     Added,
 }
 
@@ -460,11 +456,12 @@ pub struct RemovedMember {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemovalDisposition {
-    /// Member moved to a related type (e.g., Modal.title → ModalHeader.title).
+    /// Member moved to a related type (e.g., parent.field → child.field).
     MovedToRelatedType {
-        /// The target type name (e.g., "ModalHeader").
+        /// The target type name.
         target_type: String,
-        /// How to pass the value: "prop" (named prop) or "children".
+        /// How to pass the value (language-specific, e.g., "prop", "children",
+        /// "parameter", "field").
         mechanism: String,
     },
     /// Replaced by a different member on the same type.
@@ -491,38 +488,14 @@ pub struct TypeChange {
     pub after: Option<String>,
 }
 
-/// A child or sibling component discovered during analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChildComponent {
-    /// Component name (e.g., "ModalHeader").
-    pub name: String,
-    /// Whether this component was added or modified.
-    pub status: ChildComponentStatus,
-    /// Known members on this child component (from the new surface AST).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub known_members: Vec<String>,
-    /// Members that were removed from the parent and match members on this
-    /// child (by name). Populated from AST member comparison.
-    /// E.g., parent `Modal` had `title` removed, child `ModalHeader`
-    /// has `title` → `absorbed_members: ["title"]`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub absorbed_members: Vec<String>,
-}
-
-/// Status of a child/sibling component.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChildComponentStatus {
-    /// Newly added in the new version.
-    Added,
-    /// Existed before but was modified.
-    Modified,
-}
+// `ChildComponent` and `ChildComponentStatus` moved to
+// `crates/ts/src/language.rs::TsReportData` during Phase 4 genericization.
+// They are React/JSX-specific (component hierarchy analysis).
 
 /// An expected direct child component, derived from LLM hierarchy inference.
 ///
 /// Each entry names a component that should be used as a direct child of the
-/// parent component. The `name` resolves to another `ComponentSummary` in the
+/// parent component. The `name` resolves to another `TypeSummary` in the
 /// same package.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpectedChild {

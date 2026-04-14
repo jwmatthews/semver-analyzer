@@ -11,9 +11,10 @@
 use anyhow::Result;
 use semver_analyzer_core::{
     AnalysisReport, AnalysisResult, ApiSurface, BehavioralChangeKind, BodyAnalysisResult,
-    BodyAnalysisSemantics, Caller, ChangedFunction, EvidenceType, HierarchySemantics, Language,
-    LanguageSemantics, ManifestChange, MessageFormatter, Reference, RenameSemantics,
-    StructuralChange, StructuralChangeType, Symbol, SymbolKind, TestDiff, TestFile, Visibility,
+    BodyAnalysisSemantics, Caller, ChangedFunction, EvidenceType, ExpectedChild,
+    HierarchySemantics, Language, LanguageSemantics, ManifestChange, MessageFormatter, Reference,
+    RenameSemantics, StructuralChange, StructuralChangeType, Symbol, SymbolKind, TestDiff,
+    TestFile, Visibility,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
@@ -109,17 +110,51 @@ pub enum TsEvidence {
     },
 }
 
-/// TypeScript-specific report data (React component analysis).
+/// TypeScript-specific report data carried on each `TypeSummary`.
 ///
-/// These types will eventually absorb ComponentSummary, HierarchyDelta,
-/// ContainerChange, and other React-specific types currently
-/// in the core crate. For now this is a placeholder.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Contains React/JSX-specific analysis results: discovered child
+/// components with absorbed members, and expected composition
+/// hierarchy children from LLM inference.
+///
+/// Flattened into the parent `TypeSummary` JSON via `#[serde(flatten)]`
+/// for backward compatibility — fields appear at the top level.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TsReportData {
-    /// Placeholder -- will hold ComponentSummary, ConstantGroup, etc.
-    /// when they move from core in Phase 5.
-    #[serde(default)]
-    pub _placeholder: (),
+    /// Discovered child/sibling components (e.g., ModalHeader added
+    /// alongside Modal being modified).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_components: Vec<ChildComponent>,
+
+    /// Expected direct children of this component, derived from LLM
+    /// hierarchy inference on the component family's source code.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_children: Vec<ExpectedChild>,
+}
+
+/// A child or sibling component discovered during TypeScript analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildComponent {
+    /// Component name (e.g., "ModalHeader").
+    pub name: String,
+    /// Whether this component was added or modified.
+    pub status: ChildComponentStatus,
+    /// Known members on this child component (from the new surface AST).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_members: Vec<String>,
+    /// Members that were removed from the parent and match members on this
+    /// child (by name). Populated from AST member comparison.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absorbed_members: Vec<String>,
+}
+
+/// Status of a child/sibling component.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildComponentStatus {
+    /// Newly added in the new version.
+    Added,
+    /// Existed before but was modified.
+    Modified,
 }
 
 // ── LanguageSemantics ───────────────────────────────────────────────────

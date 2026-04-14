@@ -35,6 +35,9 @@ pub mod symbol_data;
 // Re-export key types for convenience
 pub use extensions::TsAnalysisExtensions;
 pub use extract::OxcExtractor;
-pub use language::{TsCategory, TsEvidence, TsManifestChangeType, TsReportData, TypeScript};
+pub use language::{
+    ChildComponent, ChildComponentStatus, TsCategory, TsEvidence, TsManifestChangeType,
+    TsReportData, TypeScript,
+};
 pub use symbol_data::TsSymbolData;
 pub use worktree::{ExtractionWarning, WorktreeGuard};

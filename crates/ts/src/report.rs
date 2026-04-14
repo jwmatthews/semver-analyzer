@@ -14,13 +14,14 @@ use semver_analyzer_core::ApiSurface as CoreApiSurface;
 use semver_analyzer_core::Symbol as CoreSymbol;
 use semver_analyzer_core::{
     AddedExport, AnalysisMetadata, AnalysisReport, AnalysisResult, ApiChange, ApiChangeKind,
-    ApiChangeType, BehavioralChange, ChangeSubject, ChildComponent, ChildComponentStatus,
-    Comparison, ComponentStatus, ComponentSummary, ConstantGroup, ExpectedChild, FileChanges,
-    FileStatus, HierarchyDelta, InferredRenamePatterns, LlmApiChange, ManifestChange,
-    MemberSummary, MigratedMember, MigrationTarget, PackageChanges, RemovalDisposition,
-    RemovedMember, StructuralChange, StructuralChangeType, SuffixRename, Summary, SymbolKind,
-    TypeChange,
+    ApiChangeType, BehavioralChange, ChangeSubject, Comparison, ComponentStatus, ConstantGroup,
+    ExpectedChild, FileChanges, FileStatus, HierarchyDelta, InferredRenamePatterns, LlmApiChange,
+    ManifestChange, MemberSummary, MigratedMember, MigrationTarget, PackageChanges,
+    RemovalDisposition, RemovedMember, StructuralChange, StructuralChangeType, SuffixRename,
+    Summary, SymbolKind, TypeChange, TypeSummary,
 };
+
+use crate::language::{ChildComponent, ChildComponentStatus, TsReportData};
 
 use crate::TsSymbolData;
 
@@ -873,7 +874,7 @@ fn build_package_summaries(
             &removed_members,
         );
 
-        let summary = ComponentSummary {
+        let summary = TypeSummary {
             name: component_name.clone(),
             definition_name: definition_name.clone(),
             status,
@@ -889,8 +890,10 @@ fn build_package_summaries(
             type_changes,
             migration_target,
             behavioral_changes: component_behavioral,
-            child_components,
-            expected_children: Vec::new(),
+            language_data: TsReportData {
+                child_components,
+                expected_children: Vec::new(),
+            },
             source_files: source_file.into_iter().collect(),
         };
 
@@ -1277,7 +1280,7 @@ fn infer_prop_name_for_child(
 // ─── Hierarchy Delta Enrichment ──────────────────────────────────────────
 
 /// Enrich hierarchy deltas with prop migration data and populate
-/// `expected_children` on each `ComponentSummary`.
+/// `expected_children` on each `TypeSummary`.
 fn enrich_hierarchy_deltas(
     report: &mut AnalysisReport<TypeScript>,
     mut deltas: Vec<HierarchyDelta>,
@@ -1386,7 +1389,7 @@ fn enrich_hierarchy_deltas(
         }
     }
 
-    // Populate expected_children on ComponentSummary entries from the FULL
+    // Populate expected_children on TypeSummary entries from the FULL
     // new-version hierarchy.
     for (family, family_hierarchy) in new_hierarchies {
         for (comp_name, children) in family_hierarchy {
@@ -1402,8 +1405,13 @@ fn enrich_hierarchy_deltas(
                     if comp.name == *comp_name {
                         found = true;
                         for ec in &expected {
-                            if !comp.expected_children.iter().any(|e| e.name == ec.name) {
-                                comp.expected_children.push(ec.clone());
+                            if !comp
+                                .language_data
+                                .expected_children
+                                .iter()
+                                .any(|e| e.name == ec.name)
+                            {
+                                comp.language_data.expected_children.push(ec.clone());
                             }
                         }
                     }
@@ -1423,7 +1431,7 @@ fn enrich_hierarchy_deltas(
                     });
 
                 if let Some(idx) = target_idx {
-                    report.packages[idx].type_summaries.push(ComponentSummary {
+                    report.packages[idx].type_summaries.push(TypeSummary {
                         name: comp_name.clone(),
                         definition_name: format!("{}Props", comp_name),
                         status: ComponentStatus::Modified,
@@ -1432,8 +1440,10 @@ fn enrich_hierarchy_deltas(
                         type_changes: vec![],
                         migration_target: None,
                         behavioral_changes: vec![],
-                        child_components: vec![],
-                        expected_children: expected,
+                        language_data: TsReportData {
+                            child_components: vec![],
+                            expected_children: expected,
+                        },
                         source_files: vec![],
                     });
                 }
@@ -1469,8 +1479,11 @@ fn enrich_hierarchy_deltas(
         let mut comp_children: HashMap<String, Vec<ExpectedChild>> = HashMap::new();
         for pkg in &report.packages {
             for comp in &pkg.type_summaries {
-                if !comp.expected_children.is_empty() {
-                    comp_children.insert(comp.name.clone(), comp.expected_children.clone());
+                if !comp.language_data.expected_children.is_empty() {
+                    comp_children.insert(
+                        comp.name.clone(),
+                        comp.language_data.expected_children.clone(),
+                    );
                 }
             }
         }
@@ -1487,7 +1500,7 @@ fn enrich_hierarchy_deltas(
 
         for pkg in &report.packages {
             for comp in &pkg.type_summaries {
-                if !comp.expected_children.is_empty() {
+                if !comp.language_data.expected_children.is_empty() {
                     continue;
                 }
 
@@ -1558,8 +1571,13 @@ fn enrich_hierarchy_deltas(
                 for comp in &mut pkg.type_summaries {
                     if comp.name == comp_name {
                         for ec in &children {
-                            if !comp.expected_children.iter().any(|e| e.name == ec.name) {
-                                comp.expected_children.push(ec.clone());
+                            if !comp
+                                .language_data
+                                .expected_children
+                                .iter()
+                                .any(|e| e.name == ec.name)
+                            {
+                                comp.language_data.expected_children.push(ec.clone());
                             }
                         }
                     }
@@ -1591,7 +1609,7 @@ fn enrich_hierarchy_deltas(
 
         for pkg in &mut report.packages {
             for comp in &mut pkg.type_summaries {
-                if comp.expected_children.is_empty() {
+                if comp.language_data.expected_children.is_empty() {
                     continue;
                 }
 
@@ -1614,7 +1632,7 @@ fn enrich_hierarchy_deltas(
                     );
                 }
 
-                for child in &mut comp.expected_children {
+                for child in &mut comp.language_data.expected_children {
                     // Skip if prop_name already set
                     if child.prop_name.is_some() {
                         continue;
@@ -1679,7 +1697,7 @@ fn enrich_hierarchy_deltas(
     // - Removed symbols with no replacement
     {
         // Collect deprecated components that have migration_target
-        let mut deprecated_families: HashMap<String, Vec<&ComponentSummary<TypeScript>>> =
+        let mut deprecated_families: HashMap<String, Vec<&TypeSummary<TypeScript>>> =
             HashMap::new();
 
         for pkg in &report.packages {
@@ -1705,18 +1723,18 @@ fn enrich_hierarchy_deltas(
         }
 
         for (family, deprecated_comps) in &deprecated_families {
-            // Find the ComponentSummary that has expected_children for
+            // Find the TypeSummary that has expected_children for
             // the new composition structure. This is the main module's entry
             // (or the sole entry when deprecated inherits expected_children).
             let main_comp = report
                 .packages
                 .iter()
                 .flat_map(|pkg| &pkg.type_summaries)
-                .find(|c| c.name == *family && !c.expected_children.is_empty());
+                .find(|c| c.name == *family && !c.language_data.expected_children.is_empty());
 
             // Build added_children from the main module's expected_children
             let new_children: Vec<ExpectedChild> = main_comp
-                .map(|mc| mc.expected_children.clone())
+                .map(|mc| mc.language_data.expected_children.clone())
                 .unwrap_or_default();
 
             // Find the best migration_target (highest overlap) for the delta
@@ -1799,7 +1817,7 @@ fn enrich_hierarchy_deltas(
                     for pkg in report.packages.iter() {
                         for comp in &pkg.type_summaries {
                             if comp.name == name {
-                                for ec in &comp.expected_children {
+                                for ec in &comp.language_data.expected_children {
                                     queue.push(ec.name.clone());
                                 }
                             }
@@ -1876,7 +1894,7 @@ fn enrich_hierarchy_deltas(
         let mut bem_additions = 0usize;
         for pkg in &mut report.packages {
             for comp in &mut pkg.type_summaries {
-                if !comp.expected_children.is_empty() {
+                if !comp.language_data.expected_children.is_empty() {
                     continue;
                 }
 
@@ -1926,7 +1944,7 @@ fn enrich_hierarchy_deltas(
                         block_token = %block_token,
                         "BEM CSS fallback: inferred expected_children"
                     );
-                    comp.expected_children = children;
+                    comp.language_data.expected_children = children;
                     bem_additions += 1;
                 }
             }
@@ -3074,7 +3092,7 @@ mod tests {
     // ─── Deprecated→main hierarchy delta tests ───────────────────
 
     fn make_test_report(
-        type_summaries: Vec<ComponentSummary<TypeScript>>,
+        type_summaries: Vec<TypeSummary<TypeScript>>,
         file_changes: Vec<FileChanges<TypeScript>>,
     ) -> AnalysisReport<TypeScript> {
         AnalysisReport {
@@ -3118,7 +3136,7 @@ mod tests {
     #[test]
     fn deprecated_to_main_hierarchy_delta_created() {
         let mut report = make_test_report(
-            vec![ComponentSummary {
+            vec![TypeSummary {
                 name: "Dropdown".to_string(),
                 definition_name: "DropdownProps".to_string(),
                 status: ComponentStatus::Modified,
@@ -3159,11 +3177,13 @@ mod tests {
                     new_extends: None,
                 }),
                 behavioral_changes: vec![],
-                child_components: vec![],
-                expected_children: vec![
-                    ExpectedChild::new("DropdownList", true),
-                    ExpectedChild::new("DropdownGroup", false),
-                ],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![
+                        ExpectedChild::new("DropdownList", true),
+                        ExpectedChild::new("DropdownGroup", false),
+                    ],
+                },
                 source_files: vec![],
             }],
             vec![FileChanges {
@@ -3248,7 +3268,7 @@ mod tests {
     #[test]
     fn no_deprecated_delta_without_migration_target() {
         let mut report = make_test_report(
-            vec![ComponentSummary {
+            vec![TypeSummary {
                 name: "ApplicationLauncher".to_string(),
                 definition_name: "ApplicationLauncherProps".to_string(),
                 status: ComponentStatus::Removed,
@@ -3257,8 +3277,10 @@ mod tests {
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
-                child_components: vec![],
-                expected_children: vec![],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![],
+                },
                 source_files: vec![],
             }],
             vec![],
@@ -3285,7 +3307,7 @@ mod tests {
     #[test]
     fn deprecated_delta_has_migrated_members_from_props() {
         let mut report = make_test_report(
-            vec![ComponentSummary {
+            vec![TypeSummary {
                 name: "Dropdown".to_string(),
                 definition_name: "DropdownProps".to_string(),
                 status: ComponentStatus::Modified,
@@ -3312,8 +3334,10 @@ mod tests {
                     new_extends: None,
                 }),
                 behavioral_changes: vec![],
-                child_components: vec![],
-                expected_children: vec![ExpectedChild::new("DropdownList", true)],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![ExpectedChild::new("DropdownList", true)],
+                },
                 source_files: vec![],
             }],
             vec![],
@@ -3418,7 +3442,7 @@ mod tests {
         // Simulate the FormGroup scenario: LLM returned mechanism="prop"
         // but prop_name is None. After enrichment, it should be "labelHelp".
         let mut report = make_test_report(
-            vec![ComponentSummary {
+            vec![TypeSummary {
                 name: "FormGroup".to_string(),
                 definition_name: "FormGroupProps".to_string(),
                 status: ComponentStatus::Modified,
@@ -3427,16 +3451,18 @@ mod tests {
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
-                child_components: vec![],
-                expected_children: vec![
-                    ExpectedChild {
-                        name: "FormGroupLabelHelp".to_string(),
-                        required: false,
-                        mechanism: "prop".to_string(),
-                        prop_name: None, // Unknown — should be inferred
-                    },
-                    ExpectedChild::new("FormHelperText", false),
-                ],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![
+                        ExpectedChild {
+                            name: "FormGroupLabelHelp".to_string(),
+                            required: false,
+                            mechanism: "prop".to_string(),
+                            prop_name: None, // Unknown — should be inferred
+                        },
+                        ExpectedChild::new("FormHelperText", false),
+                    ],
+                },
                 source_files: vec![],
             }],
             vec![],
@@ -3530,6 +3556,7 @@ mod tests {
             .unwrap();
 
         let label_help = form_group
+            .language_data
             .expected_children
             .iter()
             .find(|c| c.name == "FormGroupLabelHelp")
@@ -3547,6 +3574,7 @@ mod tests {
 
         // FormHelperText should remain as direct child
         let helper_text = form_group
+            .language_data
             .expected_children
             .iter()
             .find(|c| c.name == "FormHelperText")
@@ -3560,7 +3588,7 @@ mod tests {
         // LLM said mechanism="child" but the Props interface proves it's
         // prop-passed (the parent has a slot prop matching the child name).
         let mut report = make_test_report(
-            vec![ComponentSummary {
+            vec![TypeSummary {
                 name: "FormGroup".to_string(),
                 definition_name: "FormGroupProps".to_string(),
                 status: ComponentStatus::Modified,
@@ -3569,13 +3597,15 @@ mod tests {
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
-                child_components: vec![],
-                expected_children: vec![ExpectedChild {
-                    name: "FormGroupLabelHelp".to_string(),
-                    required: false,
-                    mechanism: "child".to_string(), // LLM got this wrong
-                    prop_name: None,
-                }],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![ExpectedChild {
+                        name: "FormGroupLabelHelp".to_string(),
+                        required: false,
+                        mechanism: "child".to_string(), // LLM got this wrong
+                        prop_name: None,
+                    }],
+                },
                 source_files: vec![],
             }],
             vec![],
@@ -3633,6 +3663,7 @@ mod tests {
         enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
 
         let label_help = report.packages[0].type_summaries[0]
+            .language_data
             .expected_children
             .iter()
             .find(|c| c.name == "FormGroupLabelHelp")
@@ -3741,7 +3772,7 @@ mod tests {
         // If the prop exists but has type "string" (not a slot type),
         // it should NOT be inferred as prop_name.
         let mut report = make_test_report(
-            vec![ComponentSummary {
+            vec![TypeSummary {
                 name: "Modal".to_string(),
                 definition_name: "ModalProps".to_string(),
                 status: ComponentStatus::Modified,
@@ -3750,13 +3781,15 @@ mod tests {
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
-                child_components: vec![],
-                expected_children: vec![ExpectedChild {
-                    name: "ModalTitle".to_string(),
-                    required: false,
-                    mechanism: "child".to_string(),
-                    prop_name: None,
-                }],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![ExpectedChild {
+                        name: "ModalTitle".to_string(),
+                        required: false,
+                        mechanism: "child".to_string(),
+                        prop_name: None,
+                    }],
+                },
                 source_files: vec![],
             }],
             vec![],
@@ -3813,7 +3846,10 @@ mod tests {
         let new_hierarchies = HashMap::new();
         enrich_hierarchy_deltas(&mut report, vec![], &new_surface, &new_hierarchies);
 
-        let modal_title = report.packages[0].type_summaries[0].expected_children[0].clone();
+        let modal_title = report.packages[0].type_summaries[0]
+            .language_data
+            .expected_children[0]
+            .clone();
 
         assert_eq!(
             modal_title.mechanism, "child",
@@ -3832,7 +3868,7 @@ mod tests {
         // header/footer). The prop_name inference should only use the
         // main module, so ModalHeader stays as mechanism="child".
         let mut report = make_test_report(
-            vec![ComponentSummary {
+            vec![TypeSummary {
                 name: "Modal".to_string(),
                 definition_name: "ModalProps".to_string(),
                 status: ComponentStatus::Modified,
@@ -3848,22 +3884,24 @@ mod tests {
                 type_changes: vec![],
                 migration_target: None,
                 behavioral_changes: vec![],
-                child_components: vec![],
-                expected_children: vec![
-                    ExpectedChild {
-                        name: "ModalHeader".to_string(),
-                        required: false,
-                        mechanism: "child".to_string(), // LLM correctly said child
-                        prop_name: None,
-                    },
-                    ExpectedChild::new("ModalBody", false),
-                    ExpectedChild {
-                        name: "ModalFooter".to_string(),
-                        required: false,
-                        mechanism: "child".to_string(), // LLM correctly said child
-                        prop_name: None,
-                    },
-                ],
+                language_data: TsReportData {
+                    child_components: vec![],
+                    expected_children: vec![
+                        ExpectedChild {
+                            name: "ModalHeader".to_string(),
+                            required: false,
+                            mechanism: "child".to_string(), // LLM correctly said child
+                            prop_name: None,
+                        },
+                        ExpectedChild::new("ModalBody", false),
+                        ExpectedChild {
+                            name: "ModalFooter".to_string(),
+                            required: false,
+                            mechanism: "child".to_string(), // LLM correctly said child
+                            prop_name: None,
+                        },
+                    ],
+                },
                 source_files: vec![],
             }],
             vec![],
@@ -4003,6 +4041,7 @@ mod tests {
             .unwrap();
 
         let modal_header = modal
+            .language_data
             .expected_children
             .iter()
             .find(|c| c.name == "ModalHeader")
@@ -4017,6 +4056,7 @@ mod tests {
         );
 
         let modal_footer = modal
+            .language_data
             .expected_children
             .iter()
             .find(|c| c.name == "ModalFooter")
@@ -4032,6 +4072,7 @@ mod tests {
 
         // ModalBody should also remain as child
         let modal_body = modal
+            .language_data
             .expected_children
             .iter()
             .find(|c| c.name == "ModalBody")

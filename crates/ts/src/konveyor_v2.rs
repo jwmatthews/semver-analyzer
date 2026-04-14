@@ -2072,8 +2072,10 @@ pub fn generate_family_strategies(
                 .find(|comp| comp.name == tree.root);
 
             if let Some(comp) = type_summary {
-                let classifications =
-                    classify_removed_props(&comp.removed_members, &comp.child_components);
+                let classifications = classify_removed_props(
+                    &comp.removed_members,
+                    &comp.language_data.child_components,
+                );
                 for c in &classifications {
                     // Skip props already in prop_to_child (exact match)
                     if prop_to_child.contains_key(&c.name) {
