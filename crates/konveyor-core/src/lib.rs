@@ -26,6 +26,7 @@ use semver_analyzer_core::{ApiChange, ApiChangeKind, ApiChangeType, RemovalDispo
 pub use konveyor_core::rule::{
     dedup_conditions, extract_file_pattern_from_condition, extract_frontend_refs,
     FileContentFields, FrontendDependencyFields, FrontendPatternFields, FrontendReferencedFields,
+    JavaAnnotatedFields, JavaAnnotationElement, JavaDependencyFields, JavaReferencedFields,
     JsonFields, KonveyorCondition, KonveyorLink, KonveyorRule, KonveyorRuleset,
 };
 

@@ -48,16 +48,19 @@ async fn run(cli: Cli, reporter: &ProgressReporter) -> Result<()> {
     match cli.command {
         Command::Extract { language } => match language {
             ExtractLanguage::Typescript(args) => cmd_extract_ts(args, reporter)?,
+            ExtractLanguage::Java(args) => cmd_extract_java(args, reporter)?,
         },
 
         Command::Diff(args) => cmd_diff(args, reporter)?,
 
         Command::Analyze { language } => match language {
             AnalyzeLanguage::Typescript(args) => cmd_analyze_ts(args, reporter).await?,
+            AnalyzeLanguage::Java(args) => cmd_analyze_java(args, reporter).await?,
         },
 
         Command::Konveyor { language } => match language {
             KonveyorLanguage::Typescript(args) => cmd_konveyor_ts(args, reporter).await?,
+            KonveyorLanguage::Java(args) => cmd_konveyor_java(args, reporter).await?,
         },
 
         Command::Serve => {
@@ -805,6 +808,182 @@ fn count_change_types(structural_changes: &[StructuralChange]) -> ChangeTypeCoun
         }
     }
     counts
+}
+
+// ─── Output helpers ─────────────────────────────────────────────────────
+
+// ─── Extract command (Java) ─────────────────────────────────────────────
+
+fn cmd_extract_java(
+    args: semver_analyzer_java::cli::JavaExtractArgs,
+    reporter: &ProgressReporter,
+) -> Result<()> {
+    let _span =
+        info_span!("extract", repo = %args.common.repo.display(), git_ref = %args.common.git_ref)
+            .entered();
+    let common = &args.common;
+
+    let phase = reporter.start_phase(&format!(
+        "Extracting Java API surface from {} at ref {}",
+        common.repo.display(),
+        common.git_ref
+    ));
+
+    let java = semver_analyzer_java::Java;
+    let surface = java
+        .extract(&common.repo, &common.git_ref, None)
+        .context("Failed to extract Java API surface")?;
+
+    let sym_count = surface.symbols.len();
+    phase.finish_with_detail(
+        "Extracted Java API surface",
+        &format!("{} symbols", sym_count),
+    );
+    info!(symbols = sym_count, "java extraction complete");
+
+    write_json_output(&surface, common.output.as_deref(), reporter)?;
+    Ok(())
+}
+
+// ─── Analyze command (Java) ─────────────────────────────────────────────
+
+async fn cmd_analyze_java(
+    args: semver_analyzer_java::cli::JavaAnalyzeArgs,
+    reporter: &ProgressReporter,
+) -> Result<()> {
+    let common = &args.common;
+    let _span = info_span!(
+        "analyze",
+        repo = %common.repo.display(),
+        from = %common.from,
+        to = %common.to
+    )
+    .entered();
+
+    let java = semver_analyzer_java::Java;
+    let shared = semver_analyzer_core::shared::SharedFindings::<semver_analyzer_java::Java>::new();
+
+    // TD pipeline
+    let td_phase = reporter.start_phase("Extracting Java API surfaces");
+
+    let old_surface = java
+        .extract(&common.repo, &common.from, Some(shared.degradation()))
+        .context("Failed to extract old API surface")?;
+    let new_surface = java
+        .extract(&common.repo, &common.to, Some(shared.degradation()))
+        .context("Failed to extract new API surface")?;
+
+    td_phase.finish_with_detail(
+        "Extracted API surfaces",
+        &format!(
+            "old: {} symbols, new: {} symbols",
+            old_surface.symbols.len(),
+            new_surface.symbols.len()
+        ),
+    );
+
+    let diff_phase = reporter.start_phase("Diffing Java API surfaces");
+    let structural_changes =
+        semver_analyzer_core::traits::diff_surfaces_with_semantics(&old_surface, &new_surface, &java);
+
+    let breaking = structural_changes.iter().filter(|c| c.is_breaking).count();
+    diff_phase.finish_with_detail(
+        "Structural diff complete",
+        &format!(
+            "{} total changes, {} breaking",
+            structural_changes.len(),
+            breaking
+        ),
+    );
+
+    // Build report
+    let report_phase = reporter.start_phase("Building Java analysis report");
+
+    let results = semver_analyzer_core::AnalysisResult::<semver_analyzer_java::Java> {
+        old_surface: Arc::new(old_surface),
+        new_surface: Arc::new(new_surface),
+        structural_changes: Arc::new(structural_changes),
+        behavioral_changes: Vec::new(),
+        manifest_changes: Vec::new(),
+        llm_api_changes: Vec::new(),
+        inferred_rename_patterns: None,
+        container_changes: Vec::new(),
+        extensions: (),
+        degradation: shared.degradation_arc(),
+    };
+
+    let report =
+        semver_analyzer_java::Java::build_report(&results, &common.repo, &common.from, &common.to);
+
+    report_phase.finish_with_detail(
+        "Report built",
+        &format!("{} breaking changes", report.summary.total_breaking_changes),
+    );
+
+    // Output
+    let envelope = build_envelope(&report, &results.structural_changes)?;
+    write_json_output(&envelope, common.output.as_deref(), reporter)?;
+
+    // Print degradation summary
+    diagnostics::print_degradation_summary(shared.degradation(), reporter);
+
+    Ok(())
+}
+
+// ─── Konveyor command (Java) ────────────────────────────────────────────
+
+async fn cmd_konveyor_java(
+    args: semver_analyzer_java::cli::JavaKonveyorArgs,
+    reporter: &ProgressReporter,
+) -> Result<()> {
+    let common = &args.common;
+    let _span = info_span!("konveyor-java").entered();
+
+    let from_report = common
+        .from_report
+        .as_ref()
+        .context("--from-report is required for konveyor java (--repo mode not yet supported)")?;
+
+    let phase = reporter.start_phase("Loading Java analysis report");
+
+    let report_json = read_to_string(from_report)
+        .with_context(|| format!("Failed to read report from {}", from_report.display()))?;
+
+    let report: AnalysisReport<semver_analyzer_java::Java> = serde_json::from_str(&report_json)
+        .with_context(|| "Failed to parse Java analysis report")?;
+
+    phase.finish("Loaded report");
+
+    let gen_phase = reporter.start_phase("Generating Java Konveyor rules");
+
+    let rules = semver_analyzer_java::konveyor::generate_rules(&report);
+
+    gen_phase.finish_with_detail("Generated rules", &format!("{} rules", rules.len()));
+
+    // Write rules
+    let output_dir = &common.output_dir;
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("Failed to create output dir {}", output_dir.display()))?;
+
+    let ruleset = semver_analyzer_java::konveyor::ruleset(
+        &report.comparison.from_ref,
+        &report.comparison.to_ref,
+    );
+    let ruleset_yaml = serde_yaml::to_string(&ruleset)?;
+    let ruleset_path = output_dir.join("ruleset.yaml");
+    fs::write(&ruleset_path, &ruleset_yaml)?;
+
+    let rules_yaml = serde_yaml::to_string(&rules)?;
+    let rules_path = output_dir.join("rules.yaml");
+    fs::write(&rules_path, &rules_yaml)?;
+
+    reporter.println(&format!(
+        "Wrote {} rules to {}",
+        rules.len(),
+        output_dir.display()
+    ));
+
+    Ok(())
 }
 
 // ─── Output helpers ─────────────────────────────────────────────────────
