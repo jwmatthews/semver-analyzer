@@ -1209,6 +1209,107 @@ The suppression uses `extract_removed_union_values()` from
 type change like `ReactNode → string`), the main rule is emitted as a
 catch-all since no per-value discrimination is possible.
 
+#### Rule Precision and Scanner Discriminators (CRITICAL)
+
+**Every generated rule must be idempotent — it must NOT fire on code that
+is already correct.** The `FrontendReferencedFields` struct (defined in
+`konveyor-core/src/rule.rs`, re-exported through `crates/konveyor-core/`)
+provides discriminator fields to scope rules precisely. Use them to avoid
+false positives on already-migrated code.
+
+**Scanner discriminator fields:**
+
+| Field | Serde name | Semantic | Example use |
+|-------|-----------|----------|-------------|
+| `child` | `child` | Fire only when parent HAS this child | Detect old internal components still present |
+| `not_child` | `notChild` | Fire on each child NOT matching pattern | Exclusive wrapper ("all children must be X") |
+| `requires_child` | `requiresChild` | Fire when parent has NONE of this child | New-sibling / parent-must-contain-child |
+| `not_parent` | `notParent` | Fire when component NOT inside parent | Child-must-be-in-parent conformance |
+| `value` | `value` | Fire only on specific prop value | Removed union value (e.g., `variant="tertiary"`) |
+
+**Location selection:**
+
+| Location | Fires on | Use when |
+|----------|----------|----------|
+| `IMPORT` | Any file importing the symbol | Fully removed components/symbols — the import itself is the violation |
+| `JSX_COMPONENT` | Each JSX usage of the component | JSX-level transformations: adding children, changing structure |
+| `JSX_PROP` | Each usage of a specific prop | Removed or renamed props — only fires when the prop is actually used |
+| `FUNCTION_CALL` | Each call to a function | Removed/changed function signatures |
+| `TYPE_REFERENCE` | Each type reference | Removed/renamed type aliases |
+
+**Rules for rule generation:**
+
+1. **New-sibling rules** (child absorbs parent's removed props): Use
+   `location: JSX_COMPONENT` + `requires_child: ^ChildName$`. Fires only
+   when the parent is used in JSX without the required new child. Silent
+   on already-migrated code.
+
+2. **Removed-prop rules**: Use `location: JSX_PROP` with the removed prop
+   name as `pattern`. Fires only when the deprecated prop is actually used.
+
+3. **Removed-value rules**: Use `location: JSX_PROP` + `value` discriminator.
+   Fires only on the specific deprecated value, not all usages of the prop.
+
+4. **Conformance rules** (`notParent`, `requiresChild`): Use
+   `location: JSX_COMPONENT` with the appropriate structural discriminator.
+
+**Never** use `location: IMPORT` for rules that can be satisfied by a
+JSX-level transformation (adding a child, removing a prop, changing a value).
+Import-level rules fire on every file that imports the component, creating
+false positives on files that have already been migrated.
+
+Key files:
+- Struct definition: `konveyor-core/src/rule.rs` (`FrontendReferencedFields`)
+- New-sibling rule generation: `crates/ts/src/konveyor.rs` (search "new sibling")
+- Conformance rule generation: `crates/ts/src/konveyor_v2.rs`
+  (`generate_conformance_rules`)
+
+#### Cross-Family Absorption Enrichment
+
+`discover_child_components()` in `crates/ts/src/report.rs` uses name-prefix
+matching (`name.starts_with(component_name)`) to assign new child components
+to parents. This fails when a child's name starts with the family root but
+it absorbs props from an intermediate family member.
+
+**Example:** `MastheadLogo` starts with `"Masthead"` so it gets assigned to
+`Masthead` (the root). But `MastheadBrand.component` was removed and
+`MastheadLogo.component` was added — the absorption belongs to MastheadBrand.
+Checking against Masthead's removed props (`backgroundColor`) finds 0 matches,
+and the new-sibling rule is skipped as "optional."
+
+**Solution:** `enrich_cross_family_absorption()` runs as a post-processing
+pass after all TypeSummaries are built (called right before
+`package_map.into_values().collect()` in `build_package_summaries()`).
+
+Algorithm:
+1. Group TypeSummaries by family directory (parent of `source_files` path)
+2. For each family with >1 members, build a map of removed members across
+   ALL family members
+3. For each new child with empty `absorbed_members`, cross-check its
+   `known_members` against all family members' removed props (skipping
+   ubiquitous props `children` and `className`)
+4. When cross-family absorption is found, move the child to the correct
+   parent's `child_components` and update `absorbed_members`
+
+This causes the rule generator to emit a mandatory new-sibling rule instead
+of skipping the child as "optional."
+
+Key file: `crates/ts/src/report.rs` (`enrich_cross_family_absorption`)
+Tests: `cross_family_absorption_*` in `report::tests`
+
+#### Family Strategy `new_imports` Scope
+
+The `new_imports` field in family migration strategies must include ALL new
+family members that consumers need to import, not just direct children of the
+root. Consumers must import `MastheadLogo` even though it's a grandchild of
+the root (`Masthead → MastheadMain → MastheadBrand → MastheadLogo`).
+
+The computation uses `tree.family_members` (all members at any depth) filtered
+to those not present in the old tree, rather than `new_children` (only root's
+direct edges).
+
+Key file: `crates/ts/src/konveyor_v2.rs` (search "New imports")
+
 ### Testing
 
 ```sh

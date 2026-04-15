@@ -2488,7 +2488,11 @@ pub fn generate_rules(
                             when: KonveyorCondition::FrontendReferenced {
                                 referenced: FrontendReferencedFields {
                                     pattern: format!("^{}$", regex_escape(component_name)),
-                                    location: "IMPORT".to_string(),
+                                    // Use JSX_COMPONENT + requiresChild so the rule
+                                    // only fires when the parent is used in JSX but
+                                    // does NOT already have the new child. Silent on
+                                    // already-migrated code.
+                                    location: "JSX_COMPONENT".to_string(),
                                     component: None,
                                     parent: None,
                                     value: None,
@@ -2498,7 +2502,10 @@ pub fn generate_rules(
                                     not_parent: None,
                                     child: None,
                                     not_child: None,
-                                    requires_child: None,
+                                    requires_child: Some(format!(
+                                        "^{}$",
+                                        regex_escape(new_component)
+                                    )),
                                 },
                             },
                             fix_strategy: Some(FixStrategyEntry::new("LlmAssisted")),

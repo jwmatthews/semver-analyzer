@@ -2009,14 +2009,15 @@ pub fn generate_family_strategies(
         // 5. Removed children (in old tree but not new)
         let removed_children: Vec<String> = removed_members.iter().map(|m| m.to_string()).collect();
 
-        // 6. New imports: child components that consumers need to import
-        let new_imports: Vec<String> = new_children
+        // 6. New imports: ALL family members that consumers need to import
+        // (at any depth, not just direct children of root). Consumers must
+        // import MastheadLogo even though it's a grandchild of the root
+        // (MastheadBrand -> MastheadLogo).
+        let new_imports: Vec<String> = tree
+            .family_members
             .iter()
-            .filter(|&&child| {
-                // Only include children that didn't exist in the old tree
-                !old_members.contains(child)
-            })
-            .map(|c| c.to_string())
+            .filter(|member| member.as_str() != tree.root && !old_members.contains(member.as_str()))
+            .cloned()
             .collect();
 
         // 7. Removed imports: old children no longer in the family
