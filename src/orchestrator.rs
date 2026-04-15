@@ -2267,7 +2267,30 @@ fn detect_dep_repo_packages(
             // Parse name and version from package.json
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 let name = json["name"].as_str().unwrap_or_default();
-                let version = json["version"].as_str().unwrap_or_default();
+                let mut version = json["version"].as_str().unwrap_or_default().to_string();
+
+                // Many repos use placeholder versions like "0.0.0-development"
+                // in source; the real version is set during npm publish. Fall
+                // back to deriving the version from the git tag (e.g.,
+                // "v6.4.0" → "6.4.0").
+                if version.starts_with("0.0.0") {
+                    let tag_version = to_ref.trim_start_matches('v');
+                    if !tag_version.is_empty()
+                        && tag_version
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_digit())
+                    {
+                        tracing::info!(
+                            package = %name,
+                            placeholder = %version,
+                            derived = %tag_version,
+                            "Package.json has placeholder version, using git tag"
+                        );
+                        version = tag_version.to_string();
+                    }
+                }
+
                 if !name.is_empty() && !version.is_empty() {
                     tracing::info!(
                         package = %name,
@@ -2275,7 +2298,7 @@ fn detect_dep_repo_packages(
                         "Detected dep-repo package"
                     );
                     let mut map = std::collections::HashMap::new();
-                    map.insert(name.to_string(), version.to_string());
+                    map.insert(name.to_string(), version);
                     return map;
                 }
             }
