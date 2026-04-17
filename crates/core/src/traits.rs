@@ -843,7 +843,9 @@ pub trait Language:
     /// This is where language-specific cross-pipeline processing happens.
     /// For TypeScript, this runs deprecated replacement detection (requires
     /// both TD structural changes and SD source-level changes) and transforms
-    /// structural changes accordingly.
+    /// structural changes accordingly. The `repo`/`from_ref`/`to_ref` params
+    /// enable git-based analysis (e.g., commit co-change analysis for
+    /// deprecated replacement detection).
     ///
     /// Returns the (potentially modified) structural changes.
     /// Default implementation is a no-op.
@@ -851,6 +853,9 @@ pub trait Language:
         &self,
         _extensions: &mut Self::AnalysisExtensions,
         structural_changes: Arc<Vec<StructuralChange>>,
+        _repo: &Path,
+        _from_ref: &str,
+        _to_ref: &str,
     ) -> Arc<Vec<StructuralChange>> {
         structural_changes
     }

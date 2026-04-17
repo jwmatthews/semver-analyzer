@@ -709,22 +709,43 @@ impl Language for TypeScript {
         &self,
         extensions: &mut Self::AnalysisExtensions,
         structural_changes: Arc<Vec<StructuralChange>>,
+        repo: &std::path::Path,
+        from_ref: &str,
+        to_ref: &str,
     ) -> Arc<Vec<StructuralChange>> {
         let sd = match extensions.sd_result.as_mut() {
             Some(sd) => sd,
             None => return structural_changes,
         };
 
-        // Deprecated replacement detection via rendering swaps
-        let deprecated_replacements =
+        // Step 1: Deprecated replacement detection via rendering swaps (primary)
+        let mut deprecated_replacements =
             crate::deprecated_replacements::detect_deprecated_replacements(&structural_changes, sd);
+
+        // Step 2: Commit co-change fallback (for components not detected by rendering swap)
+        let already_detected: std::collections::HashSet<&str> = deprecated_replacements
+            .iter()
+            .map(|r| r.old_component.as_str())
+            .collect();
+        let commit_replacements =
+            crate::deprecated_replacements::detect_deprecated_replacements_from_commits(
+                repo,
+                from_ref,
+                to_ref,
+                &structural_changes,
+                &already_detected,
+            );
+        deprecated_replacements.extend(commit_replacements);
+
+        // Log all detected replacements
         if !deprecated_replacements.is_empty() {
             for dr in &deprecated_replacements {
                 tracing::info!(
                     old = %dr.old_component,
                     new = %dr.new_component,
+                    source = ?dr.evidence_source,
                     evidence = ?dr.evidence_hosts,
-                    "Deprecated replacement detected via rendering swap"
+                    "Deprecated replacement detected"
                 );
             }
             sd.deprecated_replacements = deprecated_replacements;

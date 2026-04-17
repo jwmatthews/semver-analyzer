@@ -118,6 +118,228 @@ pub fn git_diff_file(repo: &Path, from_ref: &str, to_ref: &str, file_path: &str)
     }
 }
 
+// ── Deprecation commit co-change analysis ────────────────────────────
+
+/// A commit that added files to a deprecated component directory.
+#[derive(Debug, Clone)]
+pub struct DeprecationCommit {
+    /// Short commit SHA.
+    pub sha: String,
+    /// The deprecated component name extracted from the path
+    /// (e.g., "Tile" from `deprecated/components/Tile/Tile.tsx`).
+    pub component: String,
+}
+
+/// Find commits between `from_ref` and `to_ref` that added files to
+/// `deprecated/components/` directories (i.e., commits that deprecated
+/// a component).
+///
+/// Runs `git log --diff-filter=A` to find commits that added `.tsx`/`.ts`
+/// source files to deprecated component directories. Returns a list of
+/// `(sha, component_name)` pairs.
+///
+/// Returns an empty vec on any git failure (shallow clone, invalid refs, etc.).
+pub fn find_deprecation_commits(
+    repo: &Path,
+    from_ref: &str,
+    to_ref: &str,
+) -> Vec<DeprecationCommit> {
+    // Use git log with --diff-filter=A to find commits that ADDED files
+    // to deprecated component directories. The --name-only flag gives us
+    // the file paths so we can extract the component name.
+    let output = Command::new("git")
+        .args([
+            "log",
+            "--diff-filter=A",
+            "--name-only",
+            "--pretty=format:%h",
+            &format!("{}..{}", from_ref, to_ref),
+            "--",
+            "*/deprecated/components/*/[A-Z]*.tsx",
+            "*/deprecated/components/*/[A-Z]*.ts",
+        ])
+        .current_dir(repo)
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::debug!(
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "git log for deprecation commits returned non-zero"
+            );
+            return vec![];
+        }
+        Err(e) => {
+            tracing::debug!(%e, "Failed to run git log for deprecation commits");
+            return vec![];
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut result = Vec::new();
+    let mut current_sha = String::new();
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Lines that don't contain '/' are commit SHAs from --pretty=format:%h
+        if !line.contains('/') {
+            current_sha = line.to_string();
+            continue;
+        }
+
+        // File path line — extract the component name from
+        // "*/deprecated/components/<ComponentName>/<file>"
+        if current_sha.is_empty() {
+            continue;
+        }
+
+        if let Some(component) = extract_component_from_deprecated_path(line) {
+            // Avoid duplicates: same commit may add multiple files for one component
+            if !result
+                .iter()
+                .any(|dc: &DeprecationCommit| dc.sha == current_sha && dc.component == component)
+            {
+                result.push(DeprecationCommit {
+                    sha: current_sha.clone(),
+                    component,
+                });
+            }
+        }
+    }
+
+    result
+}
+
+/// Extract a component name from a deprecated component file path.
+///
+/// Looks for the pattern `deprecated/components/<Name>/` and returns `<Name>`.
+/// Returns `None` if the path doesn't match the expected pattern.
+fn extract_component_from_deprecated_path(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if *part == "deprecated" && i + 2 < parts.len() && parts[i + 1] == "components" {
+            return Some(parts[i + 2].to_string());
+        }
+    }
+    None
+}
+
+/// Find component families whose source files were modified in the given commit.
+///
+/// Runs `git show --name-status --diff-filter=AM` to find Added or Modified files.
+/// Filters to source files (`.tsx`/`.ts`) in non-deprecated `components/` directories,
+/// excluding index files, tests, examples, docs, snapshots, and CSS.
+///
+/// Returns a deduplicated list of component family names (e.g., `["Card"]`).
+/// The `deprecated_family` parameter is excluded from results (to avoid
+/// self-matches), as are same-name families (already handled by Phase A.5).
+pub fn commit_co_changed_families(
+    repo: &Path,
+    commit_sha: &str,
+    deprecated_family: &str,
+) -> Vec<String> {
+    let output = Command::new("git")
+        .args([
+            "show",
+            "--name-only",
+            "--diff-filter=AM",
+            "--pretty=format:",
+            commit_sha,
+        ])
+        .current_dir(repo)
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::debug!(
+                sha = commit_sha,
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "git show for commit co-change returned non-zero"
+            );
+            return vec![];
+        }
+        Err(e) => {
+            tracing::debug!(%e, sha = commit_sha, "Failed to run git show for co-change");
+            return vec![];
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut families = std::collections::HashSet::new();
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Must be in a non-deprecated components/ directory
+        if !line.contains("/components/") || line.contains("/deprecated/") {
+            continue;
+        }
+
+        // Must be a source file (.tsx or .ts)
+        if !line.ends_with(".tsx") && !line.ends_with(".ts") {
+            continue;
+        }
+
+        // Exclude non-source files
+        if line.contains("/examples/")
+            || line.contains("/__tests__/")
+            || line.contains("__snapshots__")
+            || line.ends_with(".test.tsx")
+            || line.ends_with(".test.ts")
+            || line.ends_with(".spec.tsx")
+            || line.ends_with(".spec.ts")
+            || line.ends_with(".css")
+            || line.ends_with(".md")
+            || line.ends_with(".snap")
+        {
+            continue;
+        }
+
+        // Exclude index/barrel files
+        let filename = line.rsplit('/').next().unwrap_or("");
+        if filename == "index.ts" || filename == "index.tsx" {
+            continue;
+        }
+
+        // Extract the component family name from the path:
+        // "packages/.../components/<FamilyName>/FileName.tsx" → "FamilyName"
+        if let Some(family) = extract_family_from_components_path(line) {
+            // Exclude the deprecated family itself and same-name families
+            if family != deprecated_family {
+                families.insert(family);
+            }
+        }
+    }
+
+    families.into_iter().collect()
+}
+
+/// Extract a component family name from a non-deprecated components path.
+///
+/// Looks for the pattern `components/<Name>/` and returns `<Name>`.
+fn extract_family_from_components_path(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if *part == "components" && i + 1 < parts.len() {
+            // Make sure this isn't under deprecated/
+            if i > 0 && parts[i - 1] == "deprecated" {
+                continue;
+            }
+            return Some(parts[i + 1].to_string());
+        }
+    }
+    None
+}
+
 // ── Ref name utilities ───────────────────────────────────────────────
 
 /// Sanitize a git ref name for use as a directory name.
@@ -463,5 +685,66 @@ mod tests {
         let path_a = worktree_path_for(repo_a, "v1.0.0");
         let path_b = worktree_path_for(repo_b, "v1.0.0");
         assert_ne!(path_a, path_b);
+    }
+
+    // ── Deprecation commit co-change analysis tests ─────────────────
+
+    #[test]
+    fn extract_component_from_deprecated_path_standard() {
+        assert_eq!(
+            extract_component_from_deprecated_path(
+                "packages/react-core/src/deprecated/components/Tile/Tile.tsx"
+            ),
+            Some("Tile".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_component_from_deprecated_path_nested() {
+        assert_eq!(
+            extract_component_from_deprecated_path(
+                "packages/react-core/src/deprecated/components/Modal/ModalBox.tsx"
+            ),
+            Some("Modal".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_component_from_deprecated_path_non_deprecated() {
+        assert_eq!(
+            extract_component_from_deprecated_path(
+                "packages/react-core/src/components/Card/Card.tsx"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_family_from_components_path_standard() {
+        assert_eq!(
+            extract_family_from_components_path(
+                "packages/react-core/src/components/Card/CardHeader.tsx"
+            ),
+            Some("Card".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_family_from_components_path_excludes_deprecated() {
+        // Should not match deprecated/components paths
+        assert_eq!(
+            extract_family_from_components_path(
+                "packages/react-core/src/deprecated/components/Tile/Tile.tsx"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_family_from_components_path_no_match() {
+        assert_eq!(
+            extract_family_from_components_path("packages/react-core/src/helpers/util.ts"),
+            None
+        );
     }
 }

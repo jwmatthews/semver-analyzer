@@ -1155,33 +1155,69 @@ Regression test:
 ### Deprecated Replacement Detection
 
 When a component is relocated to `/deprecated/` AND a differently-named
-component replaces it (e.g., `Chip` → `Label`), the standard rename detector
-cannot find the relationship because:
+component replaces it (e.g., `Chip` → `Label`, `Tile` → `Card`), the standard
+rename detector cannot find the relationship because:
 
-1. `Label` already exists in both v5 and v6 (never enters the "added" pool)
-2. Relocation detection claims `Chip` before rename detection runs
-3. "Chip" and "Label" have zero lexical similarity (LCS = 0)
+1. `Label`/`Card` already exist in both v5 and v6 (never enter the "added" pool)
+2. Relocation detection claims `Chip`/`Tile` before rename detection runs
+3. "Chip" and "Label" (or "Tile" and "Card") have zero lexical similarity
 
-The **deprecated replacement detection** step in `src/orchestrator.rs` solves
-this by using **rendering swap** signals from the SD pipeline. After both TD and
-SD pipelines complete but before the report is assembled:
+The deprecated replacement detection uses **two strategies** in sequence,
+running in `finalize_extensions` after both TD and SD pipelines complete:
 
-1. `detect_deprecated_replacements()` finds relocated components where host
-   components stopped rendering the old component and started rendering a new
-   one (e.g., ToolbarFilter stopped rendering `Chip`, started rendering `Label`)
-2. `apply_deprecated_replacements()` transforms the structural changes:
-   - Relocation entries → `Changed` with `before="Chip"`, `after="Label"`
-   - Props relocations → `Changed` with `before="ChipProps"`, `after="LabelProps"`
-   - Suppresses redundant signature-changed entries (base class change)
-   - Preserves non-replaced relocations (Modal, Tile, etc.) unchanged
+#### Strategy 1: Rendering Swap (Primary)
 
-The detection filters out Fragment, React.Fragment, other relocated components,
-and uses a Group-suffix tiebreaker when candidates have equal host evidence.
+`detect_deprecated_replacements()` scans SD source-level changes for host
+components that stopped rendering the deprecated component and started
+rendering a new one (e.g., ToolbarFilter stopped rendering `Chip`, started
+rendering `Label`).
 
-Key type: `DeprecatedReplacement` in `crates/core/src/types/sd.rs`
-Key functions: `detect_deprecated_replacements()`, `apply_deprecated_replacements()`
-  in `src/orchestrator.rs`
-Tests: `deprecated_replacement_tests` module in `src/orchestrator.rs` (15 tests)
+- Filters out Fragment, React.Fragment, other relocated components
+- Uses a Group-suffix tiebreaker when candidates have equal host evidence
+- Sets `evidence_source: ReplacementEvidence::RenderingSwap`
+- **Works for**: Chip → Label (detected via ToolbarFilter, MultiTypeaheadSelect)
+- **Fails for**: Tile → Card (no PF component internally renders `<Tile>`)
+
+#### Strategy 2: Commit Co-Change (Fallback)
+
+`detect_deprecated_replacements_from_commits()` runs only for relocated
+components **not already detected** by Strategy 1. It analyzes the git
+commits that deprecated each component to find which other component
+families had source files modified in the same commit.
+
+**Algorithm:**
+1. Find commits between `from_ref` and `to_ref` that added files to
+   `deprecated/components/` directories
+2. For each deprecation commit, identify which non-deprecated component
+   families had source files (`.tsx`/`.ts`, not examples/tests/docs/index)
+   modified in the same commit
+3. **Conservative rule**: only accept single-candidate results
+   - Exactly 1 candidate → replacement detected
+   - Multiple candidates → skip (ambiguous, log at debug level)
+   - 0 candidates → skip (no co-change signal)
+4. Sets `evidence_source: ReplacementEvidence::CommitCoChange`
+- **Works for**: Tile → Card (the Tile deprecation commit `548cd3474` also
+  modified `Card/CardHeader.tsx` — Card is the only co-changed family)
+- **Correctly skips**: DragDrop (no source file co-changes in other families)
+- **Not needed for**: Chip (already caught by Strategy 1)
+
+#### Transformation
+
+`apply_deprecated_replacements()` transforms the structural changes from
+both strategies identically:
+- Relocation entries → `Changed` with `before="Chip"`, `after="Label"`
+- Props relocations → `Changed` with `before="ChipProps"`, `after="LabelProps"`
+- Suppresses redundant signature-changed entries (base class change)
+- Preserves non-replaced relocations (Modal, DualListSelector, etc.) unchanged
+
+Key type: `DeprecatedReplacement` in `crates/ts/src/sd_types.rs`
+Key enum: `ReplacementEvidence` (`RenderingSwap` | `CommitCoChange`)
+Key functions: `detect_deprecated_replacements()`,
+  `detect_deprecated_replacements_from_commits()`,
+  `apply_deprecated_replacements()` in `crates/ts/src/deprecated_replacements.rs`
+Git utilities: `find_deprecation_commits()`, `commit_co_changed_families()`
+  in `crates/core/src/git.rs`
+Tests: `deprecated_replacements::tests` module (18 tests + 1 integration test)
 
 ### Konveyor Rules
 

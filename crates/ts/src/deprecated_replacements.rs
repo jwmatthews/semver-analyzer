@@ -3,10 +3,21 @@
 //! Moved from `src/orchestrator.rs` during genericization (Phase 2).
 //! These functions are TypeScript/React-specific because they analyze
 //! `SourceLevelCategory::RenderedComponent` changes from the SD pipeline.
+//!
+//! Two detection strategies are used:
+//! 1. **Rendering swap** (primary): Host components that stopped rendering
+//!    the deprecated component and started rendering the replacement
+//!    (e.g., ToolbarFilter switched from Chip to Label).
+//! 2. **Commit co-change** (fallback): The git commit that deprecated a
+//!    component also modified source files in the replacement component's
+//!    directory (e.g., the Tile deprecation commit modified Card/CardHeader.tsx).
 
-use crate::sd_types::{DeprecatedReplacement, SdPipelineResult, SourceLevelCategory};
+use crate::sd_types::{
+    DeprecatedReplacement, ReplacementEvidence, SdPipelineResult, SourceLevelCategory,
+};
 use semver_analyzer_core::{ChangeSubject, StructuralChange, StructuralChangeType, SymbolKind};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -119,6 +130,7 @@ pub fn detect_deprecated_replacements(
                 old_component: old_comp.clone(),
                 new_component: best_replacement,
                 evidence_hosts: hosts,
+                evidence_source: ReplacementEvidence::RenderingSwap,
             });
         }
     }
@@ -226,6 +238,134 @@ pub fn apply_deprecated_replacements(
     }
 
     Arc::new(result)
+}
+
+/// Detect deprecated replacements via git commit co-change analysis.
+///
+/// This is a **fallback** strategy that runs only for relocated components
+/// not already detected by the rendering swap method. It analyzes the git
+/// commits that deprecated each component to find which other component
+/// families had source files modified in the same commit.
+///
+/// **Algorithm:**
+/// 1. Collect relocated-to-deprecated component names from structural changes
+/// 2. Filter out components already detected by rendering swap
+/// 3. For each remaining component, find the commit(s) that deprecated it
+/// 4. For each deprecation commit, find co-changed component families
+/// 5. If exactly 1 candidate family → create a `DeprecatedReplacement`
+/// 6. If multiple candidates → log at debug level, skip (conservative)
+/// 7. If 0 candidates → skip
+///
+/// **Example:** The commit that deprecated Tile (`548cd3474`) also modified
+/// `Card/CardHeader.tsx`. Card is the only non-self family with source file
+/// changes → `Tile → Card` replacement detected.
+pub fn detect_deprecated_replacements_from_commits(
+    repo: &Path,
+    from_ref: &str,
+    to_ref: &str,
+    structural_changes: &[StructuralChange],
+    already_detected: &HashSet<&str>,
+) -> Vec<DeprecatedReplacement> {
+    use semver_analyzer_core::git::{commit_co_changed_families, find_deprecation_commits};
+
+    // Step 1: Collect component names that were relocated to deprecated.
+    let relocated_components: HashSet<String> = structural_changes
+        .iter()
+        .filter(|sc| matches!(sc.change_type, StructuralChangeType::Relocated { .. }))
+        .filter(|sc| sc.description.contains("moved to deprecated"))
+        .filter(|sc| matches!(sc.kind, SymbolKind::Variable | SymbolKind::Constant))
+        .map(|sc| sc.symbol.clone())
+        .collect();
+
+    if relocated_components.is_empty() {
+        return vec![];
+    }
+
+    // Step 2: Filter out already-detected components (rendering swap found them)
+    let undetected: Vec<&str> = relocated_components
+        .iter()
+        .filter(|name| !already_detected.contains(name.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+
+    if undetected.is_empty() {
+        debug!("All relocated components already have rendering swap replacements");
+        return vec![];
+    }
+
+    // Step 3: Find deprecation commits in the git history
+    let deprecation_commits = find_deprecation_commits(repo, from_ref, to_ref);
+    if deprecation_commits.is_empty() {
+        debug!("No deprecation commits found between {from_ref} and {to_ref}");
+        return vec![];
+    }
+
+    let mut replacements = Vec::new();
+
+    // Step 4: For each undetected component, find co-changed families
+    for comp_name in &undetected {
+        // Find commits that deprecated this component
+        let relevant_commits: Vec<_> = deprecation_commits
+            .iter()
+            .filter(|dc| dc.component == *comp_name)
+            .collect();
+
+        if relevant_commits.is_empty() {
+            debug!(
+                component = comp_name,
+                "No deprecation commit found for component"
+            );
+            continue;
+        }
+
+        // Collect co-changed families across all deprecation commits for this component
+        let mut all_candidates: HashSet<String> = HashSet::new();
+        let mut commit_shas: Vec<String> = Vec::new();
+
+        for dc in &relevant_commits {
+            let families = commit_co_changed_families(repo, &dc.sha, comp_name);
+            for family in families {
+                all_candidates.insert(family);
+            }
+            commit_shas.push(dc.sha.clone());
+        }
+
+        // Step 5: Conservative: only accept single-candidate results
+        match all_candidates.len() {
+            0 => {
+                debug!(
+                    component = comp_name,
+                    commits = ?commit_shas,
+                    "No co-changed component families found in deprecation commit(s)"
+                );
+            }
+            1 => {
+                let replacement = all_candidates.into_iter().next().unwrap();
+                debug!(
+                    old = comp_name,
+                    new = %replacement,
+                    commits = ?commit_shas,
+                    "Deprecated replacement detected via commit co-change"
+                );
+                replacements.push(DeprecatedReplacement {
+                    old_component: comp_name.to_string(),
+                    new_component: replacement,
+                    evidence_hosts: commit_shas,
+                    evidence_source: ReplacementEvidence::CommitCoChange,
+                });
+            }
+            n => {
+                debug!(
+                    component = comp_name,
+                    candidates = ?all_candidates,
+                    count = n,
+                    "Multiple co-changed families found — skipping (ambiguous)"
+                );
+            }
+        }
+    }
+
+    replacements
 }
 
 #[cfg(test)]
@@ -598,6 +738,7 @@ mod tests {
             old_component: "Chip".to_string(),
             new_component: "Label".to_string(),
             evidence_hosts: vec!["ToolbarFilter".to_string()],
+            evidence_source: ReplacementEvidence::RenderingSwap,
         }];
 
         let result = apply_deprecated_replacements(changes, &replacements);
@@ -652,6 +793,7 @@ mod tests {
             old_component: "Chip".to_string(),
             new_component: "Label".to_string(),
             evidence_hosts: vec!["ToolbarFilter".to_string()],
+            evidence_source: ReplacementEvidence::RenderingSwap,
         }];
 
         let result = apply_deprecated_replacements(changes, &replacements);
@@ -686,6 +828,7 @@ mod tests {
             old_component: "Chip".to_string(),
             new_component: "Label".to_string(),
             evidence_hosts: vec!["ToolbarFilter".to_string()],
+            evidence_source: ReplacementEvidence::RenderingSwap,
         }];
 
         let result = apply_deprecated_replacements(changes, &replacements);
@@ -802,6 +945,137 @@ mod tests {
         assert!(
             sig_changed.is_empty(),
             "Signature-changed entries for replaced Props should be suppressed"
+        );
+    }
+
+    // ── Commit co-change detection tests ────────────────────────────
+
+    #[test]
+    fn test_commit_cochange_skips_already_detected() {
+        // If all relocated components are already detected via rendering swap,
+        // the commit co-change analysis should return empty.
+        let structural_changes = vec![relocated_component("Chip"), relocated_component("Tile")];
+
+        let already_detected: HashSet<&str> = ["Chip", "Tile"].iter().copied().collect();
+
+        let result = detect_deprecated_replacements_from_commits(
+            std::path::Path::new("/nonexistent"),
+            "v5",
+            "v6",
+            &structural_changes,
+            &already_detected,
+        );
+
+        assert!(
+            result.is_empty(),
+            "Should skip all components already detected"
+        );
+    }
+
+    #[test]
+    fn test_commit_cochange_empty_when_no_relocations() {
+        // No relocated components → should return empty immediately
+        let structural_changes = vec![StructuralChange {
+            symbol: "SomeProps".to_string(),
+            qualified_name: "pkg/SomeProps".to_string(),
+            kind: SymbolKind::Interface,
+            package: None,
+            change_type: StructuralChangeType::Changed(ChangeSubject::Symbol {
+                kind: SymbolKind::Interface,
+            }),
+            before: Some("OldType".to_string()),
+            after: Some("NewType".to_string()),
+            description: "type changed".to_string(),
+            is_breaking: true,
+            impact: None,
+            migration_target: None,
+        }];
+
+        let already_detected: HashSet<&str> = HashSet::new();
+
+        let result = detect_deprecated_replacements_from_commits(
+            std::path::Path::new("/nonexistent"),
+            "v5",
+            "v6",
+            &structural_changes,
+            &already_detected,
+        );
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_rendering_swap_sets_evidence_source() {
+        let structural_changes = vec![relocated_component("OldWidget")];
+
+        let sd = make_sd(vec![
+            stopped_rendering("Dashboard", "OldWidget"),
+            started_rendering("Dashboard", "NewWidget"),
+        ]);
+
+        let result = detect_deprecated_replacements(&structural_changes, &sd);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].evidence_source,
+            ReplacementEvidence::RenderingSwap
+        );
+    }
+
+    /// Integration test: verify Tile → Card detection via commit co-change
+    /// using the real PatternFly React repository.
+    ///
+    /// Requires the PF repo at `/tmp/semver-pipeline-v2/repos/patternfly-react`.
+    #[test]
+    #[ignore]
+    fn test_tile_detected_via_commit_cochange_integration() {
+        let repo = std::path::Path::new("/tmp/semver-pipeline-v2/repos/patternfly-react");
+        if !repo.exists() {
+            eprintln!("Skipping: PF repo not found at {}", repo.display());
+            return;
+        }
+
+        let structural_changes = vec![
+            relocated_component("Tile"),
+            relocated_props("Tile"),
+            // Also include Chip (will be in already_detected)
+            relocated_component("Chip"),
+            relocated_props("Chip"),
+        ];
+
+        // Simulate Chip already detected by rendering swap
+        let already_detected: HashSet<&str> = ["Chip"].iter().copied().collect();
+
+        let result = detect_deprecated_replacements_from_commits(
+            repo,
+            "v5.4.0",
+            "v6.4.1",
+            &structural_changes,
+            &already_detected,
+        );
+
+        // Tile should be detected via commit co-change → Card
+        let tile_repl = result.iter().find(|r| r.old_component == "Tile");
+        assert!(
+            tile_repl.is_some(),
+            "Tile should be detected via commit co-change. Got: {:?}",
+            result
+        );
+        let tile_repl = tile_repl.unwrap();
+        assert_eq!(tile_repl.new_component, "Card");
+        assert_eq!(
+            tile_repl.evidence_source,
+            ReplacementEvidence::CommitCoChange
+        );
+        assert!(
+            !tile_repl.evidence_hosts.is_empty(),
+            "Should have at least one commit SHA as evidence"
+        );
+
+        // Chip should NOT appear (already detected)
+        let chip_repl = result.iter().find(|r| r.old_component == "Chip");
+        assert!(
+            chip_repl.is_none(),
+            "Chip should be skipped — already detected via rendering swap"
         );
     }
 }

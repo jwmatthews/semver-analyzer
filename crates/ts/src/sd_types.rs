@@ -811,21 +811,42 @@ pub struct SdPipelineResult {
 
 // ── Deprecated Replacement Detection ────────────────────────────────────
 
+/// How a deprecated replacement was detected.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReplacementEvidence {
+    /// Detected via host components swapping rendered components
+    /// (e.g., ToolbarFilter stopped rendering `Chip`, started rendering `Label`).
+    #[default]
+    RenderingSwap,
+    /// Detected via git commit co-change analysis: the commit that deprecated
+    /// the component also modified source files in the replacement component's
+    /// directory (e.g., the Tile deprecation commit also modified `Card/CardHeader.tsx`).
+    CommitCoChange,
+}
+
 /// A deprecated component that has a differently-named replacement,
-/// detected via rendering swap analysis.
+/// detected via rendering swap analysis or git commit co-change analysis.
 ///
 /// When host components (e.g., ToolbarFilter) stopped rendering `Chip`
 /// and started rendering `Label` between versions, this establishes
 /// the `Chip → Label` replacement relationship.
+///
+/// When no rendering swap is available (e.g., Tile is a standalone leaf
+/// component), the commit that deprecated Tile may also modify Card's
+/// source files — establishing the `Tile → Card` relationship via
+/// co-change analysis.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeprecatedReplacement {
     /// The deprecated component name (e.g., "Chip").
     pub old_component: String,
     /// The replacement component name (e.g., "Label").
     pub new_component: String,
-    /// Host components that confirmed the swap
-    /// (e.g., \["ToolbarFilter", "MultiTypeaheadSelect"\]).
+    /// Evidence details: host component names for `RenderingSwap`,
+    /// commit SHAs for `CommitCoChange`.
     pub evidence_hosts: Vec<String>,
+    /// How this replacement was detected.
+    #[serde(default)]
+    pub evidence_source: ReplacementEvidence,
 }
 
 #[cfg(test)]

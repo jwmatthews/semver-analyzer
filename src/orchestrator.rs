@@ -737,7 +737,7 @@ impl<L: Language> Analyzer<L> {
         // detection) to the Language impl, then log the summary.
         let structural_changes = self
             .lang
-            .finalize_extensions(&mut extensions, td.structural_changes);
+            .finalize_extensions(&mut extensions, td.structural_changes, repo, from_ref, to_ref);
 
         for line in self.lang.extensions_log_summary(&extensions) {
             progress.println(&format!("  {}", line));
