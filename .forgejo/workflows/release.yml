@@ -4,6 +4,20 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to publish (e.g. v0.0.1)"
+        type: string
+        required: true
+      skip_preflight:
+        description: "Skip preflight checks (useful when retrying a failed publish)"
+        type: boolean
+        default: true
+      skip_version_bump:
+        description: "Skip version bump PR (if already created from a prior run)"
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,10 +25,13 @@ env:
 jobs:
   preflight:
     name: Pre-release checks
+    if: github.event_name != 'workflow_dispatch' || !inputs.skip_preflight
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: https://github.com/actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust stable
         uses: https://github.com/dtolnay/rust-toolchain@stable
@@ -32,7 +49,8 @@ jobs:
 
       - name: Verify tag matches root Cargo.toml version
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          REF_TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${REF_TAG#v}"
           CARGO_VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
           if [ "$TAG" != "$CARGO_VERSION" ]; then
             echo "::error::Tag version ($TAG) does not match Cargo.toml version ($CARGO_VERSION)"
@@ -55,16 +73,27 @@ jobs:
   publish:
     name: Publish to crates.io
     needs: preflight
+    if: always() && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: https://github.com/actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust stable
         uses: https://github.com/dtolnay/rust-toolchain@stable
 
       - name: Publish semver-analyzer-core
-        run: cargo publish --package semver-analyzer-core
+        run: |
+          output=$(cargo publish --package semver-analyzer-core 2>&1) && echo "$output" || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "semver-analyzer-core already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -72,12 +101,28 @@ jobs:
         run: sleep 30
 
       - name: Publish semver-analyzer-llm
-        run: cargo publish --package semver-analyzer-llm
+        run: |
+          output=$(cargo publish --package semver-analyzer-llm 2>&1) && echo "$output" || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "semver-analyzer-llm already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - name: Publish semver-analyzer-konveyor-core
-        run: cargo publish --package semver-analyzer-konveyor-core
+        run: |
+          output=$(cargo publish --package semver-analyzer-konveyor-core 2>&1) && echo "$output" || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "semver-analyzer-konveyor-core already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -85,12 +130,28 @@ jobs:
         run: sleep 30
 
       - name: Publish semver-analyzer-ts
-        run: cargo publish --package semver-analyzer-ts
+        run: |
+          output=$(cargo publish --package semver-analyzer-ts 2>&1) && echo "$output" || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "semver-analyzer-ts already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - name: Publish semver-analyzer-java
-        run: cargo publish --package semver-analyzer-java
+        run: |
+          output=$(cargo publish --package semver-analyzer-java 2>&1) && echo "$output" || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "semver-analyzer-java already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -98,13 +159,22 @@ jobs:
         run: sleep 30
 
       - name: Publish semver-analyzer
-        run: cargo publish --package semver-analyzer
+        run: |
+          output=$(cargo publish --package semver-analyzer 2>&1) && echo "$output" || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "semver-analyzer already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   version-bump:
     name: Bump version for next development cycle
     needs: publish
+    if: "!(github.event_name == 'workflow_dispatch' && inputs.skip_version_bump)"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
@@ -129,6 +199,9 @@ jobs:
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "next=$NEXT" >> "$GITHUB_OUTPUT"
 
+      - name: Install Rust stable
+        uses: https://github.com/dtolnay/rust-toolchain@stable
+
       - name: Bump all Cargo.toml versions and internal deps
         run: |
           CURRENT="${{ steps.next.outputs.current }}"
@@ -146,11 +219,14 @@ jobs:
             sed -i "s/\(semver-analyzer[a-z-]* = { version = \)\"${CURRENT}\"/\1\"${NEXT}\"/" "$manifest"
           done
 
+      - name: Update Cargo.lock
+        run: cargo generate-lockfile
+
       - name: Create branch and commit
         run: |
           BRANCH="chore/bump-v${{ steps.next.outputs.next }}"
           git checkout -b "$BRANCH"
-          git add Cargo.toml crates/*/Cargo.toml
+          git add Cargo.toml Cargo.lock crates/*/Cargo.toml
           git commit -m "chore: bump version to ${{ steps.next.outputs.next }}"
           git push origin "$BRANCH"
 
