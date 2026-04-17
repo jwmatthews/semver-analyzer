@@ -777,10 +777,8 @@ fn extract_from_rule(
                                 info.display_values.insert(display_str.to_string());
                             }
                             // Flex properties
-                            Property::FlexShrink(shrink, _) => {
-                                if *shrink == 0.0 {
-                                    info.flex_shrink_zero = true;
-                                }
+                            Property::FlexShrink(shrink, _) if *shrink == 0.0 => {
+                                info.flex_shrink_zero = true;
                             }
                             Property::FlexWrap(wrap, _) => {
                                 let s = format!("{:?}", wrap);

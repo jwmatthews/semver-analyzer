@@ -675,10 +675,12 @@ impl<L: Language> Analyzer<L> {
                     let from_wt_path = from_wt.as_ref().map(|w| w.path().to_path_buf());
                     let to_wt_path = to_wt.as_ref().map(|w| w.path().to_path_buf());
 
-                    if from_wt_path.is_some() && to_wt_path.is_some() {
+                    if let (Some(from_path), Some(to_path)) =
+                        (from_wt_path.as_ref(), to_wt_path.as_ref())
+                    {
                         tracing::info!(
-                            from = %from_wt_path.as_ref().unwrap().display(),
-                            to = %to_wt_path.as_ref().unwrap().display(),
+                            from = %from_path.display(),
+                            to = %to_path.display(),
                             "Received worktree paths from TD for SD extends resolution"
                         );
                     }

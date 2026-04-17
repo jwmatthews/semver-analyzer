@@ -402,10 +402,10 @@ fn find_children_in_statement<'a>(
                 }
             }
         }
-        Statement::ClassDeclaration(class) => {
-            if find_children_in_class_body(&class.body, source, path, aliases) {
-                return true;
-            }
+        Statement::ClassDeclaration(class)
+            if find_children_in_class_body(&class.body, source, path, aliases) =>
+        {
+            return true;
         }
         _ => {}
     }
@@ -438,10 +438,10 @@ fn find_children_in_declaration<'a>(
                 }
             }
         }
-        Declaration::ClassDeclaration(class) => {
-            if find_children_in_class_body(&class.body, source, path, aliases) {
-                return true;
-            }
+        Declaration::ClassDeclaration(class)
+            if find_children_in_class_body(&class.body, source, path, aliases) =>
+        {
+            return true;
         }
         _ => {}
     }
@@ -599,10 +599,10 @@ fn find_children_in_jsx_element<'a>(
                     }
                 }
             }
-            JSXChild::Element(child_el) => {
-                if find_children_in_jsx_element(child_el, source, path, aliases) {
-                    return true;
-                }
+            JSXChild::Element(child_el)
+                if find_children_in_jsx_element(child_el, source, path, aliases) =>
+            {
+                return true;
             }
             JSXChild::Fragment(frag) => {
                 for frag_child in &frag.children {
@@ -799,10 +799,10 @@ fn find_children_in_statement_detail<'a>(
                 }
             }
         }
-        Statement::ClassDeclaration(class) => {
-            if find_children_in_class_body_detail(&class.body, source, path, aliases) {
-                return true;
-            }
+        Statement::ClassDeclaration(class)
+            if find_children_in_class_body_detail(&class.body, source, path, aliases) =>
+        {
+            return true;
         }
         _ => {}
     }
@@ -834,10 +834,10 @@ fn find_children_in_declaration_detail<'a>(
                 }
             }
         }
-        Declaration::ClassDeclaration(class) => {
-            if find_children_in_class_body_detail(&class.body, source, path, aliases) {
-                return true;
-            }
+        Declaration::ClassDeclaration(class)
+            if find_children_in_class_body_detail(&class.body, source, path, aliases) =>
+        {
+            return true;
         }
         _ => {}
     }
@@ -985,10 +985,10 @@ fn find_children_in_jsx_element_detail<'a>(
                     }
                 }
             }
-            JSXChild::Element(child_el) => {
-                if find_children_in_jsx_element_detail(child_el, source, path, aliases) {
-                    return true;
-                }
+            JSXChild::Element(child_el)
+                if find_children_in_jsx_element_detail(child_el, source, path, aliases) =>
+            {
+                return true;
             }
             JSXChild::Fragment(frag) => {
                 for frag_child in &frag.children {
