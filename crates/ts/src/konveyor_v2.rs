@@ -3171,6 +3171,13 @@ fn generate_test_impact_rules(
                     continue;
                 }
 
+                // Skip rules for fully-removed components (not in component_packages).
+                // If the component doesn't exist in v6, the OUIA value change is moot —
+                // the entire component needs migration, which TD rules already cover.
+                if !component_packages.contains_key(&change.component) {
+                    continue;
+                }
+
                 if let Some(ref old_val) = change.old_value {
                     // Parse the old_value format: `attr_name="value"`
                     // Example: `data-ouia-component-type="PF5/${componentType}"`
@@ -3532,8 +3539,11 @@ fn generate_prop_attribute_override_rules(
             Some(val) => {
                 let parts: Vec<&str> = val.splitn(2, " → ").collect();
                 if parts.len() == 2 {
-                    let attrs: Vec<String> =
-                        parts[1].split(", ").map(|s| s.trim().to_string()).collect();
+                    let attrs: Vec<String> = parts[1]
+                        .split(", ")
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                     (parts[0].to_string(), attrs)
                 } else {
                     continue;
@@ -3541,6 +3551,14 @@ fn generate_prop_attribute_override_rules(
             }
             None => continue,
         };
+
+        // Skip when we don't know which attributes are overridden.
+        // This happens when managed_attrs detected the helper spread but
+        // couldn't correlate it with specific data-* attributes (e.g.,
+        // useOUIAProps produces attributes at runtime, not as JSX literals).
+        if overridden_attrs.is_empty() {
+            continue;
+        }
 
         // Generate one rule per overridden attribute
         for attr in &overridden_attrs {
