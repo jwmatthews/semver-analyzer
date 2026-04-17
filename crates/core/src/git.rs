@@ -13,11 +13,13 @@
 //! git plumbing.
 
 use anyhow::{Context, Result};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The directory name under the repo root where worktrees are created.
-const WORKTREE_DIR_NAME: &str = ".semver-worktrees";
+/// Top-level directory name for worktrees in the system temp dir.
+const WORKTREE_DIR_NAME: &str = "semver-worktrees";
 
 // ── Git file operations ──────────────────────────────────────────────
 
@@ -141,12 +143,39 @@ pub fn sanitize_ref_name(git_ref: &str) -> String {
     }
 }
 
+/// Compute a deterministic hash for a repo path.
+///
+/// Used to create unique worktree directories per repo in the system
+/// temp dir. Two runs against the same repo produce the same hash.
+fn repo_hash(repo: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    repo.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Generate a deterministic worktree path for a given ref.
 ///
-/// Path format: `<repo>/.semver-worktrees/<sanitized-ref>`
+/// Path format: `<tmp>/semver-worktrees/<repo-hash>/<sanitized-ref>`
+///
+/// Worktrees are placed in the system temp dir rather than inside the
+/// repo to avoid polluting the working tree. On crash, orphaned
+/// worktrees sit in `/tmp/` where the OS cleans them up on reboot.
+/// The repo hash ensures different repos don't collide.
 pub fn worktree_path_for(repo: &Path, git_ref: &str) -> PathBuf {
     let sanitized = sanitize_ref_name(git_ref);
-    repo.join(WORKTREE_DIR_NAME).join(sanitized)
+    std::env::temp_dir()
+        .join(WORKTREE_DIR_NAME)
+        .join(repo_hash(repo))
+        .join(sanitized)
+}
+
+/// Return the parent directory for all worktrees of a given repo.
+///
+/// Path format: `<tmp>/semver-worktrees/<repo-hash>/`
+pub fn worktree_dir_for(repo: &Path) -> PathBuf {
+    std::env::temp_dir()
+        .join(WORKTREE_DIR_NAME)
+        .join(repo_hash(repo))
 }
 
 // ── WorktreeGuard ────────────────────────────────────────────────────
@@ -229,14 +258,14 @@ impl WorktreeGuard {
 
     /// Scan for and remove stale worktrees from previous crashed runs.
     ///
-    /// Looks in `<repo>/.semver-worktrees/` for any existing directories
-    /// and attempts to clean them up via `git worktree remove`.
+    /// Looks in `<tmp>/semver-worktrees/<repo-hash>/` for any existing
+    /// directories and attempts to clean them up via `git worktree remove`.
     pub fn cleanup_stale(repo: &Path) -> Result<usize> {
         let repo = repo
             .canonicalize()
             .with_context(|| format!("Failed to canonicalize repo path: {}", repo.display()))?;
         let repo = repo.as_path();
-        let worktree_dir = repo.join(WORKTREE_DIR_NAME);
+        let worktree_dir = worktree_dir_for(repo);
         if !worktree_dir.exists() {
             return Ok(0);
         }
@@ -400,22 +429,39 @@ mod tests {
     }
 
     #[test]
-    fn worktree_path_structure() {
+    fn worktree_path_in_tmp_dir() {
         let repo = Path::new("/repos/my-project");
         let path = worktree_path_for(repo, "v1.0.0");
-        assert_eq!(
-            path,
-            PathBuf::from("/repos/my-project/.semver-worktrees/v1.0.0")
-        );
+        let expected = std::env::temp_dir()
+            .join("semver-worktrees")
+            .join(repo_hash(repo))
+            .join("v1.0.0");
+        assert_eq!(path, expected);
     }
 
     #[test]
     fn worktree_path_sanitizes_ref() {
         let repo = Path::new("/repos/my-project");
         let path = worktree_path_for(repo, "feature/branch");
-        assert_eq!(
-            path,
-            PathBuf::from("/repos/my-project/.semver-worktrees/feature_branch")
-        );
+        assert!(path.ends_with("feature_branch"));
+        // Verify it's in the tmp dir, not the repo
+        assert!(!path.starts_with(repo));
+    }
+
+    #[test]
+    fn worktree_path_deterministic_per_repo() {
+        let repo = Path::new("/repos/my-project");
+        let path1 = worktree_path_for(repo, "v1.0.0");
+        let path2 = worktree_path_for(repo, "v1.0.0");
+        assert_eq!(path1, path2);
+    }
+
+    #[test]
+    fn worktree_path_different_repos_differ() {
+        let repo_a = Path::new("/repos/project-a");
+        let repo_b = Path::new("/repos/project-b");
+        let path_a = worktree_path_for(repo_a, "v1.0.0");
+        let path_b = worktree_path_for(repo_b, "v1.0.0");
+        assert_ne!(path_a, path_b);
     }
 }

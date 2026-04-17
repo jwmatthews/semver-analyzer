@@ -10,6 +10,7 @@ use super::ExtractionWarning;
 #[cfg(test)]
 use semver_analyzer_core::git::sanitize_ref_name;
 use semver_analyzer_core::git::worktree_path_for;
+use semver_analyzer_core::traits::WorktreeAccess;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,6 +18,9 @@ use std::process::Command;
 ///
 /// On construction: creates a worktree, installs dependencies, runs tsc.
 /// On drop: removes the worktree (even on panic or early return).
+///
+/// Implements `WorktreeAccess` so it can be wrapped in `Arc` and shared
+/// between TD and SD pipelines via `std::sync::mpsc::channel`.
 pub struct WorktreeGuard {
     /// Path to the repository root.
     repo_root: PathBuf,
@@ -222,8 +226,8 @@ impl WorktreeGuard {
 
     /// Scan for and remove stale worktrees from previous crashed runs.
     ///
-    /// Looks in `<repo>/.semver-worktrees/` for any existing directories
-    /// and attempts to clean them up via `git worktree remove`.
+    /// Looks in `<tmp>/semver-worktrees/<repo-hash>/` for any existing
+    /// directories and attempts to clean them up via `git worktree remove`.
     pub fn cleanup_stale(repo: &Path) -> Result<usize, WorktreeError> {
         let repo = repo.canonicalize().map_err(|e| {
             WorktreeError::CommandFailed(format!(
@@ -233,13 +237,7 @@ impl WorktreeGuard {
             ))
         })?;
         let repo = repo.as_path();
-        // Derive the worktree parent directory from the path computation.
-        // worktree_path_for returns <repo>/.semver-worktrees/<ref>, so
-        // the parent is <repo>/.semver-worktrees/.
-        let worktree_dir = worktree_path_for(repo, "dummy")
-            .parent()
-            .expect("worktree path should have a parent")
-            .to_path_buf();
+        let worktree_dir = semver_analyzer_core::git::worktree_dir_for(repo);
         if !worktree_dir.exists() {
             return Ok(0);
         }
@@ -286,6 +284,12 @@ impl Drop for WorktreeGuard {
                 let _ = std::fs::remove_dir_all(&self.worktree_path);
             }
         }
+    }
+}
+
+impl WorktreeAccess for WorktreeGuard {
+    fn path(&self) -> &Path {
+        &self.worktree_path
     }
 }
 
@@ -441,23 +445,20 @@ mod tests {
     }
 
     #[test]
-    fn worktree_path_structure() {
+    fn worktree_path_in_tmp_dir() {
         let repo = Path::new("/repos/my-project");
         let path = worktree_path_for(repo, "v1.0.0");
-        assert_eq!(
-            path,
-            PathBuf::from("/repos/my-project/.semver-worktrees/v1.0.0")
-        );
+        // Should be in the system temp dir, not inside the repo
+        assert!(!path.starts_with(repo));
+        assert!(path.ends_with("v1.0.0"));
     }
 
     #[test]
     fn worktree_path_sanitizes_ref() {
         let repo = Path::new("/repos/my-project");
         let path = worktree_path_for(repo, "feature/branch");
-        assert_eq!(
-            path,
-            PathBuf::from("/repos/my-project/.semver-worktrees/feature_branch")
-        );
+        assert!(path.ends_with("feature_branch"));
+        assert!(!path.starts_with(repo));
     }
 
     // -- Helper: create a temporary git repo with a commit and tag --

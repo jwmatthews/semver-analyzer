@@ -29,6 +29,7 @@ pub mod composition;
 pub mod css_profile;
 pub mod extensions;
 pub mod konveyor_v2;
+pub mod resolve;
 pub mod sd_pipeline;
 pub mod sd_types;
 pub mod source_profile;

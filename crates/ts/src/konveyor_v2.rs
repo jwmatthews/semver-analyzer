@@ -2843,6 +2843,8 @@ const ROLE_QUERY_PATTERN: &str =
     "^(getByRole|queryByRole|findByRole|getAllByRole|queryAllByRole|findAllByRole)$";
 const LABEL_QUERY_PATTERN: &str =
     "^(getByLabelText|queryByLabelText|findByLabelText|getAllByLabelText|queryAllByLabelText|findAllByLabelText)$";
+const DATA_ATTR_QUERY_PATTERN: &str =
+    "^(querySelector|querySelectorAll|getByAttribute|queryByAttribute|findByAttribute)$";
 const TEST_FILE_PATTERN: &str = ".*\\.(test|spec)\\.(ts|tsx|js|jsx)$";
 
 /// Map HTML element names to their implicit ARIA roles.
@@ -3154,6 +3156,141 @@ fn generate_test_impact_rules(
                             fix_strategy: None,
                         });
                     }
+                }
+            }
+
+            // ── Data attribute changes: match querySelector/getByAttribute ─
+            SourceLevelCategory::DataAttribute => {
+                // Only generate rules for transitive changes (via dependency chain)
+                if change.dependency_chain.is_none() {
+                    continue;
+                }
+
+                if let Some(ref old_val) = change.old_value {
+                    // Parse the old_value format: `attr_name="value"`
+                    // Example: `data-ouia-component-type="PF5/${componentType}"`
+                    let (attr_name, raw_old_value) = if let Some(idx) = old_val.find("=\"") {
+                        let attr = &old_val[..idx];
+                        let val = old_val[idx + 2..].trim_end_matches('"');
+                        (attr.to_string(), val.to_string())
+                    } else if let Some(idx) = old_val.find(": ") {
+                        // Fallback: `attr: value` format
+                        (old_val[..idx].to_string(), old_val[idx + 2..].to_string())
+                    } else {
+                        continue;
+                    };
+
+                    // Parse new_value with same format
+                    let raw_new_value = change.new_value.as_ref().and_then(|nv| {
+                        if let Some(idx) = nv.find("=\"") {
+                            Some(nv[idx + 2..].trim_end_matches('"').to_string())
+                        } else {
+                            nv.find(": ").map(|idx| nv[idx + 2..].to_string())
+                        }
+                    });
+
+                    // Substitute template variables (e.g., `${componentType}`)
+                    // with the component name. PatternFly convention: the OUIA
+                    // component type matches the React component name.
+                    let component = &change.component;
+                    let old_value = raw_old_value.replace("${componentType}", component);
+                    let new_value = raw_new_value
+                        .as_ref()
+                        .map(|v| v.replace("${componentType}", component));
+
+                    if !is_concrete_value(&old_value) {
+                        continue;
+                    }
+
+                    let prefix = rule_prefix(&change.migration_from);
+                    let rule_id = format!(
+                        "{}-test-{}-data-attr-{}-changed",
+                        prefix,
+                        sanitize(component),
+                        sanitize(&attr_name),
+                    );
+
+                    let message = if let Some(ref new_val) = new_value {
+                        if is_concrete_value(new_val) {
+                            format!(
+                                "{component} `{attr}` value changed from `{old}` to `{new}`.\n\n\
+                                 Update test selectors:\n  \
+                                 `querySelector('[{attr}=\"{old}\"]')` → `querySelector('[{attr}=\"{new}\"]')`",
+                                attr = attr_name,
+                                old = old_value,
+                                new = new_val,
+                            )
+                        } else {
+                            format!(
+                                "{component} `{attr}` value changed from `{old}` to a dynamic value.\n\n\
+                                 Tests using `querySelector('[{attr}=\"{old}\"]')` may need updating.\n\n\
+                                 {desc}",
+                                attr = attr_name,
+                                old = old_value,
+                                desc = change.description,
+                            )
+                        }
+                    } else {
+                        format!(
+                            "{component} `{attr}` value `{old}` was removed.\n\n\
+                             Tests using `querySelector('[{attr}=\"{old}\"]')` will fail.\n\n\
+                             {desc}",
+                            attr = attr_name,
+                            old = old_value,
+                            desc = change.description,
+                        )
+                    };
+
+                    let fix =
+                        new_value
+                            .as_ref()
+                            .filter(|nv| is_concrete_value(nv))
+                            .map(|new_val| {
+                                use semver_analyzer_konveyor_core::FixStrategyEntry;
+                                FixStrategyEntry {
+                                    strategy: "PropValueChange".into(),
+                                    from: Some(old_value.clone()),
+                                    to: Some(new_val.clone()),
+                                    component: Some(component.clone()),
+                                    prop: Some(attr_name.clone()),
+                                    ..Default::default()
+                                }
+                            });
+
+                    rules.push(KonveyorRule {
+                        rule_id,
+                        labels: vec![
+                            "source=semver-analyzer".into(),
+                            "change-type=test-impact".into(),
+                            "impact=frontend-testing".into(),
+                            format!("package={}", pkg),
+                        ],
+                        effort: 1,
+                        category: "optional".into(),
+                        description: format!(
+                            "Test impact: {} `{}` value changed",
+                            component, attr_name,
+                        ),
+                        message,
+                        links: vec![],
+                        when: KonveyorCondition::FrontendReferenced {
+                            referenced: FrontendReferencedFields {
+                                pattern: DATA_ATTR_QUERY_PATTERN.into(),
+                                location: "FUNCTION_CALL".into(),
+                                component: None,
+                                parent: None,
+                                not_parent: None,
+                                child: None,
+                                not_child: None,
+                                requires_child: None,
+                                parent_from: None,
+                                value: Some(format!(".*{}.*", regex_escape(&old_value))),
+                                from: None,
+                                file_pattern: Some(TEST_FILE_PATTERN.into()),
+                            },
+                        },
+                        fix_strategy: fix,
+                    });
                 }
             }
 
@@ -4213,6 +4350,7 @@ mod tests {
             test_description: None,
             element: None,
             migration_from: None,
+            dependency_chain: None,
         }];
 
         let rules = generate_context_rules(&changes, &test_pkg_map());
@@ -4250,6 +4388,7 @@ mod tests {
                 migration_from: Some(
                     "packages/react-core/src/deprecated/components/Select/SelectOption.tsx".into(),
                 ),
+                dependency_chain: None,
             },
             SourceLevelChange {
                 component: "SelectOption".into(),
@@ -4263,6 +4402,7 @@ mod tests {
                 migration_from: Some(
                     "packages/react-core/src/deprecated/components/Select/SelectOption.tsx".into(),
                 ),
+                dependency_chain: None,
             },
             // Also add a non-migration change for the same component
             SourceLevelChange {
@@ -4275,6 +4415,7 @@ mod tests {
                 test_description: None,
                 element: Some("li".into()),
                 migration_from: None, // evolution change
+                dependency_chain: None,
             },
         ];
 
@@ -4324,6 +4465,7 @@ mod tests {
             migration_from: Some(
                 "packages/react-core/src/deprecated/components/Select/Select.tsx".into(),
             ),
+            dependency_chain: None,
         }];
 
         let mut pkgs = test_pkg_map();
@@ -4366,6 +4508,7 @@ mod tests {
             migration_from: Some(
                 "packages/react-core/src/deprecated/components/Dropdown/Dropdown.tsx".into(),
             ),
+            dependency_chain: None,
         }];
 
         let pkgs = test_pkg_map();
@@ -4408,6 +4551,7 @@ mod tests {
             test_description: None,
             element: None,
             migration_from: None, // evolution, not migration
+            dependency_chain: None,
         }];
 
         let rules = generate_prop_attribute_override_rules(

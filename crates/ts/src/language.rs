@@ -373,6 +373,56 @@ impl Language for TypeScript {
         extractor.extract_at_ref(repo, git_ref, self.build_command.as_deref(), degradation)
     }
 
+    fn extract_keeping_worktree(
+        &self,
+        repo: &Path,
+        git_ref: &str,
+        degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
+    ) -> Result<semver_analyzer_core::ExtractionWithWorktree<TsSymbolData>> {
+        use crate::worktree::{ExtractionWarning, WorktreeGuard};
+        use semver_analyzer_core::error::DiagnoseWithTip;
+
+        let guard = WorktreeGuard::new(repo, git_ref, self.build_command.as_deref()).diagnose()?;
+
+        // Record extraction warnings as degradation (same detail as extract_at_ref)
+        if let Some(tracker) = degradation {
+            for warning in guard.warnings() {
+                match warning {
+                    ExtractionWarning::PartialTscBuildFailed {
+                        succeeded, failed, ..
+                    } => {
+                        tracker.record(
+                            "TD",
+                            format!(
+                                "tsc partially succeeded ({} packages ok, {} failed) \
+                                 and project build also failed at ref {}",
+                                succeeded, failed, git_ref
+                            ),
+                            "API surface may be incomplete — some package \
+                             declarations could not be generated",
+                        );
+                    }
+                    ExtractionWarning::TscFailedBuildSucceeded { .. } => {
+                        tracker.record(
+                            "TD",
+                            format!("tsc failed at ref {}, fell back to project build", git_ref),
+                            "API surface was extracted via project build — \
+                             coverage should be complete",
+                        );
+                    }
+                }
+            }
+        }
+
+        let guard = Arc::new(guard);
+        let extractor = crate::extract::OxcExtractor::new();
+        let surface = extractor.extract_from_dir(guard.path())?;
+        Ok((
+            surface,
+            Some(guard as Arc<dyn semver_analyzer_core::traits::WorktreeAccess>),
+        ))
+    }
+
     fn parse_changed_functions(
         &self,
         repo: &Path,
@@ -639,7 +689,8 @@ impl Language for TypeScript {
             &params.from_ref,
             &params.to_ref,
             css_profiles.as_ref(),
-            &params.changed_functions,
+            params.from_worktree_path.as_deref(),
+            params.to_worktree_path.as_deref(),
         )?;
 
         // Wire orchestrator-computed data into the SD result

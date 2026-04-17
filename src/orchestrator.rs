@@ -323,7 +323,7 @@ impl<L: Language> Analyzer<L> {
         to_ref: &str,
         no_llm: bool,
         llm_command: Option<&str>,
-        build_command: Option<&str>,
+        _build_command: Option<&str>,
         dep_dir: Option<&Path>,
         dep_from: Option<&str>,
         dep_to: Option<&str>,
@@ -334,13 +334,24 @@ impl<L: Language> Analyzer<L> {
         let _span = info_span!("analyze_pipeline_v2", %from_ref, %to_ref).entered();
         let shared = Arc::new(SharedFindings::<L>::new());
 
-        // ── Owned clones for TD's spawn_blocking ────────────────────
+        // ── Owned clones for TD's parallel extraction ─────────────────
+        // Two spawn_blocking tasks run concurrently (from-ref + to-ref),
+        // then a third runs the diff + manifest analysis.
+        let lang_from = self.lang.clone();
+        let lang_to = self.lang.clone();
         let lang_td = self.lang.clone();
+        let repo_from = repo.to_path_buf();
+        let repo_to = repo.to_path_buf();
         let repo_td = repo.to_path_buf();
         let from_td = from_ref.to_string();
         let to_td = to_ref.to_string();
-        let build_cmd = build_command.map(|s| s.to_string());
+        let from_extract = from_ref.to_string();
+        let to_extract = to_ref.to_string();
+        let shared_from = shared.clone();
+        let shared_to = shared.clone();
         let shared_td = shared.clone();
+        let progress_from = progress.clone();
+        let progress_to = progress.clone();
         let progress_td = progress.clone();
 
         // ── Owned clones for SD's spawn_blocking ────────────────────
@@ -367,47 +378,107 @@ impl<L: Language> Analyzer<L> {
         let progress_rename = progress.clone();
         let shared_inference = shared.clone();
 
-        // ── Parse changed functions for transitive behavioral analysis ──
-        // This uses git diff (no worktree needed) so it can run before
-        // TD creates its worktrees. The results are passed to the SD
-        // pipeline for dependency behavioral change detection.
-        let changed_fns_sd = {
-            let lang_cf = self.lang.clone();
-            let repo_cf = repo.to_path_buf();
-            let from_cf = from_ref.to_string();
-            let to_cf = to_ref.to_string();
-            tokio::task::spawn_blocking(move || {
-                lang_cf.parse_changed_functions(&repo_cf, &from_cf, &to_cf)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("parse_changed_functions panicked: {}", e))?
-            .unwrap_or_else(|e| {
-                tracing::warn!(%e, "parse_changed_functions failed, transitive analysis will be skipped");
-                Vec::new()
-            })
-        };
+        // ── Channels for worktree sharing (TD → SD) ────────────────
+        // TD creates worktrees during extraction. It sends Arc clones
+        // through these channels so SD can use the filesystem paths
+        // for oxc_resolver-based import resolution.
+        let (from_wt_tx, from_wt_rx) =
+            std::sync::mpsc::channel::<Option<Arc<dyn semver_analyzer_core::traits::WorktreeAccess>>>();
+        let (to_wt_tx, to_wt_rx) =
+            std::sync::mpsc::channel::<Option<Arc<dyn semver_analyzer_core::traits::WorktreeAccess>>>();
 
         // ── Run TD + SD concurrently ────────────────────────────────
         let (td_inference_result, ext_result) = tokio::join!(
-            // TD branch: structural diff → rename inference → hierarchy inference
+            // TD branch: parallel extraction → diff → rename inference
             async move {
-                // Clone shared for use after spawn_blocking
                 let shared_td_outer = shared_td.clone();
-                // TD: blocking (extract surfaces, structural diff)
+
+                // ── Parallel extraction: from-ref and to-ref concurrently ──
+                // Each extraction creates a worktree (yarn install + tsc build)
+                // and sends the worktree handle to SD immediately when ready.
+                let (from_result, to_result) = tokio::join!(
+                    tokio::task::spawn_blocking(move || {
+                        let _span = info_span!("td_pipeline").entered();
+                        let phase = progress_from.start_phase(
+                            &format!("[TD] Extracting API surface at {} ...", from_extract),
+                        );
+                        let _extract_span = info_span!("extract_surface", git_ref = %from_extract).entered();
+                        let (surface, wt) = lang_from
+                            .extract_keeping_worktree(
+                                &repo_from,
+                                &from_extract,
+                                Some(shared_from.degradation()),
+                            )
+                            .with_context(|| {
+                                format!("Failed to extract API surface at ref {}", from_extract)
+                            })?;
+                        let surface = Arc::new(surface);
+                        let count = surface.symbols.len();
+                        phase.finish_with_detail(
+                            &format!("[TD] Extracted API surface at {}", from_extract),
+                            &format!("{} symbols", count),
+                        );
+                        info!(symbols = count, git_ref = %from_extract, "old surface extracted");
+                        shared_from.set_old_surface(surface.clone());
+                        // Send worktree handle to SD immediately
+                        let _ = from_wt_tx.send(wt.as_ref().map(Arc::clone));
+                        Ok::<_, anyhow::Error>((surface, wt))
+                    }),
+                    tokio::task::spawn_blocking(move || {
+                        let _span = info_span!("td_pipeline").entered();
+                        let phase = progress_to.start_phase(
+                            &format!("[TD] Extracting API surface at {} ...", to_extract),
+                        );
+                        let _extract_span = info_span!("extract_surface", git_ref = %to_extract).entered();
+                        let (surface, wt) = lang_to
+                            .extract_keeping_worktree(
+                                &repo_to,
+                                &to_extract,
+                                Some(shared_to.degradation()),
+                            )
+                            .with_context(|| {
+                                format!("Failed to extract API surface at ref {}", to_extract)
+                            })?;
+                        let surface = Arc::new(surface);
+                        let count = surface.symbols.len();
+                        phase.finish_with_detail(
+                            &format!("[TD] Extracted API surface at {}", to_extract),
+                            &format!("{} symbols", count),
+                        );
+                        info!(symbols = count, git_ref = %to_extract, "new surface extracted");
+                        shared_to.set_new_surface(surface.clone());
+                        // Send worktree handle to SD immediately
+                        let _ = to_wt_tx.send(wt.as_ref().map(Arc::clone));
+                        Ok::<_, anyhow::Error>((surface, wt))
+                    }),
+                );
+
+                let (old_surface, old_wt) = from_result
+                    .map_err(|e| anyhow::anyhow!("TD from-ref extraction panicked: {}", e))?
+                    .context("TD from-ref extraction failed")?;
+                let (new_surface, new_wt) = to_result
+                    .map_err(|e| anyhow::anyhow!("TD to-ref extraction panicked: {}", e))?
+                    .context("TD to-ref extraction failed")?;
+
+                // ── Diff + manifest analysis (needs both surfaces) ──
                 let td = tokio::task::spawn_blocking(move || {
-                    Self::run_td(
+                    let _span = info_span!("td_pipeline", from_ref = %from_td, to_ref = %to_td).entered();
+                    Self::run_td_analyze(
                         lang_td.as_ref(),
                         &repo_td,
                         &from_td,
                         &to_td,
-                        build_cmd.as_deref(),
+                        old_surface,
+                        new_surface,
+                        old_wt,
+                        new_wt,
                         &shared_td,
                         &progress_td,
                     )
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("TD task panicked: {}", e))?
-                .context("TD pipeline failed")?;
+                .map_err(|e| anyhow::anyhow!("TD analysis panicked: {}", e))?
+                .context("TD analysis failed")?;
 
                 // TD done — extract surfaces for inference phases
                 let default_surface: Arc<ApiSurface<L::SymbolData>> =
@@ -570,6 +641,25 @@ impl<L: Language> Analyzer<L> {
                         .map(|g| g.path().to_path_buf())
                         .or(dep_dir_sd);
 
+                    // Receive worktree handles from TD pipeline.
+                    // Blocks until TD creates each worktree (or TD drops
+                    // senders on error). SD's early phases (A, A.5, B) run
+                    // inside run_extended_analysis using read_git_file;
+                    // only Phase B.5 (extends resolution) uses these paths.
+                    let from_wt = from_wt_rx.recv().ok().flatten();
+                    let to_wt = to_wt_rx.recv().ok().flatten();
+
+                    let from_wt_path = from_wt.as_ref().map(|w| w.path().to_path_buf());
+                    let to_wt_path = to_wt.as_ref().map(|w| w.path().to_path_buf());
+
+                    if from_wt_path.is_some() && to_wt_path.is_some() {
+                        tracing::info!(
+                            from = %from_wt_path.as_ref().unwrap().display(),
+                            to = %to_wt_path.as_ref().unwrap().display(),
+                            "Received worktree paths from TD for SD extends resolution"
+                        );
+                    }
+
                     let params = semver_analyzer_core::ExtendedAnalysisParams {
                         repo: repo_sd.clone(),
                         from_ref: from_sd.clone(),
@@ -577,10 +667,15 @@ impl<L: Language> Analyzer<L> {
                         dep_dir: css_dir,
                         removed_dep_components: removed_css_blocks,
                         dep_repo_packages,
-                        changed_functions: changed_fns_sd,
+                        from_worktree_path: from_wt_path,
+                        to_worktree_path: to_wt_path,
                     };
 
-                    lang_sd.run_extended_analysis(&params)
+                    // Keep worktree handles alive until analysis completes.
+                    let result = lang_sd.run_extended_analysis(&params);
+                    drop(from_wt);
+                    drop(to_wt);
+                    result
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("SD task panicked: {}", e))?;
@@ -700,9 +795,17 @@ struct TdResult<L: Language> {
     manifest_changes: Vec<ManifestChange<L>>,
     #[allow(dead_code)]
     stats: TdStats,
+    /// Worktree handles kept alive for sharing with SD pipeline.
+    /// The BU pipeline ignores these (they drop after `run_td` returns).
+    #[allow(dead_code)]
+    old_worktree: Option<Arc<dyn semver_analyzer_core::traits::WorktreeAccess>>,
+    #[allow(dead_code)]
+    new_worktree: Option<Arc<dyn semver_analyzer_core::traits::WorktreeAccess>>,
 }
 
 impl<L: Language> Analyzer<L> {
+    /// Run the full TD pipeline: extract both surfaces sequentially, diff,
+    /// and analyze manifests. Used by the BU pipeline's `run()`.
     fn run_td(
         lang: &L,
         repo: &Path,
@@ -717,14 +820,14 @@ impl<L: Language> Analyzer<L> {
         // Step 1: Extract API surface at old ref
         let phase =
             progress.start_phase(&format!("[TD] Extracting API surface at {} ...", from_ref));
-        let old_surface = {
+        let (old_surface, old_worktree) = {
             let _extract_span = info_span!("extract_surface", git_ref = %from_ref).entered();
-            Arc::new(
-                lang.extract(repo, from_ref, Some(shared.degradation()))
-                    .with_context(|| {
-                        format!("Failed to extract API surface at ref {}", from_ref)
-                    })?,
-            )
+            let (surface, wt) = lang
+                .extract_keeping_worktree(repo, from_ref, Some(shared.degradation()))
+                .with_context(|| {
+                    format!("Failed to extract API surface at ref {}", from_ref)
+                })?;
+            (Arc::new(surface), wt)
         };
         let old_count = old_surface.symbols.len();
         phase.finish_with_detail(
@@ -732,18 +835,16 @@ impl<L: Language> Analyzer<L> {
             &format!("{} symbols", old_count),
         );
         info!(symbols = old_count, git_ref = %from_ref, "old surface extracted");
-
-        // Store in shared state — Arc clone is a cheap refcount bump
         shared.set_old_surface(old_surface.clone());
 
         // Step 2: Extract API surface at new ref
         let phase = progress.start_phase(&format!("[TD] Extracting API surface at {} ...", to_ref));
-        let new_surface = {
+        let (new_surface, new_worktree) = {
             let _extract_span = info_span!("extract_surface", git_ref = %to_ref).entered();
-            Arc::new(
-                lang.extract(repo, to_ref, Some(shared.degradation()))
-                    .with_context(|| format!("Failed to extract API surface at ref {}", to_ref))?,
-            )
+            let (surface, wt) = lang
+                .extract_keeping_worktree(repo, to_ref, Some(shared.degradation()))
+                .with_context(|| format!("Failed to extract API surface at ref {}", to_ref))?;
+            (Arc::new(surface), wt)
         };
         let new_count = new_surface.symbols.len();
         phase.finish_with_detail(
@@ -751,10 +852,44 @@ impl<L: Language> Analyzer<L> {
             &format!("{} symbols", new_count),
         );
         info!(symbols = new_count, git_ref = %to_ref, "new surface extracted");
-
         shared.set_new_surface(new_surface.clone());
 
-        // Step 3: Structural diff (using language-specific semantics)
+        // Steps 3-4: diff + manifest
+        Self::run_td_analyze(
+            lang,
+            repo,
+            from_ref,
+            to_ref,
+            old_surface,
+            new_surface,
+            old_worktree,
+            new_worktree,
+            shared,
+            progress,
+        )
+    }
+
+    /// Post-extraction TD analysis: structural diff + manifest diff.
+    ///
+    /// Separated from `run_td` so that `run_v2` can extract both surfaces
+    /// in parallel and then call this with the results.
+    #[allow(clippy::too_many_arguments)]
+    fn run_td_analyze(
+        lang: &L,
+        repo: &Path,
+        from_ref: &str,
+        to_ref: &str,
+        old_surface: Arc<ApiSurface<L::SymbolData>>,
+        new_surface: Arc<ApiSurface<L::SymbolData>>,
+        old_worktree: Option<Arc<dyn semver_analyzer_core::traits::WorktreeAccess>>,
+        new_worktree: Option<Arc<dyn semver_analyzer_core::traits::WorktreeAccess>>,
+        shared: &SharedFindings<L>,
+        progress: &ProgressReporter,
+    ) -> Result<TdResult<L>> {
+        let old_count = old_surface.symbols.len();
+        let new_count = new_surface.symbols.len();
+
+        // Structural diff (using language-specific semantics)
         let phase = progress.start_phase("[TD] Computing structural diff ...");
         let structural_changes = {
             let _diff_span = info_span!("structural_diff").entered();
@@ -782,11 +917,10 @@ impl<L: Language> Analyzer<L> {
             .collect();
         shared.insert_structural_breaks(breaking_changes);
 
-        // Step 4: Manifest diff (language-specific)
+        // Manifest diff (language-specific)
         let _manifest_span = info_span!("manifest_diff").entered();
         let mut manifest_changes = Vec::new();
 
-        // 4a: Diff static root manifest files (e.g., root package.json)
         for manifest_file in L::MANIFEST_FILES {
             let old_content = read_git_file(repo, from_ref, manifest_file);
             let new_content = read_git_file(repo, to_ref, manifest_file);
@@ -796,8 +930,6 @@ impl<L: Language> Analyzer<L> {
             }
         }
 
-        // 4b: Diff per-package manifests in monorepos (e.g., packages/*/package.json)
-        // Uses the new ref to discover packages, then diffs each against the old ref.
         let package_manifests = L::discover_package_manifests(repo, to_ref);
         if !package_manifests.is_empty() {
             tracing::info!(
@@ -810,7 +942,6 @@ impl<L: Language> Analyzer<L> {
             let new_content = read_git_file(repo, to_ref, manifest_path);
             if let (Some(old_str), Some(new_str)) = (old_content, new_content) {
                 let mut changes = L::diff_manifest_content(&old_str, &new_str);
-                // Tag each change with the source package name
                 for change in &mut changes {
                     change.source_package = Some(package_name.clone());
                 }
@@ -829,6 +960,8 @@ impl<L: Language> Analyzer<L> {
                 structural_change_count: total_changes,
                 structural_breaking_count: breaking,
             },
+            old_worktree,
+            new_worktree,
         })
     }
 

@@ -25,14 +25,16 @@ use crate::source_profile::{self, diff::diff_profiles};
 
 use crate::sd_types::{
     ComponentSourceProfile, CompositionChange, CompositionChangeType, CompositionTree,
-    ConformanceCheck, ConformanceCheckType, SdPipelineResult,
+    ConformanceCheck, ConformanceCheckType, SdPipelineResult, SourceLevelCategory,
+    SourceLevelChange,
 };
 
 use anyhow::{Context, Result};
+use semver_analyzer_core::types::ChangedFunction;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
-use tracing::{debug, info, info_span, warn};
+use tracing::{debug, info, info_span, trace, warn};
 
 /// Run the full SD pipeline for a TypeScript/React project.
 ///
@@ -47,6 +49,8 @@ pub fn run_sd(
     from_ref: &str,
     to_ref: &str,
     css_profiles: Option<&HashMap<String, crate::css_profile::CssBlockProfile>>,
+    from_worktree_path: Option<&Path>,
+    to_worktree_path: Option<&Path>,
 ) -> Result<SdPipelineResult> {
     let _span = info_span!("sd_pipeline", %from_ref, %to_ref).entered();
 
@@ -241,6 +245,72 @@ pub fn run_sd(
                     .count(),
                 "Phase A.5 complete: deprecated migration diffing"
             );
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Phase B.5: Extends resolution — enrich all_props from inherited
+    // ════════════════════════════════════════════════════════════════
+    //
+    // all_props only includes props declared in the interface body —
+    // inherited props from `extends OUIAProps` etc. are missing. This
+    // step resolves extends_props entries to actual prop lists by
+    // following imports and parsing the extended interfaces.
+    //
+    // This enrichment is needed before Phase A.7 (transitive analysis)
+    // because managed_attrs detection uses all_props as known_props.
+    // Components like TabButton that inherit OUIAProps via extends
+    // won't have ouiaId in all_props without this step.
+
+    let enrichment_count =
+        enrich_all_props_from_extends(repo, to_ref, &mut new_profiles, to_worktree_path);
+    let old_enrichment_count =
+        enrich_all_props_from_extends(repo, from_ref, &mut old_profiles, from_worktree_path);
+
+    if enrichment_count + old_enrichment_count > 0 {
+        info!(
+            new = enrichment_count,
+            old = old_enrichment_count,
+            "Phase B.5 complete: extends resolution enrichment"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Phase A.7: Dependency behavioral analysis (transitive changes)
+    // ════════════════════════════════════════════════════════════════
+    //
+    // Detect behavioral changes that propagate transitively through
+    // imported helper functions. Runs after Phase B so it has access
+    // to ALL profiles (not just changed files).
+    //
+    // Phase 1 focuses on managed attribute helpers: functions used as
+    // generator_function in ManagedAttributeBinding (detected by the
+    // source profile's managed_attrs.rs module).
+    //
+    // parse_changed_functions runs here (not in the orchestrator) so it
+    // doesn't block TD from starting. It uses git diff + git show, no
+    // worktree needed.
+
+    let changed_functions = {
+        let parser = crate::diff_parser::TsDiffParser::new();
+        match parser.parse_changed_functions(repo, from_ref, to_ref) {
+            Ok(fns) => fns,
+            Err(e) => {
+                warn!(%e, "parse_changed_functions failed, transitive analysis will be skipped");
+                Vec::new()
+            }
+        }
+    };
+
+    if !changed_functions.is_empty() {
+        let transitive_changes =
+            analyze_managed_attr_dependencies(&changed_functions, &old_profiles, &new_profiles);
+        if !transitive_changes.is_empty() {
+            info!(
+                changes = transitive_changes.len(),
+                "Phase A.7 complete: transitive behavioral changes detected"
+            );
+            all_source_changes.extend(transitive_changes);
         }
     }
 
@@ -1641,6 +1711,867 @@ fn resolve_component_package(file_path: &str) -> Option<String> {
 
 use crate::git_utils::read_git_file;
 
+// ── Phase A.7: Transitive behavioral change detection ───────────────────
+
+/// Analyze transitive behavioral changes from managed attribute helpers.
+///
+/// When a helper function (e.g., `getOUIAProps`) changes between versions,
+/// all components that import and use it are transitively affected. This
+/// function:
+///
+/// 1. Identifies changed functions that match `generator_function` names
+///    in any component's `managed_attributes` bindings.
+/// 2. Analyzes the old/new helper function bodies to determine what
+///    attributes changed and how.
+/// 3. Emits `SourceLevelChange` entries for each affected component.
+fn analyze_managed_attr_dependencies(
+    changed_functions: &[ChangedFunction],
+    old_profiles: &HashMap<String, ComponentSourceProfile>,
+    new_profiles: &HashMap<String, ComponentSourceProfile>,
+) -> Vec<SourceLevelChange> {
+    let _span = info_span!("phase_a7_transitive").entered();
+    let mut changes = Vec::new();
+
+    // Step 1: Collect all generator_function names from managed_attributes
+    // across all component profiles (both old and new).
+    let mut generator_to_components: HashMap<String, Vec<String>> = HashMap::new();
+    for (component_name, profile) in new_profiles.iter().chain(old_profiles.iter()) {
+        for binding in &profile.managed_attributes {
+            generator_to_components
+                .entry(binding.generator_function.clone())
+                .or_default()
+                .push(component_name.clone());
+        }
+    }
+
+    if generator_to_components.is_empty() {
+        return changes;
+    }
+
+    // Step 2: Find changed functions whose names match known generators.
+    for changed_fn in changed_functions {
+        let fn_name = &changed_fn.name;
+        let affected_components = match generator_to_components.get(fn_name) {
+            Some(components) => components,
+            None => continue,
+        };
+
+        debug!(
+            function = %fn_name,
+            file = %changed_fn.file.display(),
+            affected = affected_components.len(),
+            "Changed helper matches managed attribute generator"
+        );
+
+        // Step 3: Analyze what changed in the helper's output.
+        let (old_body, new_body) = match (&changed_fn.old_body, &changed_fn.new_body) {
+            (Some(old), Some(new)) => (old.as_str(), new.as_str()),
+            _ => {
+                // Function was added or removed entirely — not a transitive
+                // change (the managed_attrs diff in Phase A handles add/remove).
+                continue;
+            }
+        };
+
+        let output_changes = diff_helper_output(fn_name, old_body, new_body);
+        if output_changes.is_empty() {
+            continue;
+        }
+
+        // Step 4: Emit SourceLevelChange entries for each affected component.
+        // Deduplicate component names since the same component might appear
+        // in both old and new profile collections.
+        let mut seen_components = HashSet::new();
+        for component_name in affected_components {
+            if !seen_components.insert(component_name.clone()) {
+                continue;
+            }
+
+            // Find the managed attribute binding for this component to get
+            // the specific overridden attributes.
+            let binding = new_profiles
+                .get(component_name)
+                .or_else(|| old_profiles.get(component_name))
+                .and_then(|p| {
+                    p.managed_attributes
+                        .iter()
+                        .find(|b| b.generator_function == *fn_name)
+                });
+
+            let overridden_attrs: Vec<String> = binding
+                .map(|b| b.overridden_attributes.clone())
+                .unwrap_or_default();
+
+            for (attr_name, old_val, new_val) in &output_changes {
+                // Only emit changes for attributes that the component's
+                // managed binding actually overrides.
+                if !overridden_attrs.is_empty() && !overridden_attrs.contains(attr_name) {
+                    continue;
+                }
+
+                let description = format!(
+                    "{component_name}'s `{attr_name}` value changed from \
+                     \"{old_val}\" to \"{new_val}\" via {fn_name}(). \
+                     Update any code that matches on the old attribute value."
+                );
+
+                let dep_chain = vec![
+                    component_name.clone(),
+                    fn_name.clone(),
+                    changed_fn.file.display().to_string(),
+                ];
+
+                changes.push(SourceLevelChange {
+                    component: component_name.clone(),
+                    category: SourceLevelCategory::DataAttribute,
+                    description,
+                    old_value: Some(format!("{attr_name}=\"{old_val}\"")),
+                    new_value: Some(format!("{attr_name}=\"{new_val}\"")),
+                    has_test_implications: true,
+                    test_description: Some(format!(
+                        "Tests querying `[{attr_name}=\"{old_val}\"]` will no longer \
+                         match. Update selectors to use \"{new_val}\"."
+                    )),
+                    element: binding.map(|b| b.target_element.clone()),
+                    migration_from: None,
+                    dependency_chain: Some(dep_chain),
+                });
+
+                info!(
+                    component = %component_name,
+                    attribute = %attr_name,
+                    old = %old_val,
+                    new = %new_val,
+                    "Transitive behavioral change: managed attribute output changed"
+                );
+            }
+        }
+    }
+
+    changes
+}
+
+/// Analyze old/new helper function bodies to detect changes in generated
+/// data attribute values.
+///
+/// This performs a simple string-literal extraction from the function bodies,
+/// looking for patterns like `"PF5/ComponentName"` → `"PF6/ComponentName"`.
+///
+/// Returns a list of (attribute_name, old_value, new_value) tuples.
+fn diff_helper_output(
+    fn_name: &str,
+    old_body: &str,
+    new_body: &str,
+) -> Vec<(String, String, String)> {
+    let mut changes = Vec::new();
+
+    // Extract string literals from both bodies
+    let old_strings = extract_string_literals(old_body);
+    let new_strings = extract_string_literals(new_body);
+
+    // Look for version prefix changes (e.g., "PF5/" → "PF6/")
+    // This is the primary pattern for OUIA component type changes.
+    for old_str in &old_strings {
+        // Find strings that look like versioned component types
+        if let Some((prefix, suffix)) = extract_version_prefix(old_str) {
+            // Look for a matching string in the new body with a different prefix
+            for new_str in &new_strings {
+                if let Some((new_prefix, new_suffix)) = extract_version_prefix(new_str) {
+                    if suffix == new_suffix && prefix != new_prefix {
+                        // Found a version prefix change
+                        changes.push((
+                            "data-ouia-component-type".to_string(),
+                            old_str.clone(),
+                            new_str.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if changes.is_empty() {
+        // Fallback: detect any string literal changes between old and new bodies.
+        // Report them generically as potential output changes.
+        let old_set: HashSet<&String> = old_strings.iter().collect();
+        let new_set: HashSet<&String> = new_strings.iter().collect();
+
+        let removed: Vec<_> = old_set.difference(&new_set).collect();
+        let added: Vec<_> = new_set.difference(&old_set).collect();
+
+        // If exactly one string was removed and one added, it's likely a
+        // value change. Report it generically.
+        if removed.len() == 1 && added.len() == 1 {
+            changes.push((
+                format!("{fn_name}-output"),
+                (*removed[0]).clone(),
+                (*added[0]).clone(),
+            ));
+        }
+    }
+
+    changes
+}
+
+/// Extract string literals from a function body.
+///
+/// Uses simple regex-like matching for quoted strings. This is intentionally
+/// simple for Phase 1 — we're looking for literal version prefixes like
+/// `"PF5/"` or `'PF6/'`, not complex expression evaluation.
+fn extract_string_literals(body: &str) -> Vec<String> {
+    let mut strings = Vec::new();
+    let mut chars = body.chars().peekable();
+
+    while let Some(&ch) = chars.peek() {
+        if ch == '"' || ch == '\'' || ch == '`' {
+            let quote = ch;
+            chars.next(); // consume opening quote
+            let mut literal = String::new();
+            let mut escaped = false;
+            for next_ch in chars.by_ref() {
+                if escaped {
+                    literal.push(next_ch);
+                    escaped = false;
+                } else if next_ch == '\\' {
+                    escaped = true;
+                } else if next_ch == quote {
+                    break;
+                } else if quote == '`' && next_ch == '$' {
+                    // Skip template literal expressions
+                    literal.push(next_ch);
+                } else {
+                    literal.push(next_ch);
+                }
+            }
+            if !literal.is_empty() {
+                strings.push(literal);
+            }
+        } else {
+            chars.next();
+        }
+    }
+
+    strings
+}
+
+/// Try to extract a version prefix pattern from a string.
+///
+/// Matches patterns like "PF5/ComponentName" or "PF6/ComponentName"
+/// where the prefix is "PF" followed by a digit.
+///
+/// Returns `Some((prefix, suffix))` where prefix is e.g. "PF5" and
+/// suffix is e.g. "/ComponentName".
+fn extract_version_prefix(s: &str) -> Option<(String, String)> {
+    // Match "PF<digit>/<rest>"
+    if s.len() >= 4 && s.starts_with("PF") {
+        let digit_end = s[2..].find('/').map(|i| i + 2)?;
+        let prefix_part = &s[..digit_end];
+        // Ensure the part between "PF" and "/" is numeric
+        if s[2..digit_end].chars().all(|c| c.is_ascii_digit()) {
+            let suffix = &s[digit_end..];
+            return Some((prefix_part.to_string(), suffix.to_string()));
+        }
+    }
+    None
+}
+
+// ── Phase B.5: Extends resolution ────────────────────────────────────────
+
+/// Enrich `all_props` for profiles that have unresolved `extends_props`.
+///
+/// For each profile with `extends_props` entries (e.g., `["OUIAProps"]`),
+/// finds the import for that type in the component source, resolves the
+/// import path to a source file via `read_git_file`, parses the interface,
+/// and merges its props into `all_props`. After enrichment, re-extracts
+/// `managed_attributes` with the enriched prop set.
+///
+/// Returns the number of profiles that were enriched.
+fn enrich_all_props_from_extends(
+    repo: &Path,
+    git_ref: &str,
+    profiles: &mut HashMap<String, ComponentSourceProfile>,
+    worktree_path: Option<&Path>,
+) -> usize {
+    let mut enriched_count = 0;
+
+    // When a worktree is available, create a ResolverMap for robust import
+    // resolution (handles barrel files, package imports, tsconfig paths).
+    let resolver_map: Option<crate::resolve::ResolverMap> = worktree_path.map(|wt| {
+        let rm = crate::resolve::create_resolver_map(wt, 5);
+        debug!(
+            worktree = %wt.display(),
+            "Created ResolverMap for extends resolution"
+        );
+        rm
+    });
+
+    // Collect profiles that need enrichment (avoid borrowing profiles during mutation)
+    let needs_enrichment: Vec<(String, String, Vec<String>)> = profiles
+        .iter()
+        .filter(|(_, p)| !p.extends_props.is_empty())
+        .map(|(name, p)| (name.clone(), p.file.clone(), p.extends_props.clone()))
+        .collect();
+
+    for (component_name, file_path, extends_props) in &needs_enrichment {
+        // Read the component source — prefer worktree filesystem when available
+        let source = if let Some(wt) = worktree_path {
+            let full_path = wt.join(file_path);
+            std::fs::read_to_string(&full_path).ok()
+        } else {
+            read_git_file(repo, git_ref, file_path)
+        };
+        let source = match source {
+            Some(s) => s,
+            None => {
+                trace!(
+                    component = %component_name,
+                    file = %file_path,
+                    "extends enrichment: could not read component source"
+                );
+                continue;
+            }
+        };
+
+        // Parse imports from the component source
+        let imports = parse_import_sources(&source, file_path);
+
+        let mut newly_added_props = Vec::new();
+
+        for extends_type in extends_props {
+            // Find which import brings in this type
+            let import_source = match find_import_for_type(&source, extends_type) {
+                Some(s) => s,
+                None => {
+                    trace!(
+                        component = %component_name,
+                        extends_type = %extends_type,
+                        "extends enrichment: no import found for type"
+                    );
+                    continue;
+                }
+            };
+
+            // ── Resolve import path to a file ────────────────────────
+            //
+            // Two paths: (1) oxc_resolver when worktree is available,
+            // (2) manual probing via read_git_file as fallback.
+            if let (Some(wt), Some(rm)) = (worktree_path, &resolver_map) {
+                // oxc_resolver path: handles relative imports, barrel files,
+                // package imports, and tsconfig path aliases.
+                let component_dir = std::path::Path::new(file_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new(""));
+                let full_component_dir = wt.join(component_dir);
+
+                let resolver = rm.resolver_for_file(&full_component_dir);
+                match resolver.resolve(&full_component_dir, &import_source) {
+                    Ok(resolved) => {
+                        let resolved_path = resolved.full_path();
+                        if let Ok(resolved_src) = std::fs::read_to_string(&resolved_path) {
+                            if let Some(props) =
+                                extract_interface_props(&resolved_src, extends_type)
+                            {
+                                newly_added_props.extend(props);
+                            } else {
+                                // Interface not in this file — follow re-exports
+                                // using oxc_resolver for each target
+                                resolve_reexports_with_resolver(
+                                    rm,
+                                    wt,
+                                    &resolved_src,
+                                    extends_type,
+                                    &resolved_path,
+                                    &mut newly_added_props,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        trace!(
+                            component = %component_name,
+                            extends_type = %extends_type,
+                            import_source = %import_source,
+                            %e,
+                            "extends enrichment: oxc_resolver failed"
+                        );
+                    }
+                }
+                continue;
+            }
+
+            // Fallback: manual path resolution via read_git_file
+            let resolved = match resolve_relative_import(file_path, &import_source, &imports) {
+                Some(p) => p,
+                None => {
+                    trace!(
+                        component = %component_name,
+                        extends_type = %extends_type,
+                        import_source = %import_source,
+                        "extends enrichment: could not resolve import (non-relative?)"
+                    );
+                    continue;
+                }
+            };
+
+            // Read the resolved file and extract the interface props.
+            // The resolved path may be a bare directory name (e.g.,
+            // "packages/react-core/src/helpers") which read_git_file can't
+            // read. In that case, probe for barrel files (.ts, /index.ts).
+            let interface_source = match read_git_file(repo, git_ref, &resolved) {
+                Some(s) => s,
+                None => {
+                    // Try barrel file (index.ts) resolution
+                    if let Some(barrel_resolved) =
+                        try_barrel_resolution(repo, git_ref, &resolved, extends_type)
+                    {
+                        if let Some(barrel_src) = read_git_file(repo, git_ref, &barrel_resolved) {
+                            // Try direct extraction first
+                            if let Some(props) = extract_interface_props(&barrel_src, extends_type)
+                            {
+                                newly_added_props.extend(props);
+                            } else {
+                                // Follow re-exports from the barrel file
+                                try_resolve_from_reexports(
+                                    repo,
+                                    git_ref,
+                                    &barrel_src,
+                                    extends_type,
+                                    &barrel_resolved,
+                                    &mut newly_added_props,
+                                );
+                            }
+                        } else {
+                            trace!(
+                                component = %component_name,
+                                extends_type = %extends_type,
+                                barrel = %barrel_resolved,
+                                "extends enrichment: barrel file unreadable"
+                            );
+                        }
+                    } else {
+                        trace!(
+                            component = %component_name,
+                            extends_type = %extends_type,
+                            resolved = %resolved,
+                            "extends enrichment: barrel resolution failed"
+                        );
+                    }
+                    continue;
+                }
+            };
+
+            // Try to extract props directly from the resolved file
+            if let Some(props) = extract_interface_props(&interface_source, extends_type) {
+                newly_added_props.extend(props);
+            } else {
+                // The interface might be re-exported from this file — follow
+                // named and wildcard re-exports to find the actual definition.
+                try_resolve_from_reexports(
+                    repo,
+                    git_ref,
+                    &interface_source,
+                    extends_type,
+                    &resolved,
+                    &mut newly_added_props,
+                );
+            }
+        }
+
+        if !newly_added_props.is_empty() {
+            if let Some(profile) = profiles.get_mut(component_name) {
+                let before = profile.all_props.len();
+                for prop in &newly_added_props {
+                    profile.all_props.insert(prop.clone());
+                }
+                let added = profile.all_props.len() - before;
+                if added > 0 {
+                    debug!(
+                        component = %component_name,
+                        added = added,
+                        props = ?newly_added_props,
+                        "Enriched all_props from extends"
+                    );
+
+                    // Re-extract managed_attributes with enriched props
+                    profile.managed_attributes =
+                        crate::source_profile::managed_attrs::extract_managed_attributes(
+                            &source,
+                            component_name,
+                            &profile.all_props,
+                            &profile.data_attributes,
+                        );
+
+                    enriched_count += 1;
+                } else {
+                    trace!(
+                        component = %component_name,
+                        props = ?newly_added_props,
+                        "extends enrichment: all props already present (0 new)"
+                    );
+                }
+            }
+        } else {
+            trace!(
+                component = %component_name,
+                extends = ?extends_props,
+                "extends enrichment: no props resolved from any extends type"
+            );
+        }
+    }
+
+    enriched_count
+}
+
+/// Parse import declarations from a source file.
+/// Returns a map of imported type/value names to their module source strings.
+fn parse_import_sources(source: &str, _file_path: &str) -> HashMap<String, String> {
+    let allocator = oxc_allocator::Allocator::default();
+    let source_type = oxc_span::SourceType::tsx();
+    let parsed = oxc_parser::Parser::new(&allocator, source, source_type).parse();
+
+    let mut imports = HashMap::new();
+
+    for item in &parsed.program.body {
+        if let oxc_ast::ast::Statement::ImportDeclaration(import) = item {
+            let module_source = import.source.value.to_string();
+            if let Some(specifiers) = &import.specifiers {
+                for spec in specifiers {
+                    let local_name = match spec {
+                        oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(named) => {
+                            named.local.name.to_string()
+                        }
+                        oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(def) => {
+                            def.local.name.to_string()
+                        }
+                        oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(ns) => {
+                            ns.local.name.to_string()
+                        }
+                    };
+                    imports.insert(local_name, module_source.clone());
+                }
+            }
+        }
+    }
+
+    imports
+}
+
+/// Find the import source for a specific type name.
+fn find_import_for_type(source: &str, type_name: &str) -> Option<String> {
+    let allocator = oxc_allocator::Allocator::default();
+    let source_type = oxc_span::SourceType::tsx();
+    let parsed = oxc_parser::Parser::new(&allocator, source, source_type).parse();
+
+    for item in &parsed.program.body {
+        if let oxc_ast::ast::Statement::ImportDeclaration(import) = item {
+            if let Some(specifiers) = &import.specifiers {
+                for spec in specifiers {
+                    let imported_name = match spec {
+                        oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(named) => {
+                            match &named.imported {
+                                oxc_ast::ast::ModuleExportName::IdentifierName(id) => {
+                                    id.name.as_str()
+                                }
+                                oxc_ast::ast::ModuleExportName::IdentifierReference(id) => {
+                                    id.name.as_str()
+                                }
+                                oxc_ast::ast::ModuleExportName::StringLiteral(s) => {
+                                    s.value.as_str()
+                                }
+                            }
+                        }
+                        _ => continue,
+                    };
+                    if imported_name == type_name {
+                        return Some(import.source.value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve a relative import path to a file path within the repo.
+///
+/// Given a component file path and an import source like `../../helpers`,
+/// compute the resolved path by joining and probing extensions.
+fn resolve_relative_import(
+    component_file: &str,
+    import_source: &str,
+    _imports: &HashMap<String, String>,
+) -> Option<String> {
+    if !import_source.starts_with('.') {
+        // Non-relative import (npm package) — can't resolve without node_modules
+        return None;
+    }
+
+    // Compute the directory of the component file
+    let component_dir = std::path::Path::new(component_file).parent()?;
+    let joined = component_dir.join(import_source);
+
+    // Normalize the path (resolve `..`)
+    let normalized = normalize_path(&joined);
+
+    Some(normalized)
+}
+
+/// Normalize a path by resolving `.` and `..` components.
+fn normalize_path(path: &std::path::Path) -> String {
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => {
+                parts.push(other.as_os_str());
+            }
+        }
+    }
+    parts
+        .iter()
+        .map(|s| s.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Try to resolve an import by probing file extensions and index files
+/// via `read_git_file`. Returns the first path that exists.
+fn try_barrel_resolution(
+    repo: &Path,
+    git_ref: &str,
+    base_path: &str,
+    _type_name: &str,
+) -> Option<String> {
+    // Probe: base_path.ts, base_path.tsx, base_path/index.ts, base_path/index.tsx
+    let candidates = [
+        format!("{base_path}.ts"),
+        format!("{base_path}.tsx"),
+        format!("{base_path}/index.ts"),
+        format!("{base_path}/index.tsx"),
+    ];
+
+    for candidate in &candidates {
+        if read_git_file(repo, git_ref, candidate).is_some() {
+            return Some(candidate.clone());
+        }
+    }
+
+    None
+}
+
+/// Extract property names from an interface declaration in a source file.
+///
+/// Looks for `interface {type_name} { prop1: ...; prop2: ...; }` and
+/// returns the list of property names.
+fn extract_interface_props(source: &str, type_name: &str) -> Option<Vec<String>> {
+    let allocator = oxc_allocator::Allocator::default();
+    let source_type = oxc_span::SourceType::tsx();
+    let parsed = oxc_parser::Parser::new(&allocator, source, source_type).parse();
+
+    for item in &parsed.program.body {
+        // Check direct interface declaration
+        if let oxc_ast::ast::Statement::ExportNamedDeclaration(export) = item {
+            if let Some(oxc_ast::ast::Declaration::TSInterfaceDeclaration(iface)) =
+                &export.declaration
+            {
+                if iface.id.name.as_str() == type_name {
+                    return Some(extract_props_from_interface_body(iface));
+                }
+            }
+        }
+
+        // Check non-exported interface
+        if let oxc_ast::ast::Statement::TSInterfaceDeclaration(iface) = item {
+            if iface.id.name.as_str() == type_name {
+                return Some(extract_props_from_interface_body(iface));
+            }
+        }
+
+        // Check type alias: `export type OUIAProps = { ouiaId?: ...; }`
+        if let oxc_ast::ast::Statement::ExportNamedDeclaration(export) = item {
+            if let Some(oxc_ast::ast::Declaration::TSTypeAliasDeclaration(alias)) =
+                &export.declaration
+            {
+                if alias.id.name.as_str() == type_name {
+                    if let oxc_ast::ast::TSType::TSTypeLiteral(lit) = &alias.type_annotation {
+                        let mut props = Vec::new();
+                        for member in &lit.members {
+                            if let oxc_ast::ast::TSSignature::TSPropertySignature(prop) = member {
+                                if let oxc_ast::ast::PropertyKey::StaticIdentifier(id) = &prop.key {
+                                    props.push(id.name.to_string());
+                                }
+                            }
+                        }
+                        return Some(props);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract property names from an interface body.
+fn extract_props_from_interface_body(iface: &oxc_ast::ast::TSInterfaceDeclaration) -> Vec<String> {
+    let mut props = Vec::new();
+    for sig in &iface.body.body {
+        if let oxc_ast::ast::TSSignature::TSPropertySignature(prop) = sig {
+            if let oxc_ast::ast::PropertyKey::StaticIdentifier(id) = &prop.key {
+                props.push(id.name.to_string());
+            }
+        }
+    }
+    props
+}
+
+/// Try to resolve a type's interface props by following re-export chains
+/// from a barrel file. Checks all candidate paths (named re-exports first,
+/// then wildcard `export *` entries) until the interface is found.
+fn try_resolve_from_reexports(
+    repo: &Path,
+    git_ref: &str,
+    barrel_source: &str,
+    type_name: &str,
+    barrel_file: &str,
+    out: &mut Vec<String>,
+) {
+    let candidates = find_reexport_sources(barrel_source, type_name, barrel_file);
+    for candidate_path in &candidates {
+        // Try reading the candidate file directly
+        if let Some(src) = read_git_file(repo, git_ref, candidate_path) {
+            if let Some(props) = extract_interface_props(&src, type_name) {
+                out.extend(props);
+                return;
+            }
+        }
+        // Try without extension (the path already has .ts appended, but
+        // the actual file might be .tsx or need index resolution)
+        let base = candidate_path.trim_end_matches(".ts");
+        for ext in &[".tsx", "/index.ts", "/index.tsx"] {
+            let alt = format!("{base}{ext}");
+            if let Some(src) = read_git_file(repo, git_ref, &alt) {
+                if let Some(props) = extract_interface_props(&src, type_name) {
+                    out.extend(props);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Follow re-export chains using the worktree filesystem.
+///
+/// Similar to `try_resolve_from_reexports` but reads from the worktree
+/// filesystem instead of `read_git_file`. Uses `find_reexport_sources`
+/// to get candidate paths, then resolves them against the worktree.
+fn resolve_reexports_with_resolver(
+    _resolver_map: &crate::resolve::ResolverMap,
+    worktree: &Path,
+    barrel_source: &str,
+    type_name: &str,
+    barrel_file: &std::path::Path,
+    out: &mut Vec<String>,
+) {
+    // Strip the worktree prefix to get relative paths for find_reexport_sources
+    let barrel_rel = barrel_file
+        .strip_prefix(worktree)
+        .unwrap_or(barrel_file)
+        .to_string_lossy()
+        .to_string();
+
+    let candidates = find_reexport_sources(barrel_source, type_name, &barrel_rel);
+
+    for candidate_path in &candidates {
+        // candidate_path is a repo-relative path with .ts appended.
+        // Try reading it directly from the worktree.
+        let full_path = worktree.join(candidate_path);
+        if let Ok(src) = std::fs::read_to_string(&full_path) {
+            if let Some(props) = extract_interface_props(&src, type_name) {
+                out.extend(props);
+                return;
+            }
+        }
+
+        // Try without .ts extension (might be .tsx or need index resolution)
+        let base = candidate_path.trim_end_matches(".ts");
+        for ext in &[".tsx", "/index.ts", "/index.tsx"] {
+            let alt = format!("{base}{ext}");
+            let alt_path = worktree.join(&alt);
+            if let Ok(src) = std::fs::read_to_string(alt_path) {
+                if let Some(props) = extract_interface_props(&src, type_name) {
+                    out.extend(props);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Find re-export sources for a type in a barrel file.
+///
+/// Looks for patterns like:
+/// - `export { OUIAProps } from './OUIA/ouia'` — named re-export (returned first)
+/// - `export * from './OUIA/ouia'` — wildcard re-export (all candidates returned)
+///
+/// Returns resolved file paths of candidate re-export sources. Named
+/// re-exports are returned first (they're definitive); wildcard re-exports
+/// are returned as candidates since the type might be in any of them.
+fn find_reexport_sources(barrel_source: &str, type_name: &str, barrel_file: &str) -> Vec<String> {
+    let allocator = oxc_allocator::Allocator::default();
+    let source_type = oxc_span::SourceType::tsx();
+    let parsed = oxc_parser::Parser::new(&allocator, barrel_source, source_type).parse();
+
+    let barrel_dir = std::path::Path::new(barrel_file)
+        .parent()
+        .unwrap_or(std::path::Path::new(""));
+
+    let mut named = Vec::new();
+    let mut wildcards = Vec::new();
+
+    for item in &parsed.program.body {
+        if let oxc_ast::ast::Statement::ExportNamedDeclaration(export) = item {
+            if let Some(source) = &export.source {
+                let module_source = source.value.as_str();
+
+                // Check if this export includes the type we're looking for
+                let exports_type = export.specifiers.iter().any(|spec| {
+                    let exported_name = match &spec.exported {
+                        oxc_ast::ast::ModuleExportName::IdentifierName(id) => id.name.as_str(),
+                        oxc_ast::ast::ModuleExportName::IdentifierReference(id) => id.name.as_str(),
+                        oxc_ast::ast::ModuleExportName::StringLiteral(s) => s.value.as_str(),
+                    };
+                    exported_name == type_name
+                });
+
+                if exports_type && module_source.starts_with('.') {
+                    let joined = barrel_dir.join(module_source);
+                    let resolved = normalize_path(&joined);
+                    named.push(format!("{resolved}.ts"));
+                }
+            }
+        }
+
+        // Wildcard re-exports: `export * from './OUIA/ouia'`
+        if let oxc_ast::ast::Statement::ExportAllDeclaration(export_all) = item {
+            let module_source = export_all.source.value.as_str();
+            if module_source.starts_with('.') {
+                let joined = barrel_dir.join(module_source);
+                let resolved = normalize_path(&joined);
+                wildcards.push(format!("{resolved}.ts"));
+            }
+        }
+    }
+
+    // Named re-exports first (definitive), then wildcards (candidates)
+    named.extend(wildcards);
+    named
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2724,5 +3655,115 @@ export { DropdownList } from './DropdownList';
                 "Allowed set should include ActionListItem"
             );
         }
+    }
+
+    #[test]
+    fn test_ouia_extends_enrichment_chain() {
+        // Test the individual functions in the extends enrichment chain
+        // using TabAction as the representative component.
+
+        // 1. Test extract_profile produces extends_props with OUIAProps
+        let tab_action_source = r#"
+            import * as React from 'react';
+            import { css } from '@patternfly/react-styles';
+            import styles from '@patternfly/react-styles/css/components/Tabs/tabs';
+            import { Button } from '../Button';
+            import { getOUIAProps, OUIAProps } from '../../helpers';
+
+            export interface TabActionProps extends Omit<React.HTMLProps<HTMLButtonElement>, 'ref' | 'type' | 'size'>, OUIAProps {
+                children?: React.ReactNode;
+                className?: string;
+                onClick?: (event: React.MouseEvent<HTMLElement, MouseEvent>) => void;
+                isDisabled?: boolean;
+                'aria-label'?: string;
+                innerRef?: React.Ref<any>;
+            }
+        "#;
+
+        let profile = crate::source_profile::extract_profile(
+            "TabAction",
+            "packages/react-core/src/components/Tabs/TabAction.tsx",
+            tab_action_source,
+        );
+        assert!(
+            profile.extends_props.contains(&"OUIAProps".to_string()),
+            "TabAction extends_props should contain OUIAProps, got: {:?}",
+            profile.extends_props
+        );
+
+        // 2. Test find_import_for_type finds OUIAProps import
+        let import_source = find_import_for_type(tab_action_source, "OUIAProps");
+        assert_eq!(
+            import_source.as_deref(),
+            Some("../../helpers"),
+            "Should find OUIAProps import from '../../helpers'"
+        );
+
+        // 3. Test resolve_relative_import resolves to helpers directory
+        let imports = parse_import_sources(
+            tab_action_source,
+            "packages/react-core/src/components/Tabs/TabAction.tsx",
+        );
+        let resolved = resolve_relative_import(
+            "packages/react-core/src/components/Tabs/TabAction.tsx",
+            "../../helpers",
+            &imports,
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("packages/react-core/src/helpers"),
+            "Should resolve to packages/react-core/src/helpers"
+        );
+
+        // 4. Test extract_interface_props finds OUIAProps in ouia.ts source
+        let ouia_source = r#"
+            import { useMemo } from 'react';
+            type OuiaId = number | string;
+            export interface OUIAProps {
+                ouiaId?: OuiaId;
+                ouiaSafe?: boolean;
+            }
+            export function getOUIAProps(componentType: string, id: OuiaId, ouiaSafe: boolean = true) {
+                return {};
+            }
+        "#;
+        let ouia_props = extract_interface_props(ouia_source, "OUIAProps");
+        assert_eq!(
+            ouia_props,
+            Some(vec!["ouiaId".to_string(), "ouiaSafe".to_string()]),
+            "Should extract ouiaId and ouiaSafe from OUIAProps interface"
+        );
+
+        // 5. Test find_reexport_sources finds OUIA/ouia from helpers/index.ts barrel
+        let barrel_source = r#"
+            export * from './constants';
+            export * from './OUIA/ouia';
+            export * from './util';
+        "#;
+        let reexport_sources = find_reexport_sources(
+            barrel_source,
+            "OUIAProps",
+            "packages/react-core/src/helpers/index.ts",
+        );
+        assert!(
+            !reexport_sources.is_empty(),
+            "Should find re-export sources for OUIAProps from barrel file"
+        );
+        assert!(
+            reexport_sources.iter().any(|p| p.contains("OUIA/ouia")),
+            "Re-export sources should include OUIA/ouia path, got: {:?}",
+            reexport_sources
+        );
+
+        // 6. Verify that all_props initially does NOT contain ouiaId/ouiaSafe
+        assert!(
+            !profile.all_props.contains("ouiaId"),
+            "Before enrichment, all_props should not contain ouiaId. Got: {:?}",
+            profile.all_props
+        );
+        assert!(
+            !profile.all_props.contains("ouiaSafe"),
+            "Before enrichment, all_props should not contain ouiaSafe"
+        );
     }
 }

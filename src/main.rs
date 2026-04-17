@@ -266,8 +266,9 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
 
     // Build report (includes composition changes + hierarchy enrichment)
     let phase = reporter.start_phase("Building analysis report");
-    let mut report =
-        analyzer.lang.build_report(&result, &common.repo, &common.from, &common.to);
+    let mut report = analyzer
+        .lang
+        .build_report(&result, &common.repo, &common.from, &common.to);
     phase.finish("Report built");
 
     // ── Infer CSS suffix renames via LLM ─────────────────────────────
@@ -295,7 +296,10 @@ async fn cmd_analyze_ts(args: TsAnalyzeArgs, reporter: &ProgressReporter) -> Res
                         let analyzer = LlmBehaviorAnalyzer::new(&cmd).with_timeout(llm_timeout);
                         let removed_refs: Vec<&str> = removed.iter().map(|s| s.as_str()).collect();
                         let added_refs: Vec<&str> = added.iter().map(|s| s.as_str()).collect();
-                        let prompt = semver_analyzer_ts::llm_prompts::build_suffix_rename_prompt(&removed_refs, &added_refs);
+                        let prompt = semver_analyzer_ts::llm_prompts::build_suffix_rename_prompt(
+                            &removed_refs,
+                            &added_refs,
+                        );
                         analyzer.infer_suffix_renames_from_prompt(&prompt)
                     }
                 })
@@ -887,8 +891,11 @@ async fn cmd_analyze_java(
     );
 
     let diff_phase = reporter.start_phase("Diffing Java API surfaces");
-    let structural_changes =
-        semver_analyzer_core::traits::diff_surfaces_with_semantics(&old_surface, &new_surface, &java);
+    let structural_changes = semver_analyzer_core::traits::diff_surfaces_with_semantics(
+        &old_surface,
+        &new_surface,
+        &java,
+    );
 
     let breaking = structural_changes.iter().filter(|c| c.is_breaking).count();
     diff_phase.finish_with_detail(
@@ -916,8 +923,7 @@ async fn cmd_analyze_java(
         degradation: shared.degradation_arc(),
     };
 
-    let report =
-        java.build_report(&results, &common.repo, &common.from, &common.to);
+    let report = java.build_report(&results, &common.repo, &common.from, &common.to);
 
     report_phase.finish_with_detail(
         "Report built",

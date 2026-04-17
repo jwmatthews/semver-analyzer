@@ -309,6 +309,19 @@ pub struct ManagedAttributeBinding {
     /// by the managed spread. Correlated from the data_attributes map.
     /// e.g., ["data-ouia-component-id", "data-ouia-component-type"]
     pub overridden_attributes: Vec<String>,
+
+    /// Whether the managed spread comes AFTER the rest spread on the
+    /// same JSX element, meaning the component's generated attributes
+    /// silently override any consumer-provided values.
+    ///
+    /// `true` = component wins (managed spread after rest spread).
+    /// `false` = consumer wins (managed spread before rest, or no rest).
+    ///
+    /// Prop-attribute-override rules only fire when `true`. Transitive
+    /// behavioral change detection (Phase A.7) uses both — the helper's
+    /// output change affects the rendered attributes regardless of order.
+    #[serde(default)]
+    pub component_overrides: bool,
 }
 
 // ── Source Level Change (diff between two profiles) ─────────────────────
@@ -364,6 +377,20 @@ pub struct SourceLevelChange {
     /// deprecated Select and its non-deprecated replacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_from: Option<String>,
+
+    /// For transitive behavioral changes: the chain from the affected
+    /// component to the root cause dependency.
+    ///
+    /// Example: `["Alert", "getOUIAProps", "src/helpers/OUIA/ouia.ts"]`
+    /// means Alert is affected because it imports `getOUIAProps` from
+    /// `ouia.ts`, and that helper function changed its output between
+    /// versions.
+    ///
+    /// When `None`, the change was detected by direct profile comparison
+    /// (the normal case). When `Some`, it was detected by analyzing
+    /// transitive dependency changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_chain: Option<Vec<String>>,
 }
 
 /// Categories of source-level changes.

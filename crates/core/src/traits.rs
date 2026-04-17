@@ -480,6 +480,24 @@ pub trait MessageFormatter {
     fn describe(&self, change: &StructuralChange) -> String;
 }
 
+// ── Worktree sharing ─────────────────────────────────────────────────────
+
+/// Opaque handle to a checked-out worktree.
+///
+/// Keeps the worktree alive as long as the handle exists. The worktree
+/// is cleaned up when the last `Arc<dyn WorktreeAccess>` drops.
+///
+/// Language crates implement this on their worktree guard type. The
+/// orchestrator holds `Arc<dyn WorktreeAccess>` to share worktrees
+/// between TD and SD pipelines via `std::sync::mpsc::channel`.
+pub trait WorktreeAccess: Send + Sync + 'static {
+    /// Filesystem path to the worktree directory.
+    fn path(&self) -> &Path;
+}
+
+/// Result of `extract_keeping_worktree`: API surface + optional worktree handle.
+pub type ExtractionWithWorktree<M> = (ApiSurface<M>, Option<Arc<dyn WorktreeAccess>>);
+
 // ── Extended analysis parameters ─────────────────────────────────────────
 
 /// Parameters for `Language::run_extended_analysis`.
@@ -514,12 +532,18 @@ pub struct ExtendedAnalysisParams {
     /// analyzed monorepo.
     pub dep_repo_packages: HashMap<String, String>,
 
-    /// Functions whose bodies changed between old and new refs.
-    /// Produced by `Language::parse_changed_functions()` and used by the
-    /// SD pipeline to detect transitive behavioral changes — e.g., when a
-    /// helper function like `getOUIAProps()` changes its output, all
-    /// components that import it are transitively affected.
-    pub changed_functions: Vec<ChangedFunction>,
+    /// Filesystem path to the from-ref worktree (if shared by TD).
+    ///
+    /// When set, the SD pipeline uses filesystem reads instead of
+    /// `read_git_file` for the old version. Also enables `oxc_resolver`
+    /// for robust import resolution (barrel files, package imports,
+    /// tsconfig path aliases).
+    pub from_worktree_path: Option<PathBuf>,
+
+    /// Filesystem path to the to-ref worktree (if shared by TD).
+    ///
+    /// Same as `from_worktree_path` but for the new version.
+    pub to_worktree_path: Option<PathBuf>,
 }
 
 // ── LLM category definitions ────────────────────────────────────────────
@@ -664,6 +688,26 @@ pub trait Language:
         git_ref: &str,
         degradation: Option<&crate::diagnostics::DegradationTracker>,
     ) -> Result<ApiSurface<Self::SymbolData>>;
+
+    /// Extract the API surface and optionally keep the worktree alive.
+    ///
+    /// Like `extract()`, but returns an `Arc<dyn WorktreeAccess>` that
+    /// keeps the worktree alive after extraction. The orchestrator uses
+    /// this to share worktrees between TD and SD pipelines.
+    ///
+    /// Default implementation calls `extract()` and returns `None` for
+    /// the worktree handle (worktree is created and dropped internally).
+    /// Languages that support worktree sharing override this to wrap
+    /// the guard in `Arc` and return it.
+    fn extract_keeping_worktree(
+        &self,
+        repo: &Path,
+        git_ref: &str,
+        degradation: Option<&crate::diagnostics::DegradationTracker>,
+    ) -> Result<ExtractionWithWorktree<Self::SymbolData>> {
+        let surface = self.extract(repo, git_ref, degradation)?;
+        Ok((surface, None))
+    }
 
     /// Parse the diff between two git refs and identify all functions
     /// whose bodies changed (public AND private).

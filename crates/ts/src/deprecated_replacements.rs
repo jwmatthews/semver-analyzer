@@ -318,6 +318,7 @@ mod tests {
             test_description: None,
             element: None,
             migration_from: None,
+            dependency_chain: None,
         }
     }
 
@@ -333,6 +334,7 @@ mod tests {
             test_description: None,
             element: None,
             migration_from: None,
+            dependency_chain: None,
         }
     }
 
@@ -348,6 +350,7 @@ mod tests {
             test_description: None,
             element: None,
             migration_from: None,
+            dependency_chain: None,
         }
     }
 

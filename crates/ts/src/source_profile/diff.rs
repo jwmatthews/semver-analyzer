@@ -73,6 +73,7 @@ fn diff_portal_usage(
             test_description: test_desc,
             element: None,
             migration_from: None,
+            dependency_chain: None,
         });
     }
 }
@@ -101,6 +102,7 @@ fn diff_context_dependencies(
                 test_description: None,
                 element: None,
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -121,6 +123,7 @@ fn diff_context_dependencies(
                 test_description: None,
                 element: None,
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -153,6 +156,7 @@ fn diff_context_providers(
                 )),
                 element: None,
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -177,6 +181,7 @@ fn diff_context_providers(
                 )),
                 element: None,
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -207,6 +212,7 @@ fn diff_forward_ref(
             test_description: None,
             element: None,
             migration_from: None,
+            dependency_chain: None,
         });
     }
 }
@@ -236,6 +242,7 @@ fn diff_memo(
             test_description: None,
             element: None,
             migration_from: None,
+            dependency_chain: None,
         });
     }
 }
@@ -264,6 +271,7 @@ fn diff_prop_defaults(
                     test_description: None,
                     element: None,
                     migration_from: None,
+                    dependency_chain: None,
                 });
             }
             None => {
@@ -280,6 +288,7 @@ fn diff_prop_defaults(
                     test_description: None,
                     element: None,
                     migration_from: None,
+                    dependency_chain: None,
                 });
             }
             _ => {} // Same value, no change
@@ -301,6 +310,7 @@ fn diff_prop_defaults(
                 test_description: None,
                 element: None,
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -337,6 +347,7 @@ fn diff_rendered_components(
                 test_description: None,
                 element: None,
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -353,6 +364,7 @@ fn diff_rendered_components(
                 test_description: None,
                 element: None,
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -381,6 +393,7 @@ fn diff_dom_structure(
                 )),
                 element: Some(elem.clone()),
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -400,6 +413,7 @@ fn diff_dom_structure(
                 )),
                 element: Some(elem.clone()),
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -431,6 +445,7 @@ fn diff_aria_attributes(
                 )),
                 element: Some(elem.clone()),
                 migration_from: None,
+                dependency_chain: None,
             });
         } else if let Some(old_val) = old.aria_attributes.get(&(elem.clone(), attr.clone())) {
             if old_val != val {
@@ -448,6 +463,7 @@ fn diff_aria_attributes(
                     )),
                     element: Some(elem.clone()),
                     migration_from: None,
+                    dependency_chain: None,
                 });
             }
         }
@@ -471,6 +487,7 @@ fn diff_aria_attributes(
                 )),
                 element: Some(elem.clone()),
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -501,6 +518,7 @@ fn diff_role_attributes(
                     )),
                     element: Some(elem.clone()),
                     migration_from: None,
+                    dependency_chain: None,
                 });
             }
             None => {
@@ -516,6 +534,7 @@ fn diff_role_attributes(
                     )),
                     element: Some(elem.clone()),
                     migration_from: None,
+                    dependency_chain: None,
                 });
             }
             _ => {}
@@ -536,6 +555,7 @@ fn diff_role_attributes(
                 )),
                 element: Some(elem.clone()),
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -566,6 +586,7 @@ fn diff_data_attributes(
                 )),
                 element: Some(elem.clone()),
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -587,6 +608,7 @@ fn diff_data_attributes(
                 )),
                 element: Some(elem.clone()),
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -613,6 +635,7 @@ fn diff_css_tokens(
             )),
             element: None,
             migration_from: None,
+            dependency_chain: None,
         });
     }
 
@@ -629,6 +652,7 @@ fn diff_css_tokens(
             )),
             element: None,
             migration_from: None,
+            dependency_chain: None,
         });
     }
 }
@@ -669,6 +693,7 @@ fn diff_prop_style_bindings(
                     )),
                     element: None,
                     migration_from: None,
+                    dependency_chain: None,
                 });
             } else if prop_still_exists && token_still_used && !still_bound {
                 // The token still exists but the prop no longer controls it
@@ -687,6 +712,7 @@ fn diff_prop_style_bindings(
                     )),
                     element: None,
                     migration_from: None,
+                    dependency_chain: None,
                 });
             }
         }
@@ -716,6 +742,7 @@ fn diff_prop_style_bindings(
                     )),
                     element: None,
                     migration_from: None,
+                    dependency_chain: None,
                 });
             }
         }
@@ -742,31 +769,79 @@ fn diff_managed_attributes(
         .map(|b| (&b.prop_name, &b.generator_function))
         .collect();
 
-    // New managed attributes — component now overrides consumer-provided HTML attrs
+    // New managed attributes — component now overrides consumer-provided HTML attrs.
+    // Only emit PropAttributeOverride changes for component-wins bindings.
+    // Consumer-wins bindings (managed spread before rest) are tracked for
+    // transitive behavioral change detection (Phase A.7) but don't generate
+    // prop-override rules since the consumer can override the managed value.
+    //
+    // Also detects spread order transitions: when a binding existed in the old
+    // version with `component_overrides: false` (consumer wins) and now has
+    // `component_overrides: true` (component wins). This is the scenario where
+    // consumer's explicit attribute values that worked before are now silently
+    // overridden. (e.g., PF 5.3→5.4 changed OUIA spread order.)
     for binding in &new.managed_attributes {
+        if !binding.component_overrides {
+            continue;
+        }
         let key = (&binding.prop_name, &binding.generator_function);
-        if !old_bindings.contains(&key) {
+
+        // Check if the binding is brand new OR if it transitioned from consumer-wins
+        let is_new_binding = !old_bindings.contains(&key);
+        let old_was_consumer_wins = old.managed_attributes.iter().any(|b| {
+            b.prop_name == binding.prop_name
+                && b.generator_function == binding.generator_function
+                && !b.component_overrides
+        });
+
+        if is_new_binding || old_was_consumer_wins {
             let attrs_list = if binding.overridden_attributes.is_empty() {
                 "HTML attributes".to_string()
             } else {
                 binding.overridden_attributes.join(", ")
             };
 
-            changes.push(SourceLevelChange {
-                component: component.to_string(),
-                category: SourceLevelCategory::PropAttributeOverride,
-                description: format!(
+            let description = if old_was_consumer_wins {
+                format!(
+                    "{component}'s `{prop}` prop now silently overrides {attrs} via {func}(). \
+                     Previously, consumer-provided values took precedence. \
+                     Any explicit `{attrs}` attributes on this component will be ignored.",
+                    prop = binding.prop_name,
+                    attrs = attrs_list,
+                    func = binding.generator_function,
+                )
+            } else {
+                format!(
                     "{component}'s `{prop}` prop overrides {attrs} via {func}(). \
                      Use the `{prop}` prop instead of setting these HTML attributes directly.",
                     prop = binding.prop_name,
                     attrs = attrs_list,
                     func = binding.generator_function,
-                ),
-                old_value: None,
+                )
+            };
+
+            changes.push(SourceLevelChange {
+                component: component.to_string(),
+                category: SourceLevelCategory::PropAttributeOverride,
+                description,
+                old_value: if old_was_consumer_wins {
+                    Some(format!(
+                        "{} → {} (consumer wins)",
+                        binding.prop_name,
+                        binding.overridden_attributes.join(", ")
+                    ))
+                } else {
+                    None
+                },
                 new_value: Some(format!(
-                    "{} → {}",
+                    "{} → {}{}",
                     binding.prop_name,
-                    binding.overridden_attributes.join(", ")
+                    binding.overridden_attributes.join(", "),
+                    if old_was_consumer_wins {
+                        " (component wins)"
+                    } else {
+                        ""
+                    }
                 )),
                 has_test_implications: true,
                 test_description: Some(format!(
@@ -780,12 +855,17 @@ fn diff_managed_attributes(
                 )),
                 element: None,
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
 
-    // Removed managed attributes — component no longer overrides
+    // Removed managed attributes — component no longer overrides.
+    // Only emit for component-wins bindings (same filter as above).
     for binding in &old.managed_attributes {
+        if !binding.component_overrides {
+            continue;
+        }
         let key = (&binding.prop_name, &binding.generator_function);
         if !new_bindings.contains(&key) {
             changes.push(SourceLevelChange {
@@ -807,6 +887,7 @@ fn diff_managed_attributes(
                 test_description: None,
                 element: None,
                 migration_from: None,
+                dependency_chain: None,
             });
         }
     }
@@ -838,6 +919,7 @@ fn diff_children_slot(
             test_description: None,
             element: None,
             migration_from: None,
+            dependency_chain: None,
         });
     }
 
@@ -852,6 +934,7 @@ fn diff_children_slot(
             test_description: None,
             element: None,
             migration_from: None,
+            dependency_chain: None,
         });
     }
 
@@ -866,6 +949,7 @@ fn diff_children_slot(
             test_description: None,
             element: None,
             migration_from: None,
+            dependency_chain: None,
         });
     }
 }
@@ -1189,6 +1273,7 @@ mod tests {
                 "data-ouia-component-id".into(),
                 "data-ouia-component-type".into(),
             ],
+            component_overrides: true,
         });
 
         let changes = diff_profiles(&old, &new);
@@ -1216,6 +1301,7 @@ mod tests {
             generator_function: "getOUIAProps".into(),
             target_element: "button".into(),
             overridden_attributes: vec!["data-ouia-component-id".into()],
+            component_overrides: true,
         });
         let new = make_profile("MenuToggle");
 
@@ -1237,6 +1323,7 @@ mod tests {
             generator_function: "getOUIAProps".into(),
             target_element: "button".into(),
             overridden_attributes: vec!["data-ouia-component-id".into()],
+            component_overrides: true,
         };
 
         let mut profile = make_profile("MenuToggle");
