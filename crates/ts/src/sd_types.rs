@@ -778,6 +778,16 @@ pub struct SdPipelineResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_css_blocks: Vec<String>,
 
+    /// CSS classes where a version prefix swap produces a non-existent class.
+    ///
+    /// Each entry is `(old_class, dead_swapped_class)`. For example,
+    /// `("pf-v5-c-form__actions--right", "pf-v6-c-form__actions--right")`
+    /// when the `__actions--right` BEM modifier was removed in v6.
+    /// Used to generate rules that flag these dead classes and prevent
+    /// the `CssVariablePrefix` fix from creating broken CSS.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dead_css_classes_after_swap: Vec<(String, String)>,
+
     /// Deprecated component → replacement mappings detected via rendering swaps.
     ///
     /// When a component is relocated to `/deprecated/` and other components

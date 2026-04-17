@@ -672,6 +672,32 @@ async fn cmd_konveyor_ts(args: TsKonveyorArgs, reporter: &ProgressReporter) -> R
             let sd_strategies = konveyor::extract_fix_strategies(&sd_rules);
             strategies.extend(sd_strategies);
 
+            // Enrich the broad CSS class prefix rule's fix strategy with
+            // exclusion patterns from dead-class detection. This prevents
+            // the fix engine from blindly swapping prefixes on classes that
+            // were removed (not just renamed) in the target version.
+            if !sd.dead_css_classes_after_swap.is_empty() {
+                let dead_old_classes: Vec<String> = sd
+                    .dead_css_classes_after_swap
+                    .iter()
+                    .map(|(old, _)| old.clone())
+                    .collect();
+
+                // Find and update the broad prefix rule strategy
+                for (rule_id, strategy) in strategies.iter_mut() {
+                    if rule_id.starts_with("semver-consumer-css-stale-class-")
+                        && strategy.strategy == "CssVariablePrefix"
+                    {
+                        strategy.exclude_patterns = dead_old_classes.clone();
+                        info!(
+                            rule_id = %rule_id,
+                            count = dead_old_classes.len(),
+                            "Added dead-class exclusions to CSS prefix swap strategy"
+                        );
+                    }
+                }
+            }
+
             // Generate family-level strategies from composition data.
             // These describe the complete target component structure (e.g., Modal
             // with ModalHeader/ModalBody/ModalFooter) so the fix engine can build

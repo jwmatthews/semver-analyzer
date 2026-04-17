@@ -544,6 +544,13 @@ pub struct ExtendedAnalysisParams {
     ///
     /// Same as `from_worktree_path` but for the new version.
     pub to_worktree_path: Option<PathBuf>,
+
+    /// CSS classes where a naive version prefix swap (e.g., `pf-v5-` → `pf-v6-`)
+    /// produces a class name that does not exist in the target CSS distribution.
+    ///
+    /// Each entry is `(old_class, dead_swapped_class)`. Used to generate rules
+    /// that flag these dead classes and suppress the blind prefix swap fix.
+    pub dead_css_classes_after_swap: Vec<(String, String)>,
 }
 
 // ── LLM category definitions ────────────────────────────────────────────

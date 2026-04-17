@@ -695,6 +695,7 @@ impl Language for TypeScript {
 
         // Wire orchestrator-computed data into the SD result
         sd_result.removed_css_blocks = params.removed_dep_components.clone();
+        sd_result.dead_css_classes_after_swap = params.dead_css_classes_after_swap.clone();
         sd_result.dep_repo_packages = params.dep_repo_packages.clone();
 
         Ok(TsAnalysisExtensions {

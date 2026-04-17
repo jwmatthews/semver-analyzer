@@ -110,6 +110,11 @@ pub fn generate_sd_rules(
     // ── CSS class removal rules ─────────────────────────────────────
     rules.extend(generate_css_class_removal_rules(&sd.removed_css_blocks));
 
+    // ── Dead CSS class rules (prefix swap produces non-existent class) ──
+    rules.extend(generate_dead_css_class_rules(
+        &sd.dead_css_classes_after_swap,
+    ));
+
     rules
 }
 
@@ -3681,6 +3686,76 @@ fn block_to_component_name(block: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Generate rules for CSS classes where a version prefix swap produces a
+/// class name that does not exist in the target CSS distribution.
+///
+/// These rules catch two scenarios:
+/// 1. Consumer code still using the old class (e.g., `pf-v5-c-form__actions--right`)
+/// 2. Consumer code where a blind prefix swap was already applied, producing
+///    a dead class (e.g., `pf-v6-c-form__actions--right` doesn't exist in PFv6)
+///
+/// Both versions are matched by a single rule using regex alternation.
+/// The fix strategy is `None` (manual), since there's no valid v6 replacement.
+fn generate_dead_css_class_rules(dead_classes: &[(String, String)]) -> Vec<KonveyorRule> {
+    use semver_analyzer_konveyor_core::sanitize_id;
+
+    let mut rules = Vec::new();
+
+    for (old_class, dead_v6_class) in dead_classes {
+        // Build a regex that matches both the old and the dead-swapped version.
+        // Escape regex metacharacters in the class names.
+        let old_escaped = regex::escape(old_class);
+        let dead_escaped = regex::escape(dead_v6_class);
+        let pattern = format!("({}|{})", old_escaped, dead_escaped);
+
+        let rule_id = format!("sd-css-dead-class-{}", sanitize_id(old_class));
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=css-dead-class".into(),
+                "impact=visual-regression".into(),
+                "suppresses-prefix-swap=true".into(),
+            ],
+            effort: 3,
+            category: "mandatory".into(),
+            description: format!(
+                "CSS class '{}' was removed — prefix swap to '{}' is invalid",
+                old_class, dead_v6_class
+            ),
+            message: format!(
+                "The CSS class '{}' was removed in the new version. \
+                 A simple version prefix swap to '{}' does NOT produce a valid class — \
+                 this class does not exist in the target CSS distribution.\n\n\
+                 Remove this class reference or replace it with appropriate custom CSS \
+                 or a PatternFly component prop.",
+                old_class, dead_v6_class
+            ),
+            links: vec![],
+            when: KonveyorCondition::FrontendCssClass {
+                cssclass: FrontendPatternFields {
+                    pattern,
+                    // Scan all file types — these appear in JSX className strings too
+                    file_pattern: None,
+                },
+            },
+            // No automated fix — manual intervention required since the class
+            // was removed, not just renamed.
+            fix_strategy: None,
+        });
+    }
+
+    if !rules.is_empty() {
+        tracing::info!(
+            count = rules.len(),
+            "Generated dead CSS class rules (prefix swap produces non-existent class)"
+        );
+    }
+
+    rules
 }
 
 // ── Helper functions ────────────────────────────────────────────────────

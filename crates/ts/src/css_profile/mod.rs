@@ -21,7 +21,7 @@ use lightningcss::rules::CssRule;
 use lightningcss::selector::{Combinator, Component, Selector};
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info, warn};
@@ -154,6 +154,201 @@ pub fn extract_css_profiles(
 
     info!(profiles = profiles.len(), "CSS profiles extracted");
     Ok(profiles)
+}
+
+// ── CSS class inventory extraction ──────────────────────────────────────
+
+/// Extract a complete inventory of CSS class selector names from a git ref.
+///
+/// Unlike `extract_css_profiles` which builds structural BEM profiles, this
+/// function collects **all** CSS class names (component, utility, layout,
+/// modifier) into a flat `HashSet<String>`. Used to detect "dead" classes:
+/// v5 classes where a naive prefix swap produces a v6 class that doesn't
+/// actually exist in the target CSS distribution.
+pub fn extract_css_class_inventory(repo: &Path, git_ref: &str) -> Result<HashSet<String>> {
+    let css_files = find_component_css_files(repo, git_ref)?;
+
+    // Also discover utility and layout CSS files (not just components)
+    let all_css_files = find_all_css_files(repo, git_ref)?;
+
+    let mut classes = HashSet::new();
+
+    let process_source = |source: &str, classes: &mut HashSet<String>| {
+        let Ok(stylesheet) = StyleSheet::parse(source, ParserOptions::default()) else {
+            return;
+        };
+        for rule in &stylesheet.rules.0 {
+            collect_classes_from_rule(rule, classes);
+        }
+    };
+
+    // Process component CSS files
+    for (_component_dir, css_path) in &css_files {
+        if let Some(source) = crate::git_utils::read_git_file(repo, git_ref, css_path) {
+            process_source(&source, &mut classes);
+        }
+    }
+
+    // Process non-component CSS files (utilities, layouts, etc.)
+    for css_path in &all_css_files {
+        if let Some(source) = crate::git_utils::read_git_file(repo, git_ref, css_path) {
+            process_source(&source, &mut classes);
+        }
+    }
+
+    info!(
+        classes = classes.len(),
+        git_ref = git_ref,
+        "CSS class inventory extracted"
+    );
+    Ok(classes)
+}
+
+/// Extract a complete CSS class inventory from a filesystem directory.
+///
+/// Walks all subdirectories looking for `.css` files and collects every
+/// CSS class selector name. Companion to `extract_css_class_inventory`
+/// for use with built worktrees.
+pub fn extract_css_class_inventory_from_dir(dir: &Path) -> Result<HashSet<String>> {
+    let mut classes = HashSet::new();
+
+    // Walk the entire directory tree for CSS files
+    fn walk_dir(dir: &Path, classes: &mut HashSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip node_modules, .git, etc.
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name.starts_with('.') || name == "node_modules" {
+                    continue;
+                }
+                walk_dir(&path, classes);
+            } else if path.extension().is_some_and(|e| e == "css") {
+                let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                if fname.contains(".min.") || fname.contains(".map") {
+                    continue;
+                }
+                if let Ok(source) = std::fs::read_to_string(&path) {
+                    if let Ok(stylesheet) = StyleSheet::parse(&source, ParserOptions::default()) {
+                        for rule in &stylesheet.rules.0 {
+                            collect_classes_from_rule(rule, classes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    walk_dir(dir, &mut classes);
+
+    info!(
+        classes = classes.len(),
+        dir = %dir.display(),
+        "CSS class inventory extracted from dir"
+    );
+    Ok(classes)
+}
+
+/// Recursively collect all CSS class selector names from a CSS rule.
+fn collect_classes_from_rule(rule: &CssRule, classes: &mut HashSet<String>) {
+    match rule {
+        CssRule::Style(style_rule) => {
+            for selector in style_rule.selectors.0.iter() {
+                collect_classes_from_selector(selector, classes);
+            }
+        }
+        CssRule::Media(m) => {
+            for r in &m.rules.0 {
+                collect_classes_from_rule(r, classes);
+            }
+        }
+        CssRule::Supports(s) => {
+            for r in &s.rules.0 {
+                collect_classes_from_rule(r, classes);
+            }
+        }
+        CssRule::LayerBlock(l) => {
+            for r in &l.rules.0 {
+                collect_classes_from_rule(r, classes);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract class names from a single selector, including pseudo-class functions.
+fn collect_classes_from_selector(selector: &Selector, classes: &mut HashSet<String>) {
+    for component in selector.iter() {
+        match component {
+            Component::Class(name) => {
+                classes.insert(name.as_ref().to_string());
+            }
+            Component::Negation(selectors) => {
+                for sel in selectors.iter() {
+                    collect_classes_from_selector(sel, classes);
+                }
+            }
+            Component::Is(selectors) | Component::Where(selectors) => {
+                for sel in selectors.iter() {
+                    collect_classes_from_selector(sel, classes);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Find ALL CSS files in the repo at a given ref (not just components).
+///
+/// Discovers utility, layout, and other non-component CSS files that
+/// `find_component_css_files` skips.
+fn find_all_css_files(repo: &Path, git_ref: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &repo.to_string_lossy(),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            git_ref,
+        ])
+        .output()
+        .context("Failed to run 'git ls-tree' for CSS file discovery")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "git ls-tree failed for CSS file discovery at ref {}: {}",
+            git_ref,
+            stderr
+        );
+    }
+
+    let mut files = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let path = line.trim();
+        if !path.ends_with(".css") {
+            continue;
+        }
+        // Skip minified, sourcemap, example, and test files
+        if path.contains(".min.css")
+            || path.contains(".map")
+            || path.contains("/examples/")
+            || path.contains("/test")
+        {
+            continue;
+        }
+        // Skip files already covered by find_component_css_files
+        if path.contains("/components/") {
+            continue;
+        }
+        files.push(path.to_string());
+    }
+
+    Ok(files)
 }
 
 /// Extract CSS profiles from a filesystem directory of compiled CSS.

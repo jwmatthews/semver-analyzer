@@ -708,7 +708,8 @@ pub fn run_sd(
         new_required_props,
         dep_repo_packages: HashMap::new(), // populated by orchestrator from --dep-repo
         removed_css_blocks: Vec::new(),    // populated by orchestrator from dep-repo diff
-        deprecated_replacements: Vec::new(), // populated by orchestrator from rendering swaps
+        dead_css_classes_after_swap: Vec::new(), // populated by orchestrator from CSS inventory diff
+        deprecated_replacements: Vec::new(),     // populated by orchestrator from rendering swaps
         old_profiles,
         new_profiles,
     })
