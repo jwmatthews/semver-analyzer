@@ -13,6 +13,8 @@ use semver_analyzer_core::Symbol as CoreSymbol;
 use semver_analyzer_core::{
     AccessorKind, Parameter, Signature, SymbolKind, TypeParameter, Visibility,
 };
+
+use crate::worktree::RefBuildConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -206,20 +208,20 @@ impl OxcExtractor {
     /// Extract API surface from a repo at a given git ref.
     ///
     /// Creates a worktree, installs dependencies, runs tsc, and parses .d.ts files.
-    /// An optional `build_command` can override the default tsc invocation for
-    /// projects that require custom build steps (e.g., monorepos with code generation).
+    /// The `config` parameter controls Node.js version, install command, and
+    /// build command overrides for the worktree.
     pub fn extract_at_ref(
         &self,
         repo: &Path,
         git_ref: &str,
-        build_command: Option<&str>,
+        config: &RefBuildConfig,
         degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
     ) -> Result<ApiSurface> {
         use crate::worktree::{ExtractionWarning, WorktreeGuard};
         use semver_analyzer_core::error::DiagnoseWithTip;
 
         // Create worktree, install deps, run tsc --declaration (with fallback)
-        let guard = WorktreeGuard::new(repo, git_ref, build_command).diagnose()?;
+        let guard = WorktreeGuard::new(repo, git_ref, config).diagnose()?;
 
         // Record any extraction warnings as degradation
         if let Some(tracker) = degradation {

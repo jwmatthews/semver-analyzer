@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::extensions::TsAnalysisExtensions;
+use crate::worktree::RefBuildConfig;
 use crate::TsSymbolData;
 
 // ── TypeScript language type ────────────────────────────────────────────
@@ -29,19 +30,31 @@ use crate::TsSymbolData;
 /// The TypeScript language implementation.
 #[derive(Debug, Clone)]
 pub struct TypeScript {
-    build_command: Option<String>,
+    ref_config: RefBuildConfig,
 }
 
 impl TypeScript {
     pub fn new(build_command: Option<String>) -> Self {
-        Self { build_command }
+        Self {
+            ref_config: RefBuildConfig {
+                build_command,
+                ..Default::default()
+            },
+        }
+    }
+
+    pub fn with_ref_config(config: RefBuildConfig) -> Self {
+        Self { ref_config: config }
     }
 }
 
 impl Default for TypeScript {
     fn default() -> Self {
         Self {
-            build_command: Some("yarn build".to_string()),
+            ref_config: RefBuildConfig {
+                build_command: Some("yarn build".to_string()),
+                ..Default::default()
+            },
         }
     }
 }
@@ -370,7 +383,7 @@ impl Language for TypeScript {
         degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
     ) -> Result<ApiSurface<TsSymbolData>> {
         let extractor = crate::extract::OxcExtractor::new();
-        extractor.extract_at_ref(repo, git_ref, self.build_command.as_deref(), degradation)
+        extractor.extract_at_ref(repo, git_ref, &self.ref_config, degradation)
     }
 
     fn extract_keeping_worktree(
@@ -382,7 +395,7 @@ impl Language for TypeScript {
         use crate::worktree::{ExtractionWarning, WorktreeGuard};
         use semver_analyzer_core::error::DiagnoseWithTip;
 
-        let guard = WorktreeGuard::new(repo, git_ref, self.build_command.as_deref()).diagnose()?;
+        let guard = WorktreeGuard::new(repo, git_ref, &self.ref_config).diagnose()?;
 
         // Record extraction warnings as degradation (same detail as extract_at_ref)
         if let Some(tracker) = degradation {
