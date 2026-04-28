@@ -2930,6 +2930,8 @@ const LABEL_QUERY_PATTERN: &str =
     "^(getByLabelText|queryByLabelText|findByLabelText|getAllByLabelText|queryAllByLabelText|findAllByLabelText)$";
 const DATA_ATTR_QUERY_PATTERN: &str =
     "^(querySelector|querySelectorAll|getByAttribute|queryByAttribute|findByAttribute)$";
+const TEXT_QUERY_PATTERN: &str =
+    "^(getByText|queryByText|findByText|getAllByText|queryAllByText|findAllByText|getByLabelText|queryByLabelText|findByLabelText|getAllByLabelText|queryAllByLabelText|findAllByLabelText)$";
 const TEST_FILE_PATTERN: &str = ".*\\.(test|spec)\\.(ts|tsx|js|jsx)$";
 
 /// Map HTML element names to their implicit ARIA roles.
@@ -3313,6 +3315,98 @@ fn generate_test_impact_rules(
                     },
                     fix_strategy: Some(FixStrategyEntry::new("Manual")),
                 });
+            }
+
+            // ── Prop default changes: match getByText/getByLabelText('old') ─
+            SourceLevelCategory::PropDefault => {
+                if let Some(ref old_val) = change.old_value {
+                    // Strip quotes to get the raw string value
+                    let unquoted = old_val.trim_matches(|c| c == '\'' || c == '"');
+                    if unquoted.is_empty() || !is_concrete_value(unquoted) {
+                        continue;
+                    }
+
+                    let prefix = rule_prefix(&change.migration_from);
+                    let rule_id = format!(
+                        "{}-test-{}-default-{}-changed",
+                        prefix,
+                        sanitize(&change.component),
+                        sanitize(unquoted),
+                    );
+
+                    let new_display = change
+                        .new_value
+                        .as_deref()
+                        .map(|v| v.trim_matches(|c| c == '\'' || c == '"'))
+                        .unwrap_or("(removed)");
+
+                    let message = if change.new_value.is_some() {
+                        format!(
+                            "{} default prop value changed: '{}' → '{}'.\n\n\
+                             Tests using queries that match the old default value will fail:\n  \
+                             getByLabelText('{}') → getByLabelText('{}')\n  \
+                             getByText('{}') → getByText('{}')",
+                            change.component,
+                            unquoted,
+                            new_display,
+                            unquoted,
+                            new_display,
+                            unquoted,
+                            new_display,
+                        )
+                    } else {
+                        format!(
+                            "{} default prop value '{}' was removed.\n\n\
+                             Tests using queries that match the old default value will fail:\n  \
+                             getByLabelText('{}') and getByText('{}') may no longer match.",
+                            change.component, unquoted, unquoted, unquoted,
+                        )
+                    };
+
+                    rules.push(KonveyorRule {
+                        rule_id,
+                        labels: vec![
+                            "source=semver-analyzer".into(),
+                            "change-type=test-impact".into(),
+                            "impact=frontend-testing".into(),
+                            format!("package={}", pkg),
+                        ],
+                        effort: 1,
+                        category: "optional".into(),
+                        description: format!(
+                            "Test impact: {} default '{}' {}",
+                            change.component,
+                            unquoted,
+                            if change.new_value.is_some() {
+                                "changed"
+                            } else {
+                                "removed"
+                            }
+                        ),
+                        message,
+                        links: vec![],
+                        when: KonveyorCondition::FrontendReferenced {
+                            referenced: FrontendReferencedFields {
+                                pattern: TEXT_QUERY_PATTERN.into(),
+                                location: "FUNCTION_CALL".into(),
+                                component: None,
+                                parent: None,
+                                not_parent: None,
+                                child: None,
+                                not_child: None,
+                                requires_child: None,
+                                parent_from: None,
+                                value: Some(format!(
+                                    "^{}$",
+                                    regex::escape(unquoted)
+                                )),
+                                from: None,
+                                file_pattern: Some(TEST_FILE_PATTERN.into()),
+                            },
+                        },
+                        fix_strategy: None,
+                    });
+                }
             }
 
             // DataAttribute and PortalUsage are transitive-only — handled in Phase 2

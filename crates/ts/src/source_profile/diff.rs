@@ -288,6 +288,11 @@ fn diff_prop_defaults(
     for (prop, new_val) in &new.prop_defaults {
         match old.prop_defaults.get(prop) {
             Some(old_val) if old_val != new_val => {
+                // String default values (quoted literals) have test implications
+                // because tests may query by the default text via getByLabelText,
+                // getByText, etc. (e.g., closeBtnAriaLabel: 'Close chip group').
+                let is_string_default =
+                    old_val.starts_with('\'') || old_val.starts_with('"');
                 changes.push(SourceLevelChange {
                     component: component.to_string(),
                     category: SourceLevelCategory::PropDefault,
@@ -296,7 +301,7 @@ fn diff_prop_defaults(
                     ),
                     old_value: Some(old_val.clone()),
                     new_value: Some(new_val.clone()),
-                    has_test_implications: false,
+                    has_test_implications: is_string_default,
                     test_description: None,
                     element: None,
                     migration_from: None,
@@ -327,6 +332,8 @@ fn diff_prop_defaults(
     // Check for removed defaults
     for (prop, old_val) in &old.prop_defaults {
         if !new.prop_defaults.contains_key(prop) {
+            let is_string_default =
+                old_val.starts_with('\'') || old_val.starts_with('"');
             changes.push(SourceLevelChange {
                 component: component.to_string(),
                 category: SourceLevelCategory::PropDefault,
@@ -335,7 +342,7 @@ fn diff_prop_defaults(
                 ),
                 old_value: Some(old_val.clone()),
                 new_value: None,
-                has_test_implications: false,
+                has_test_implications: is_string_default,
                 test_description: None,
                 element: None,
                 migration_from: None,

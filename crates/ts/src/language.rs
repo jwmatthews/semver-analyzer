@@ -764,6 +764,11 @@ impl Language for TypeScript {
                 );
             }
             sd.deprecated_replacements = deprecated_replacements;
+
+            // Diff renamed deprecated components against their replacements.
+            // Phase A.5 only handles same-name lookups; this covers renames
+            // like ChipGroup → LabelGroup using the mapping just computed.
+            crate::deprecated_replacements::diff_renamed_replacements(sd);
         }
 
         // Transform structural changes

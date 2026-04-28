@@ -1073,9 +1073,16 @@ async fn cmd_analyze_java(
         &format!("{} breaking changes", report.summary.total_breaking_changes),
     );
 
-    // Output
-    let envelope = build_envelope(&report, &result.structural_changes)?;
-    write_json_output(&envelope, common.output.as_deref(), reporter)?;
+    // Output -- write the full AnalysisReport (same format as TypeScript).
+    // This allows `konveyor java --from-report` to load it directly.
+    // Also write the envelope alongside it for consumers that need it.
+    write_json_output(&report, common.output.as_deref(), reporter)?;
+
+    if let Some(output_path) = common.output.as_deref() {
+        let envelope = build_envelope(&report, &result.structural_changes)?;
+        let envelope_path = output_path.with_extension("envelope.json");
+        write_json_output(&envelope, Some(&envelope_path), reporter)?;
+    }
 
     // Print degradation summary
     diagnostics::print_degradation_summary(&result.degradation, reporter);

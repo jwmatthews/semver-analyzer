@@ -72,8 +72,73 @@ fn collect_defaults_from_statement<'a>(
             if let Some(expr) = export.declaration.as_expression() {
                 collect_defaults_from_expression(expr, source, defaults);
             }
+            if let ExportDefaultDeclarationKind::ClassDeclaration(cls) = &export.declaration {
+                collect_defaults_from_class(cls, source, defaults);
+            }
+        }
+        Statement::ClassDeclaration(cls) => {
+            collect_defaults_from_class(cls, source, defaults);
         }
         _ => {}
+    }
+}
+
+/// Extract default values from a class component's `static defaultProps`.
+///
+/// Handles the pattern:
+/// ```tsx
+/// class ChipGroup extends React.Component<ChipGroupProps> {
+///   static defaultProps: ChipGroupProps = {
+///     closeBtnAriaLabel: 'Close chip group',
+///     numChips: 3,
+///   };
+/// }
+/// ```
+fn collect_defaults_from_class(
+    cls: &Class<'_>,
+    source: &str,
+    defaults: &mut BTreeMap<String, String>,
+) {
+    for element in &cls.body.body {
+        if let ClassElement::PropertyDefinition(prop_def) = element {
+            // Must be `static defaultProps = { ... }`
+            if !prop_def.r#static {
+                continue;
+            }
+            let key_name = match &prop_def.key {
+                PropertyKey::StaticIdentifier(id) => id.name.as_str(),
+                _ => continue,
+            };
+            if key_name != "defaultProps" {
+                continue;
+            }
+            // Extract values from the object expression
+            if let Some(Expression::ObjectExpression(obj)) = &prop_def.value {
+                collect_defaults_from_object(obj, source, defaults);
+            }
+        }
+    }
+}
+
+/// Extract key-value pairs from an object expression (shared by class
+/// defaultProps and potentially other object-based default patterns).
+fn collect_defaults_from_object(
+    obj: &ObjectExpression<'_>,
+    source: &str,
+    defaults: &mut BTreeMap<String, String>,
+) {
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop {
+            let name = match &p.key {
+                PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                PropertyKey::StringLiteral(s) => s.value.to_string(),
+                _ => continue,
+            };
+            let value_text = span_text(source, p.value.span()).trim().to_string();
+            if !value_text.is_empty() {
+                defaults.insert(name, value_text);
+            }
+        }
     }
 }
 
@@ -92,6 +157,9 @@ fn collect_defaults_from_declaration<'a>(
                     collect_defaults_from_expression(init, source, defaults);
                 }
             }
+        }
+        Declaration::ClassDeclaration(cls) => {
+            collect_defaults_from_class(cls, source, defaults);
         }
         _ => {}
     }
@@ -273,5 +341,54 @@ mod tests {
 
         let defaults = extract_prop_defaults(source);
         assert!(defaults.is_empty());
+    }
+
+    #[test]
+    fn test_extract_class_component_static_default_props() {
+        let source = r#"
+            class ChipGroup extends React.Component<ChipGroupProps> {
+                static defaultProps: ChipGroupProps = {
+                    closeBtnAriaLabel: 'Close chip group',
+                    numChips: 3,
+                    isClosable: false,
+                    categoryName: '',
+                    'aria-label': 'Chip group category',
+                };
+                render() { return <div />; }
+            }
+        "#;
+
+        let defaults = extract_prop_defaults(source);
+        assert_eq!(
+            defaults.get("closeBtnAriaLabel"),
+            Some(&"'Close chip group'".to_string())
+        );
+        assert_eq!(defaults.get("numChips"), Some(&"3".to_string()));
+        assert_eq!(defaults.get("isClosable"), Some(&"false".to_string()));
+        assert_eq!(defaults.get("categoryName"), Some(&"''".to_string()));
+        assert_eq!(
+            defaults.get("aria-label"),
+            Some(&"'Chip group category'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_exported_class_component_default_props() {
+        let source = r#"
+            export class LabelGroup extends React.Component<LabelGroupProps> {
+                static defaultProps: LabelGroupProps = {
+                    closeBtnAriaLabel: 'Close label group',
+                    numLabels: 3,
+                };
+                render() { return <div />; }
+            }
+        "#;
+
+        let defaults = extract_prop_defaults(source);
+        assert_eq!(
+            defaults.get("closeBtnAriaLabel"),
+            Some(&"'Close label group'".to_string())
+        );
+        assert_eq!(defaults.get("numLabels"), Some(&"3".to_string()));
     }
 }

@@ -368,6 +368,64 @@ pub fn detect_deprecated_replacements_from_commits(
     replacements
 }
 
+/// Diff deprecated components against their renamed replacements.
+///
+/// Phase A.5 of the SD pipeline only diffs deprecated components against
+/// same-named replacements (e.g., deprecated/Select → Select). For renamed
+/// replacements (e.g., ChipGroup → LabelGroup), the same-name lookup fails.
+///
+/// This function runs after `deprecated_replacements` has been populated
+/// (in `finalize_extensions`). It uses the old→new name mapping to look
+/// up profiles and diff them, appending any source-level changes.
+pub fn diff_renamed_replacements(sd: &mut SdPipelineResult) {
+    use crate::source_profile::diff::diff_profiles;
+    use tracing::info;
+
+    let replacements: Vec<_> = sd.deprecated_replacements.clone();
+
+    for replacement in &replacements {
+        // Skip same-name replacements — already handled by Phase A.5
+        if replacement.old_component == replacement.new_component {
+            continue;
+        }
+
+        let old_profile = match sd.old_profiles.get(&replacement.old_component) {
+            Some(p) => p.clone(),
+            None => continue,
+        };
+        let new_profile = match sd.new_profiles.get(&replacement.new_component) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let changes = diff_profiles(&old_profile, new_profile);
+
+        // Tag changes with migration_from (the deprecated source path) and
+        // update the component name to the replacement name so downstream
+        // rule generation targets the correct component.
+        let tagged: Vec<_> = changes
+            .into_iter()
+            .map(|mut c| {
+                c.migration_from = Some(old_profile.file.clone());
+                c.component = replacement.new_component.clone();
+                c
+            })
+            .collect();
+
+        if !tagged.is_empty() {
+            info!(
+                old = %replacement.old_component,
+                new = %replacement.new_component,
+                changes = tagged.len(),
+                "Cross-name deprecated migration diff: {} → {}",
+                replacement.old_component,
+                replacement.new_component,
+            );
+            sd.source_level_changes.extend(tagged);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
