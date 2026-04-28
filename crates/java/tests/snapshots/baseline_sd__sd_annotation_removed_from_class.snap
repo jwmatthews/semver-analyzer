@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: "diff_profiles(&old, &new)"
+---
+- class_name: com.example.Service
+  category: AnnotationRemoved
+  description: "Annotation `@Component` removed from `Service`"
+  is_breaking: true
+  method: ~
+  old_value: "@Component"
+  new_value: ~

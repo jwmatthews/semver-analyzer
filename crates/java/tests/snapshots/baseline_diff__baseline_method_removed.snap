@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_diff.rs
+expression: "diff(&surface(vec![old_cls]), &surface(vec![new_cls]),)"
+---
+- symbol: process
+  qualified_name: com.example.Service.process
+  kind: Method
+  change_type: "Removed(Member { name: \"process\", kind: Method })"
+  is_breaking: true
+  description: "method `process` was removed from `Service`"
+  before: "method: process: void"
+  after: ~
+  has_migration_target: false

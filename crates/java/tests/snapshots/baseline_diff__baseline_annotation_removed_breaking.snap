@@ -1,0 +1,5 @@
+---
+source: crates/java/tests/baseline_diff.rs
+expression: "diff(&surface(vec![old_cls]), &surface(vec![new_cls]),)"
+---
+[]

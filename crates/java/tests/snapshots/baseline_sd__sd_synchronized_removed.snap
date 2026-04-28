@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: "diff_profiles(&old, &new)"
+---
+- class_name: com.example.Cache
+  category: SynchronizationRemoved
+  description: "Method `update` is no longer synchronized — thread safety may be affected"
+  is_breaking: true
+  method: update
+  old_value: synchronized
+  new_value: ~

@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: "diff_profiles(&old, &new)"
+---
+- class_name: com.example.IO
+  category: ExceptionAdded
+  description: "Method `read` now throws `IOException` — callers must handle this"
+  is_breaking: true
+  method: read
+  old_value: ~
+  new_value: IOException

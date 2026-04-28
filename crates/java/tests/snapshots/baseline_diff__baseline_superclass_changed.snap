@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: MyList
+  qualified_name: com.example.MyList
+  kind: Class
+  change_type: Changed(BaseClass)
+  is_breaking: true
+  description: "`MyList` base class changed from AbstractList to AbstractCollection"
+  before: AbstractList
+  after: AbstractCollection
+  has_migration_target: false

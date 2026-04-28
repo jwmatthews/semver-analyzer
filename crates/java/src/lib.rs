@@ -22,10 +22,14 @@ pub mod types;
 
 // Extraction and analysis modules
 pub mod diff_parser;
+pub mod extensions;
 pub mod extract;
+pub mod index;
 pub mod konveyor;
 pub mod manifest;
 pub mod report;
+pub mod sd_pipeline;
+pub mod sd_types;
 pub mod test_analyzer;
 pub mod worktree;
 
@@ -35,3 +39,6 @@ pub use types::{
     JavaAnnotation, JavaCategory, JavaEvidence, JavaManifestChangeType, JavaReportData,
     JavaSymbolData,
 };
+pub use extensions::JavaAnalysisExtensions;
+pub use konveyor::JavaKonveyorConfig;
+pub use worktree::JavaRefBuildConfig;

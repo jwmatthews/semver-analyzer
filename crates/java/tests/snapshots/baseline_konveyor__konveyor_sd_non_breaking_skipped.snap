@@ -1,0 +1,5 @@
+---
+source: crates/java/tests/baseline_konveyor.rs
+expression: normalize_rules(&rules)
+---
+[]

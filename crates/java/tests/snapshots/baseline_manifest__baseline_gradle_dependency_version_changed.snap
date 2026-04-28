@@ -1,0 +1,10 @@
+---
+source: crates/java/tests/baseline_manifest.rs
+expression: "diff_manifest(old, new)"
+---
+- field: "dependency:com.google.guava:guava"
+  change_type: DependencyVersionChanged
+  is_breaking: false
+  description: "Dependency `com.google.guava:guava` changed: `com.google.guava:guava:31.0-jre` -> `com.google.guava:guava:33.0-jre`"
+  before: "com.google.guava:guava:31.0-jre"
+  after: "com.google.guava:guava:33.0-jre"

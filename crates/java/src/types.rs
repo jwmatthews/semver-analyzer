@@ -72,6 +72,41 @@ pub struct JavaSymbolData {
     /// existing subclasses will fail to compile.
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_final: bool,
+
+    /// Whether this class/interface is `non-sealed`.
+    ///
+    /// A `non-sealed` subclass of a sealed parent allows further
+    /// unrestricted extension. Changing from `non-sealed` to `sealed`
+    /// is breaking.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_non_sealed: bool,
+
+    /// Whether this method is `synchronized`.
+    ///
+    /// Removing `synchronized` from a public method is potentially
+    /// breaking for callers relying on thread-safety guarantees.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_synchronized: bool,
+
+    /// Whether this field is `transient` (excluded from serialization).
+    ///
+    /// Adding or removing `transient` on a `Serializable` class field
+    /// changes serialization behavior.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_transient: bool,
+
+    /// Whether this field is `volatile` (memory visibility guarantee).
+    ///
+    /// Removing `volatile` from a field is potentially breaking for
+    /// concurrent code relying on the visibility guarantee.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_volatile: bool,
+
+    /// Whether this method is `native` (JNI implementation).
+    ///
+    /// Removing `native` is a breaking change for JNI consumers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_native: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -177,12 +212,33 @@ pub enum JavaEvidence {
 
 // ── Report data ─────────────────────────────────────────────────────────
 
-/// Java-specific report data.
+/// Java-specific report data carried on `TypeSummary<Java>`.
 ///
-/// Placeholder for future Java-specific report enrichment (e.g.,
-/// Spring annotation analysis, module system changes).
+/// Provides SD pipeline statistics and Java-specific analysis
+/// metadata for each package.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JavaReportData {
-    #[serde(default)]
-    pub _placeholder: (),
+    /// Number of source-level changes detected by the SD pipeline.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_level_changes: usize,
+
+    /// Number of breaking source-level changes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub breaking_source_changes: usize,
+
+    /// Number of annotation changes detected.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub annotation_changes: usize,
+
+    /// Number of module system changes detected.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub module_changes: usize,
+
+    /// Number of serialization compatibility issues.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub serialization_issues: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }

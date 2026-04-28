@@ -3,6 +3,7 @@
 //! Provides all Java-specific semantic rules, message formatting,
 //! and associated types for the multi-language architecture.
 
+use crate::extensions::JavaAnalysisExtensions;
 use crate::types::{
     JavaAnnotation, JavaCategory, JavaEvidence, JavaManifestChangeType, JavaReportData,
     JavaSymbolData,
@@ -18,12 +19,90 @@ use std::path::Path;
 // ── Java language type ──────────────────────────────────────────────────
 
 /// The Java language implementation.
-#[derive(Debug, Clone)]
-pub struct Java;
+///
+/// Optionally carries per-ref build configuration for Maven/Gradle
+/// builds. When no config is provided, source files are parsed
+/// directly with tree-sitter (no build step).
+///
+/// The `index` field is lazily built on the first call to `find_callers`
+/// or `find_references`, using the repo root stored during `extract`.
+pub struct Java {
+    /// Per-ref build configuration (optional).
+    ref_config: Option<crate::worktree::JavaRefBuildConfig>,
+    /// Lazily-built cross-file index for call graph walking.
+    index: std::sync::Mutex<Option<crate::index::JavaIndex>>,
+    /// Repo root path, stored after extraction for index building.
+    repo_root: std::sync::Mutex<Option<std::path::PathBuf>>,
+}
+
+impl std::fmt::Debug for Java {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Java")
+            .field("ref_config", &self.ref_config)
+            .field("has_index", &self.index.lock().ok().map(|i| i.is_some()))
+            .finish()
+    }
+}
+
+impl Clone for Java {
+    fn clone(&self) -> Self {
+        Self {
+            ref_config: self.ref_config.clone(),
+            // Don't clone the lazily-built index; it will be rebuilt if needed
+            index: std::sync::Mutex::new(None),
+            repo_root: std::sync::Mutex::new(
+                self.repo_root.lock().ok().and_then(|r| r.clone()),
+            ),
+        }
+    }
+}
+
+impl Java {
+    /// Create a new Java language instance with no build configuration.
+    pub fn new() -> Self {
+        Self {
+            ref_config: None,
+            index: std::sync::Mutex::new(None),
+            repo_root: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Create a Java language instance with per-ref build configuration.
+    pub fn with_ref_config(config: crate::worktree::JavaRefBuildConfig) -> Self {
+        Self {
+            ref_config: Some(config),
+            index: std::sync::Mutex::new(None),
+            repo_root: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Get or build the cross-file index for the repo.
+    fn get_or_build_index(&self) -> Result<std::sync::MutexGuard<'_, Option<crate::index::JavaIndex>>> {
+        let mut guard = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let repo = self
+                .repo_root
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(repo_path) = repo {
+                match crate::index::JavaIndex::build(&repo_path) {
+                    Ok(idx) => {
+                        *guard = Some(idx);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to build Java index for call graph");
+                    }
+                }
+            }
+        }
+        Ok(guard)
+    }
+}
 
 impl Default for Java {
     fn default() -> Self {
-        Self
+        Self::new()
     }
 }
 
@@ -201,6 +280,140 @@ impl LanguageSemantics<JavaSymbolData> for Java {
                     Some("sealed".into()),
                     Some("non-sealed".into()),
                     format!("Class `{}` is no longer sealed", old.name),
+                    false,
+                ));
+            }
+        }
+
+        // ── Non-sealed modifier changes ────────────────────────────────
+        if old_data.is_non_sealed != new_data.is_non_sealed {
+            if !new_data.is_non_sealed && new_data.is_sealed {
+                // non-sealed → sealed is handled by the sealed change above
+            } else if new_data.is_non_sealed {
+                changes.push(lang_change(
+                    old,
+                    StructuralChangeType::Changed(ChangeSubject::Modifier {
+                        modifier: "non-sealed".into(),
+                    }),
+                    Some("sealed/final".into()),
+                    Some("non-sealed".into()),
+                    format!(
+                        "Class `{}` is now non-sealed — unrestricted extension is allowed",
+                        old.name
+                    ),
+                    false,
+                ));
+            }
+        }
+
+        // ── Synchronized modifier changes ───────────────────────────────
+        if old_data.is_synchronized != new_data.is_synchronized {
+            if !new_data.is_synchronized {
+                changes.push(lang_change(
+                    old,
+                    StructuralChangeType::Removed(ChangeSubject::Modifier {
+                        modifier: "synchronized".into(),
+                    }),
+                    Some("synchronized".into()),
+                    None,
+                    format!(
+                        "Method `{}` is no longer synchronized — callers relying on thread safety may break",
+                        old.name
+                    ),
+                    true,
+                ));
+            } else {
+                changes.push(lang_change(
+                    old,
+                    StructuralChangeType::Added(ChangeSubject::Modifier {
+                        modifier: "synchronized".into(),
+                    }),
+                    None,
+                    Some("synchronized".into()),
+                    format!(
+                        "Method `{}` is now synchronized",
+                        old.name
+                    ),
+                    false,
+                ));
+            }
+        }
+
+        // ── Transient modifier changes ──────────────────────────────────
+        if old_data.is_transient != new_data.is_transient {
+            let (before, after, desc, breaking) = if new_data.is_transient {
+                (None, Some("transient".into()),
+                 format!("Field `{}` is now transient — excluded from serialization", old.name),
+                 true)
+            } else {
+                (Some("transient".into()), None,
+                 format!("Field `{}` is no longer transient — now included in serialization", old.name),
+                 true)
+            };
+            changes.push(lang_change(
+                old,
+                StructuralChangeType::Changed(ChangeSubject::Modifier {
+                    modifier: "transient".into(),
+                }),
+                before, after, desc, breaking,
+            ));
+        }
+
+        // ── Volatile modifier changes ───────────────────────────────────
+        if old_data.is_volatile != new_data.is_volatile {
+            if !new_data.is_volatile {
+                changes.push(lang_change(
+                    old,
+                    StructuralChangeType::Removed(ChangeSubject::Modifier {
+                        modifier: "volatile".into(),
+                    }),
+                    Some("volatile".into()),
+                    None,
+                    format!(
+                        "Field `{}` is no longer volatile — memory visibility guarantee removed",
+                        old.name
+                    ),
+                    true,
+                ));
+            } else {
+                changes.push(lang_change(
+                    old,
+                    StructuralChangeType::Added(ChangeSubject::Modifier {
+                        modifier: "volatile".into(),
+                    }),
+                    None,
+                    Some("volatile".into()),
+                    format!("Field `{}` is now volatile", old.name),
+                    false,
+                ));
+            }
+        }
+
+        // ── Native modifier changes ─────────────────────────────────────
+        if old_data.is_native != new_data.is_native {
+            if !new_data.is_native {
+                changes.push(lang_change(
+                    old,
+                    StructuralChangeType::Removed(ChangeSubject::Modifier {
+                        modifier: "native".into(),
+                    }),
+                    Some("native".into()),
+                    None,
+                    format!(
+                        "Method `{}` is no longer native — JNI consumers will break",
+                        old.name
+                    ),
+                    true,
+                ));
+            } else {
+                changes.push(lang_change(
+                    old,
+                    StructuralChangeType::Added(ChangeSubject::Modifier {
+                        modifier: "native".into(),
+                    }),
+                    None,
+                    Some("native".into()),
+                    format!("Method `{}` is now native", old.name),
                     false,
                 ));
             }
@@ -486,7 +699,7 @@ impl Language for Java {
     type ManifestChangeType = JavaManifestChangeType;
     type Evidence = JavaEvidence;
     type ReportData = JavaReportData;
-    type AnalysisExtensions = (); // No Java-specific extended pipelines yet.
+    type AnalysisExtensions = JavaAnalysisExtensions;
 
     const RENAMEABLE_SYMBOL_KINDS: &'static [SymbolKind] =
         &[SymbolKind::Interface, SymbolKind::Class, SymbolKind::Enum];
@@ -501,7 +714,50 @@ impl Language for Java {
         git_ref: &str,
         degradation: Option<&semver_analyzer_core::diagnostics::DegradationTracker>,
     ) -> Result<ApiSurface<JavaSymbolData>> {
-        let guard = crate::worktree::WorktreeGuard::new(repo, git_ref)?;
+        use semver_analyzer_core::error::DiagnoseExt;
+
+        // Store repo root for later index building (find_callers/find_references)
+        if let Ok(mut root) = self.repo_root.lock() {
+            *root = Some(repo.to_path_buf());
+        }
+
+        let config = self
+            .ref_config
+            .clone()
+            .unwrap_or_default();
+
+        let guard = crate::worktree::JavaWorktreeGuard::new(repo, git_ref, &config)
+            .with_diagnosis(
+                "Check that the repository path is correct and the git ref exists. \
+                 Run 'git tag -l' or 'git branch -a' to verify."
+            )?;
+
+        // Record build warnings as degradation
+        for warning in guard.warnings() {
+            if let Some(tracker) = degradation {
+                match warning {
+                    crate::worktree::ExtractionWarning::BuildFailedSourceOnly { build_error } => {
+                        tracker.record(
+                            "TD",
+                            format!("Java build failed at ref '{}': {}", git_ref, build_error),
+                            "Extraction continues with source files only. \
+                             Generated sources and resolved dependencies are unavailable.",
+                        );
+                    }
+                    crate::worktree::ExtractionWarning::PartialBuild { succeeded, failed } => {
+                        tracker.record(
+                            "TD",
+                            format!(
+                                "Partial build at ref '{}': {} modules succeeded, {} failed",
+                                git_ref, succeeded, failed
+                            ),
+                            "Some modules may have incomplete API surfaces.",
+                        );
+                    }
+                }
+            }
+        }
+
         let mut extractor =
             crate::extract::JavaExtractor::new().context("Failed to create Java extractor")?;
         let surface = extractor.extract_from_dir(guard.path())?;
@@ -530,18 +786,29 @@ impl Language for Java {
         parser.parse_changed_functions(repo, from_ref, to_ref)
     }
 
-    /// Stub: call-graph walking not yet implemented for Java.
+    /// Find all callers of a method across the project.
     ///
-    /// The BU pipeline can detect test assertion changes and function body
-    /// changes, but cannot trace "private function X broke → public
-    /// function Y calls X → Y is breaking" without this.
-    fn find_callers(&self, _file: &Path, _symbol_name: &str) -> Result<Vec<Caller>> {
-        Ok(Vec::new())
+    /// Uses a lazily-built cross-file index to scan all `.java` files
+    /// for method invocations matching `symbol_name`. The index is built
+    /// on the first call using the repo root stored during `extract`.
+    fn find_callers(&self, file: &Path, symbol_name: &str) -> Result<Vec<Caller>> {
+        let guard = self.get_or_build_index()?;
+        match guard.as_ref() {
+            Some(index) => index.find_callers(file, symbol_name),
+            None => Ok(Vec::new()),
+        }
     }
 
-    /// Stub: cross-file reference search not yet implemented for Java.
-    fn find_references(&self, _file: &Path, _symbol_name: &str) -> Result<Vec<Reference>> {
-        Ok(Vec::new())
+    /// Find all references to a symbol across the project.
+    ///
+    /// Scans all indexed files for imports, type references, and method
+    /// invocations matching `symbol_name`.
+    fn find_references(&self, file: &Path, symbol_name: &str) -> Result<Vec<Reference>> {
+        let guard = self.get_or_build_index()?;
+        match guard.as_ref() {
+            Some(index) => index.find_references(file, symbol_name),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn find_tests(&self, repo: &Path, source_file: &Path) -> Result<Vec<TestFile>> {
@@ -583,7 +850,6 @@ impl Language for Java {
             || basename.ends_with("Tests.java")
             || basename.ends_with("IT.java")
             || basename.ends_with("ITCase.java")
-            || basename == "module-info.java"
             || basename == "package-info.java"
     }
 
@@ -667,6 +933,42 @@ impl Language for Java {
             },
         ]
     }
+
+    fn run_extended_analysis(
+        &self,
+        params: &semver_analyzer_core::ExtendedAnalysisParams,
+    ) -> Result<JavaAnalysisExtensions> {
+        let sd_result = crate::sd_pipeline::run_java_sd(
+            &params.repo,
+            &params.from_ref,
+            &params.to_ref,
+            params.from_worktree_path.as_deref(),
+            params.to_worktree_path.as_deref(),
+        )?;
+
+        Ok(JavaAnalysisExtensions {
+            sd_result: Some(sd_result),
+        })
+    }
+
+    fn extensions_log_summary(&self, extensions: &JavaAnalysisExtensions) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(ref sd) = extensions.sd_result {
+            let total = sd.source_level_changes.len() + sd.module_changes.len();
+            let breaking = sd.source_level_changes.iter().filter(|c| c.is_breaking).count()
+                + sd.module_changes.iter().filter(|c| c.is_breaking).count();
+            lines.push(format!(
+                "SD: {} source-level changes ({} breaking)",
+                total, breaking
+            ));
+            lines.push(format!(
+                "SD: {} class profiles, {} inheritance entries",
+                sd.new_profiles.len(),
+                sd.inheritance_summary.len()
+            ));
+        }
+        lines
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -706,7 +1008,7 @@ mod tests {
 
     #[test]
     fn test_display_name() {
-        let java = Java;
+        let java = Java::new();
         assert_eq!(
             java.display_name("org.springframework.boot.WebApp.doThing"),
             "WebApp.doThing"
@@ -721,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_visibility_rank() {
-        let java = Java;
+        let java = Java::new();
         assert!(
             java.visibility_rank(Visibility::Public) > java.visibility_rank(Visibility::Protected)
         );
@@ -736,7 +1038,7 @@ mod tests {
 
     #[test]
     fn test_is_async_wrapper() {
-        let java = Java;
+        let java = Java::new();
         assert!(java.is_async_wrapper("CompletableFuture<String>"));
         assert!(java.is_async_wrapper("CompletionStage<Void>"));
         assert!(java.is_async_wrapper("Future<Integer>"));
@@ -746,7 +1048,7 @@ mod tests {
 
     #[test]
     fn test_should_skip_symbol() {
-        let java = Java;
+        let java = Java::new();
         let mut sym = Symbol::new(
             "package-info",
             "com.example.package-info",
@@ -772,7 +1074,7 @@ mod tests {
 
     #[test]
     fn test_is_member_addition_breaking_interface_abstract() {
-        let java = Java;
+        let java = Java::new();
         let mut iface = Symbol::new(
             "Runnable",
             "java.lang.Runnable",
@@ -797,7 +1099,7 @@ mod tests {
 
     #[test]
     fn test_is_member_addition_breaking_interface_default() {
-        let java = Java;
+        let java = Java::new();
         let mut iface = Symbol::new(
             "Collection",
             "java.util.Collection",
@@ -825,7 +1127,7 @@ mod tests {
 
     #[test]
     fn test_is_member_addition_breaking_abstract_class() {
-        let java = Java;
+        let java = Java::new();
         let mut abs_class = Symbol::new(
             "AbstractList",
             "java.util.AbstractList",
@@ -863,7 +1165,7 @@ mod tests {
 
     #[test]
     fn test_same_family() {
-        let java = Java;
+        let java = Java::new();
         let mut a = Symbol::new(
             "Foo",
             "com.example.service.Foo",
@@ -907,7 +1209,8 @@ mod tests {
         assert!(Java::should_exclude_from_analysis(Path::new(
             "build/generated/Foo.java"
         )));
-        assert!(Java::should_exclude_from_analysis(Path::new(
+        // module-info.java is now included for module system analysis
+        assert!(!Java::should_exclude_from_analysis(Path::new(
             "src/main/java/module-info.java"
         )));
         assert!(!Java::should_exclude_from_analysis(Path::new(
@@ -930,7 +1233,7 @@ mod tests {
 
     #[test]
     fn test_diff_language_data_annotation_added() {
-        let java = Java;
+        let java = Java::new();
         let old = make_sym(
             "Foo",
             "com.example.Foo",
@@ -960,7 +1263,7 @@ mod tests {
 
     #[test]
     fn test_diff_language_data_annotation_removed_breaking() {
-        let java = Java;
+        let java = Java::new();
         let old = make_sym(
             "dataSource",
             "com.example.Config.dataSource",
@@ -988,7 +1291,7 @@ mod tests {
 
     #[test]
     fn test_diff_language_data_throws_added() {
-        let java = Java;
+        let java = Java::new();
         let old = make_sym(
             "read",
             "com.example.Reader.read",
@@ -1013,7 +1316,7 @@ mod tests {
 
     #[test]
     fn test_diff_language_data_class_became_final() {
-        let java = Java;
+        let java = Java::new();
         let old = make_sym(
             "Foo",
             "com.example.Foo",
@@ -1038,7 +1341,7 @@ mod tests {
 
     #[test]
     fn test_diff_language_data_class_became_sealed() {
-        let java = Java;
+        let java = Java::new();
         let old = make_sym(
             "Shape",
             "com.example.Shape",
@@ -1064,7 +1367,7 @@ mod tests {
 
     #[test]
     fn test_diff_language_data_no_changes() {
-        let java = Java;
+        let java = Java::new();
         let data = JavaSymbolData {
             annotations: vec![JavaAnnotation {
                 name: "Override".into(),
@@ -1087,7 +1390,7 @@ mod tests {
 
     #[test]
     fn test_canonical_name_strips_package() {
-        let java = Java;
+        let java = Java::new();
         assert_eq!(
             java.canonical_name_for_relocation(
                 "org.springframework.boot.autoconfigure.cache.JCacheManagerCustomizer"
@@ -1139,7 +1442,7 @@ mod tests {
             symbols: vec![new_sym],
         };
 
-        let java = Java;
+        let java = Java::new();
         let changes = diff_surfaces_with_semantics(&old_surface, &new_surface, &java);
 
         assert!(!changes.is_empty());

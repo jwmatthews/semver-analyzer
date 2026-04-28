@@ -1,0 +1,5 @@
+---
+source: crates/java/tests/baseline_manifest.rs
+expression: "diff_manifest(pom, pom)"
+---
+[]

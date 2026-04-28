@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_diff.rs
+expression: "diff(&surface(vec![old_cls]), &surface(vec![new_cls]),)"
+---
+- symbol: CacheManager
+  qualified_name: com.example.cache.CacheManager
+  kind: Class
+  change_type: "Relocated { from: Symbol { kind: Class }, to: Symbol { kind: Class } }"
+  is_breaking: true
+  description: "class `CacheManager` moved from `com.example.cache.CacheManager` to `com.example.cache.auto.CacheManager`"
+  before: com.example.cache.CacheManager
+  after: com.example.cache.auto.CacheManager
+  has_migration_target: false

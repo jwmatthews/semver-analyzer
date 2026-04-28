@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_diff.rs
+expression: "diff(&surface(vec![old_cls]), &surface(vec![new_cls]),)"
+---
+- symbol: MAX_SIZE
+  qualified_name: com.example.Config.MAX_SIZE
+  kind: Constant
+  change_type: "Changed(Parameter { name: \"value\" })"
+  is_breaking: true
+  description: "Default value of parameter `value` in `MAX_SIZE` changed"
+  before: "100"
+  after: "200"
+  has_migration_target: false

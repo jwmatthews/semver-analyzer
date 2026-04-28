@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_diff.rs
+expression: "diff(&surface(vec![old_cls]), &surface(vec![new_cls]),)"
+---
+- symbol: getData
+  qualified_name: com.example.Service.getData
+  kind: Method
+  change_type: Changed(ReturnType)
+  is_breaking: true
+  description: "Return type of `getData` changed from `List<String>` to `Set<String>`"
+  before: List<String>
+  after: Set<String>
+  has_migration_target: false

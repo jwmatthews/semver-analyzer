@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: "diff_profiles(&old, &new)"
+---
+- class_name: com.example.Service
+  category: ConstructorDependencyChanged
+  description: "Constructor of `Service` changed: (UserRepository) → (UserRepository, EventPublisher)"
+  is_breaking: true
+  method: ~
+  old_value: UserRepository
+  new_value: "UserRepository, EventPublisher"

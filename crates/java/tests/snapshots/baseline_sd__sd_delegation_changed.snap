@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: "diff_profiles(&old, &new)"
+---
+- class_name: com.example.Processor
+  category: DelegationChanged
+  description: "Method `process` delegation changed: removed [repo.save], added [eventBus.publish]"
+  is_breaking: true
+  method: process
+  old_value: "validator.validate, repo.save"
+  new_value: "validator.validate, eventBus.publish"

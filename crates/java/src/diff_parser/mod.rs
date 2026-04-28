@@ -154,7 +154,6 @@ fn is_java_source(path: &str) -> bool {
         && !path.ends_with("Test.java")
         && !path.ends_with("Tests.java")
         && !path.ends_with("IT.java")
-        && !path.contains("module-info.java")
         && !path.contains("package-info.java")
 }
 
@@ -162,6 +161,10 @@ fn is_java_source(path: &str) -> bool {
 
 struct ExtractedFunction {
     qualified_name: String,
+    /// Disambiguated key that includes parameter types for overloaded methods.
+    /// Format: `com.example.Foo::doThing(int,String)` for methods/constructors,
+    /// or same as `qualified_name` for non-callable symbols.
+    overload_key: String,
     name: String,
     body: String,
     signature: String,
@@ -230,6 +233,57 @@ fn walk_for_functions(
                     functions,
                 );
             }
+            "field_declaration" => {
+                // Extract static final constant fields for value change detection
+                let is_static = has_modifier(child, "static");
+                let is_final = has_modifier(child, "final");
+                if is_static && is_final {
+                    let type_str = child
+                        .child_by_field_name("type")
+                        .map(|n| node_text(n, source))
+                        .unwrap_or("");
+
+                    // Extract each variable declarator
+                    let mut field_cursor = child.walk();
+                    for field_child in child.children(&mut field_cursor) {
+                        if field_child.kind() == "variable_declarator" {
+                            let fname = field_child
+                                .child_by_field_name("name")
+                                .map(|n| node_text(n, source))
+                                .unwrap_or("");
+
+                            let value = field_child
+                                .child_by_field_name("value")
+                                .map(|n| node_text(n, source).to_string())
+                                .unwrap_or_default();
+
+                            let qualified_name = if parent_class.is_empty() {
+                                format!("{}::{}", file_path, fname)
+                            } else {
+                                format!("{}::{}", parent_class, fname)
+                            };
+
+                            let signature = format!(
+                                "static final {} {}",
+                                type_str, fname
+                            );
+
+                            let visibility = extract_visibility_enum(child);
+
+                            functions.push(ExtractedFunction {
+                                qualified_name: qualified_name.clone(),
+                                overload_key: qualified_name,
+                                name: fname.to_string(),
+                                body: value,
+                                signature,
+                                visibility,
+                                kind: SymbolKind::Constant,
+                                line: field_child.start_position().row + 1,
+                            });
+                        }
+                    }
+                }
+            }
             "method_declaration" | "constructor_declaration" => {
                 let name = child
                     .child_by_field_name("name")
@@ -241,6 +295,11 @@ fn walk_for_functions(
                 } else {
                     format!("{}::{}", parent_class, name)
                 };
+
+                // Build overload key with parameter types to disambiguate
+                // overloaded methods (same name, different parameters).
+                let param_types = extract_parameter_types(child, source);
+                let overload_key = format!("{}({})", qualified_name, param_types.join(","));
 
                 let body = find_child_by_kind(child, "block")
                     .or_else(|| find_child_by_kind(child, "constructor_body"))
@@ -263,6 +322,7 @@ fn walk_for_functions(
 
                 functions.push(ExtractedFunction {
                     qualified_name,
+                    overload_key,
                     name: name.to_string(),
                     body,
                     signature,
@@ -278,6 +338,26 @@ fn walk_for_functions(
     }
 }
 
+/// Extract parameter type names from a method/constructor declaration.
+///
+/// Used to disambiguate overloaded methods (same name, different parameter
+/// types). Returns e.g., `["int", "String"]` for `doThing(int x, String y)`.
+fn extract_parameter_types(node: Node, source: &str) -> Vec<String> {
+    let Some(params) = node.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut types = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.children(&mut cursor) {
+        if child.kind() == "formal_parameter" || child.kind() == "spread_parameter" {
+            if let Some(type_node) = child.child_by_field_name("type") {
+                types.push(node_text(type_node, source).to_string());
+            }
+        }
+    }
+    types
+}
+
 fn extract_package_name(root: Node, source: &str) -> Option<String> {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
@@ -291,6 +371,21 @@ fn extract_package_name(root: Node, source: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn has_modifier(node: Node, modifier: &str) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "modifiers" {
+            let mut mod_cursor = child.walk();
+            for mod_child in child.children(&mut mod_cursor) {
+                if mod_child.kind() == modifier {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn extract_visibility_enum(node: Node) -> Visibility {
@@ -324,11 +419,11 @@ fn diff_functions_in_file(
 
     let old_map: HashMap<&str, &ExtractedFunction> = old_funcs
         .iter()
-        .map(|f| (f.qualified_name.as_str(), f))
+        .map(|f| (f.overload_key.as_str(), f))
         .collect();
     let new_map: HashMap<&str, &ExtractedFunction> = new_funcs
         .iter()
-        .map(|f| (f.qualified_name.as_str(), f))
+        .map(|f| (f.overload_key.as_str(), f))
         .collect();
 
     let mut changes = Vec::new();
@@ -388,6 +483,10 @@ fn diff_functions_in_file(
     Ok(changes)
 }
 
+/// Normalize a method body by stripping comments and blank lines.
+///
+/// Properly handles `/*` and `//` inside string literals (single-line
+/// strings and Java 13+ text blocks) to avoid false stripping.
 fn normalize_body(body: &str) -> String {
     let mut result = Vec::new();
     let mut in_block_comment = false;
@@ -397,25 +496,99 @@ fn normalize_body(body: &str) -> String {
         if trimmed.is_empty() {
             continue;
         }
+
         if in_block_comment {
-            if trimmed.contains("*/") {
+            // Look for */ outside of string literals
+            if contains_outside_strings(trimmed, "*/") {
                 in_block_comment = false;
             }
             continue;
         }
-        if trimmed.starts_with("/*") {
-            if !trimmed.contains("*/") {
+
+        // Check for block comment start outside string literals
+        if let Some(pos) = find_outside_strings(trimmed, "/*") {
+            // Check if the block comment also closes on the same line
+            let rest = &trimmed[pos + 2..];
+            if !rest.contains("*/") {
                 in_block_comment = true;
+            }
+            // If the comment starts at position 0, skip the whole line
+            if pos == 0 {
+                continue;
+            }
+            // Otherwise, keep the code before the comment
+            let code_part = trimmed[..pos].trim();
+            if !code_part.is_empty() {
+                result.push(code_part);
             }
             continue;
         }
-        if trimmed.starts_with("//") {
+
+        // Check for line comment outside string literals
+        if let Some(pos) = find_outside_strings(trimmed, "//") {
+            if pos == 0 {
+                continue;
+            }
+            let code_part = trimmed[..pos].trim();
+            if !code_part.is_empty() {
+                result.push(code_part);
+            }
             continue;
         }
+
         result.push(trimmed);
     }
 
     result.join("\n")
+}
+
+/// Find the position of `needle` in `haystack`, but only if it's
+/// outside of string literals (delimited by `"` or `'`).
+fn find_outside_strings(haystack: &str, needle: &str) -> Option<usize> {
+    let chars: Vec<char> = haystack.chars().collect();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let mut in_string = false;
+    let mut string_char = '"';
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if in_string {
+            if c == '\\' {
+                i += 2; // Skip escaped character
+                continue;
+            }
+            if c == string_char {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '"' || c == '\'' {
+            in_string = true;
+            string_char = c;
+            i += 1;
+            continue;
+        }
+
+        // Check for needle match
+        if i + needle_chars.len() <= chars.len()
+            && chars[i..i + needle_chars.len()] == needle_chars[..]
+        {
+            return Some(haystack.char_indices().nth(i).map(|(pos, _)| pos).unwrap_or(i));
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+/// Check if `haystack` contains `needle` outside of string literals.
+fn contains_outside_strings(haystack: &str, needle: &str) -> bool {
+    find_outside_strings(haystack, needle).is_some()
 }
 
 // ── Tree-sitter helpers ─────────────────────────────────────────────────
@@ -479,6 +652,158 @@ mod tests {
         let funcs = extract_functions(&mut parser, source, "Foo.java").unwrap();
         assert_eq!(funcs.len(), 2);
         assert!(funcs.iter().any(|f| f.qualified_name.contains("doThing")));
+    }
+
+    #[test]
+    fn test_extract_constant_fields() {
+        let source = r#"
+            package com.example;
+            public class Config {
+                public static final int MAX_SIZE = 100;
+                public static final String PREFIX = "app";
+                private int normalField = 5;
+                public void doThing() {}
+            }
+        "#;
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+
+        let funcs = extract_functions(&mut parser, source, "Config.java").unwrap();
+        // Should extract: MAX_SIZE, PREFIX, doThing (3 items)
+        // normalField is NOT static final, so not extracted
+        assert_eq!(funcs.len(), 3);
+
+        let max_size = funcs.iter().find(|f| f.name == "MAX_SIZE").unwrap();
+        assert_eq!(max_size.kind, SymbolKind::Constant);
+        assert_eq!(max_size.body, "100");
+
+        let prefix = funcs.iter().find(|f| f.name == "PREFIX").unwrap();
+        assert_eq!(prefix.kind, SymbolKind::Constant);
+        assert_eq!(prefix.body, "\"app\"");
+    }
+
+    #[test]
+    fn test_diff_constant_value_changed() {
+        let old = r#"
+            package com.example;
+            public class Config {
+                public static final int MAX_SIZE = 100;
+            }
+        "#;
+        let new = r#"
+            package com.example;
+            public class Config {
+                public static final int MAX_SIZE = 200;
+            }
+        "#;
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+
+        let changes = diff_functions_in_file(&mut parser, old, new, "Config.java").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].name, "MAX_SIZE");
+        assert_eq!(changes[0].old_body.as_deref(), Some("100"));
+        assert_eq!(changes[0].new_body.as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn test_normalize_body_string_literals() {
+        // /* inside a string should not start a block comment
+        let body = r#"{
+            String s = "/* not a comment */";
+            int x = 1;
+            return x;
+        }"#;
+        let normalized = normalize_body(body);
+        assert!(
+            normalized.contains("/* not a comment */"),
+            "String containing /* should be preserved"
+        );
+        assert!(normalized.contains("int x = 1;"));
+
+        // // inside a string should not strip the line
+        let body2 = r#"{
+            String url = "http://example.com";
+            return url;
+        }"#;
+        let normalized2 = normalize_body(body2);
+        assert!(
+            normalized2.contains("http://example.com"),
+            "String containing // should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_overloaded_methods_disambiguated() {
+        let old = r#"
+            package com.example;
+            public class Foo {
+                public void doThing(int x) {
+                    System.out.println(x);
+                }
+                public void doThing(String s) {
+                    System.out.println(s);
+                }
+            }
+        "#;
+        // Only the String overload changed its body
+        let new = r#"
+            package com.example;
+            public class Foo {
+                public void doThing(int x) {
+                    System.out.println(x);
+                }
+                public void doThing(String s) {
+                    System.out.println("changed: " + s);
+                }
+            }
+        "#;
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+
+        let changes = diff_functions_in_file(&mut parser, old, new, "Foo.java").unwrap();
+        // Only the String overload should be reported as changed
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0]
+            .qualified_name
+            .contains("doThing"));
+    }
+
+    #[test]
+    fn test_overloaded_methods_both_extracted() {
+        let source = r#"
+            package com.example;
+            public class Foo {
+                public void doThing(int x) {
+                    System.out.println(x);
+                }
+                public void doThing(String s) {
+                    System.out.println(s);
+                }
+            }
+        "#;
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+
+        let funcs = extract_functions(&mut parser, source, "Foo.java").unwrap();
+        // Both overloads should be extracted (previously one was lost)
+        assert_eq!(funcs.len(), 2);
+        // They should have different overload keys
+        assert_ne!(funcs[0].overload_key, funcs[1].overload_key);
+        // But same qualified_name
+        assert_eq!(funcs[0].qualified_name, funcs[1].qualified_name);
     }
 
     #[test]

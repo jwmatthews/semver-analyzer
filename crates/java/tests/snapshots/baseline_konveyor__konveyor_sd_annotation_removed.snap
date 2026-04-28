@@ -1,0 +1,15 @@
+---
+source: crates/java/tests/baseline_konveyor.rs
+expression: normalize_rules(&rules)
+---
+- rule_id: java-sd-annotation-removed-com-example-service
+  labels:
+    - source=semver-analyzer
+    - change-type=annotation-removed
+    - language=java
+    - pipeline=sd
+    - scope=method
+  effort: 3
+  category: mandatory
+  description: "Annotation `@Bean` removed from `dataSource`"
+  has_fix_strategy: true

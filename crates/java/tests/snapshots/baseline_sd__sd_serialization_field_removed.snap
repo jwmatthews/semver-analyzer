@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: normalize_sd(&changes)
+---
+- class_name: com.example.Data
+  category: SerializationFieldRemoved
+  description: "Serializable field `age` removed from `Data` — deserialization may break"
+  is_breaking: true
+  method: ~
+  old_value: age
+  new_value: ~

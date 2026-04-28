@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_diff.rs
+expression: "diff(&surface(vec![old_iface]), &surface(vec![new_iface]),)"
+---
+- symbol: findById
+  qualified_name: com.example.Repository.findById
+  kind: Method
+  change_type: "Added(Member { name: \"findById\", kind: Method })"
+  is_breaking: true
+  description: "method `findById` was added to `Repository`"
+  before: ~
+  after: "method: findById: Optional<Entity>"
+  has_migration_target: false

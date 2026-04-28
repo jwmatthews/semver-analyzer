@@ -2,25 +2,42 @@
 
 Deterministic, structured analysis of semantic versioning breaking changes between two git refs. Extracts API surfaces, diffs them, performs source-level analysis, and generates [Konveyor](https://www.konveyor.io/) migration rules with fix strategies.
 
-Currently supports TypeScript/JavaScript/React projects.
+Supports TypeScript/JavaScript/React and Java projects.
 
 ## Quick Start
 
 ```bash
-# Build
+# Build (TypeScript support is always included)
 cargo build --release
 
-# Analyze breaking changes between two tags
+# Build with Java support
+cargo build --release --features java
+
+# Analyze a TypeScript project
 semver-analyzer analyze typescript \
   --repo /path/to/your-ts-project \
   --from v1.0.0 \
   --to v2.0.0 \
   -o report.json
 
-# Generate Konveyor migration rules from the report
+# Analyze a Java project
+semver-analyzer analyze java \
+  --repo /path/to/your-java-project \
+  --from v3.2.0 \
+  --to v4.0.0 \
+  -o report.json
+
+# Generate Konveyor migration rules from a report
 semver-analyzer konveyor typescript \
   --from-report report.json \
   --output-dir ./rules
+
+# Generate Java Konveyor rules (with project-specific config)
+semver-analyzer konveyor java \
+  --from-report report.json \
+  --output-dir ./rules \
+  --project-name spring-boot \
+  --rule-prefix sb4
 ```
 
 A convenience script is provided for running against [PatternFly](https://github.com/patternfly/patternfly-react), the primary validation target. See [docs/patternfly-walkthrough.md](docs/patternfly-walkthrough.md) for the full setup guide.
@@ -330,7 +347,7 @@ crates/
         └── spec_compare.rs  # Structural spec comparison
 ```
 
-The core crate defines a `Language` trait, making the architecture language-pluggable. TypeScript is the first (and currently only) implementation.
+The core crate defines a `Language` trait, making the architecture language-pluggable. TypeScript and Java are the current implementations. Java support is behind the `java` feature flag (`cargo build --features java`).
 
 ## Development
 
@@ -363,7 +380,7 @@ cargo build --release
 
 - **ESM/CJS declaration deduplication**: Projects that emit both ESM and CJS builds will have roughly doubled symbol counts. The analyzer picks up `.d.ts` from both output directories.
 - **MCP server**: The `serve` subcommand is defined but not yet implemented.
-- **Language support**: Only TypeScript/JavaScript is currently supported.
+- **Language support**: TypeScript/JavaScript and Java are supported. Java requires `--features java` at build time.
 
 ## License
 

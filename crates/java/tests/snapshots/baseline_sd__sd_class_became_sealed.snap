@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: "diff_profiles(&old, &new)"
+---
+- class_name: com.example.Shape
+  category: SealedChanged
+  description: "Class `Shape` is now sealed (permits: Circle, Rectangle)"
+  is_breaking: true
+  method: ~
+  old_value: ~
+  new_value: "Circle, Rectangle"

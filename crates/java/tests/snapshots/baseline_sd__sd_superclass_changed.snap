@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: "diff_profiles(&old, &new)"
+---
+- class_name: com.example.MyList
+  category: InheritanceChanged
+  description: "Class `MyList` extends changed: Some(\"AbstractList\") → Some(\"AbstractCollection\")"
+  is_breaking: true
+  method: ~
+  old_value: AbstractList
+  new_value: AbstractCollection

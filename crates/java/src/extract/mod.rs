@@ -5,6 +5,7 @@
 //! types, methods, constructors, fields, and their modifiers/annotations.
 
 mod modifiers;
+pub mod module_info;
 
 use crate::types::{JavaAnnotation, JavaSymbolData};
 use anyhow::{Context, Result};
@@ -67,6 +68,20 @@ impl JavaExtractor {
 
         let root = tree.root_node();
         let mut symbols = Vec::new();
+
+        // Check for module-info.java
+        let file_name = file_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if file_name == "module-info.java" {
+            if let Some(module_sym) =
+                module_info::extract_module_info(root, source, file_path)
+            {
+                symbols.push(module_sym);
+            }
+            return Ok(symbols);
+        }
 
         let package = extract_package(root, source);
         let imports = extract_imports(root, source);
@@ -141,10 +156,7 @@ fn find_java_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) 
             }
 
             find_java_files_recursive(root, &path, files)?;
-        } else if name_str.ends_with(".java")
-            && name_str != "module-info.java"
-            && name_str != "package-info.java"
-        {
+        } else if name_str.ends_with(".java") && name_str != "package-info.java" {
             files.push(path);
         }
     }
@@ -171,8 +183,19 @@ fn extract_package(root: Node, source: &str) -> Option<String> {
 
 // ── Import declarations ─────────────────────────────────────────────────
 
-fn extract_imports(root: Node, source: &str) -> std::collections::HashMap<String, String> {
-    let mut imports = std::collections::HashMap::new();
+/// Resolved imports: maps simple names to fully-qualified names,
+/// plus wildcard import prefixes for fallback resolution.
+struct ImportMap {
+    /// Exact imports: `"Service"` → `"org.springframework.stereotype.Service"`.
+    exact: std::collections::HashMap<String, String>,
+    /// Wildcard import prefixes: `"org.springframework.stereotype"` from
+    /// `import org.springframework.stereotype.*`.
+    wildcard_prefixes: Vec<String>,
+}
+
+fn extract_imports(root: Node, source: &str) -> ImportMap {
+    let mut exact = std::collections::HashMap::new();
+    let mut wildcard_prefixes = Vec::new();
     let mut cursor = root.walk();
 
     for child in root.children(&mut cursor) {
@@ -184,16 +207,20 @@ fn extract_imports(root: Node, source: &str) -> std::collections::HashMap<String
                 .trim_end_matches(';')
                 .trim();
 
-            if !trimmed.ends_with('*') {
-                if let Some(dot_pos) = trimmed.rfind('.') {
-                    let simple_name = &trimmed[dot_pos + 1..];
-                    imports.insert(simple_name.to_string(), trimmed.to_string());
-                }
+            if let Some(prefix) = trimmed.strip_suffix(".*") {
+                // Wildcard import: keep the package prefix for fallback resolution
+                wildcard_prefixes.push(prefix.to_string());
+            } else if let Some(dot_pos) = trimmed.rfind('.') {
+                let simple_name = &trimmed[dot_pos + 1..];
+                exact.insert(simple_name.to_string(), trimmed.to_string());
             }
         }
     }
 
-    imports
+    ImportMap {
+        exact,
+        wildcard_prefixes,
+    }
 }
 
 // ── Type declaration extraction ─────────────────────────────────────────
@@ -203,7 +230,7 @@ fn extract_type_declaration(
     source: &str,
     file_path: &Path,
     package: &Option<String>,
-    imports: &std::collections::HashMap<String, String>,
+    imports: &ImportMap,
 ) -> Option<Symbol<JavaSymbolData>> {
     let name = find_child_by_field(node, "name").map(|n| node_text(n, source).to_string())?;
 
@@ -246,6 +273,7 @@ fn extract_type_declaration(
         is_annotation_type: node.kind() == "annotation_type_declaration",
         is_final: mods.is_final,
         is_sealed: mods.is_sealed,
+        is_non_sealed: mods.is_non_sealed,
         ..Default::default()
     };
 
@@ -311,24 +339,69 @@ fn extract_type_declaration(
     if node.kind() == "record_declaration" {
         if let Some(params) = find_child_by_field(node, "parameters") {
             let record_params = extract_formal_parameters(params, source);
-            let mut ctor = Symbol::new(
-                &name,
-                format!("{}.{}", qualified_name, name),
-                SymbolKind::Constructor,
-                Visibility::Public,
-                file_path,
-                node.start_position().row + 1,
-            );
-            ctor.signature = Some(Signature {
-                parameters: record_params.clone(),
-                return_type: None,
-                type_parameters: Vec::new(),
-                is_async: false,
-            });
-            ctor.language_data = JavaSymbolData::default();
-            sym.members.push(ctor);
 
+            // Check if a compact constructor was already extracted from the body.
+            // Compact constructors have no explicit parameters — they implicitly
+            // take the record's component parameters.
+            let has_compact_ctor = sym.members.iter().any(|m| {
+                m.kind == SymbolKind::Constructor
+                    && m.name == name
+                    && m.signature
+                        .as_ref()
+                        .map(|s| s.parameters.is_empty())
+                        .unwrap_or(true)
+            });
+
+            if has_compact_ctor {
+                // Update the compact constructor's signature with record params
+                for member in &mut sym.members {
+                    if member.kind == SymbolKind::Constructor
+                        && member.name == name
+                        && member
+                            .signature
+                            .as_ref()
+                            .map(|s| s.parameters.is_empty())
+                            .unwrap_or(true)
+                    {
+                        member.signature = Some(Signature {
+                            parameters: record_params.clone(),
+                            return_type: None,
+                            type_parameters: Vec::new(),
+                            is_async: false,
+                        });
+                        break;
+                    }
+                }
+            } else {
+                // Synthesize a canonical constructor
+                let mut ctor = Symbol::new(
+                    &name,
+                    format!("{}.{}", qualified_name, name),
+                    SymbolKind::Constructor,
+                    Visibility::Public,
+                    file_path,
+                    node.start_position().row + 1,
+                );
+                ctor.signature = Some(Signature {
+                    parameters: record_params.clone(),
+                    return_type: None,
+                    type_parameters: Vec::new(),
+                    is_async: false,
+                });
+                ctor.language_data = JavaSymbolData::default();
+                sym.members.push(ctor);
+            }
+
+            // Synthesize accessor methods for each record component
             for param in &record_params {
+                // Skip if an explicit accessor was already declared in the body
+                let already_declared = sym.members.iter().any(|m| {
+                    m.kind == SymbolKind::Method && m.name == param.name
+                });
+                if already_declared {
+                    continue;
+                }
+
                 let mut accessor = Symbol::new(
                     &param.name,
                     format!("{}.{}", qualified_name, param.name),
@@ -361,7 +434,7 @@ fn extract_members(
     file_path: &Path,
     parent_qualified_name: &str,
     _package: &Option<String>,
-    imports: &std::collections::HashMap<String, String>,
+    imports: &ImportMap,
     members: &mut Vec<Symbol<JavaSymbolData>>,
 ) {
     let mut cursor = body.walk();
@@ -376,7 +449,7 @@ fn extract_members(
                     }
                 }
             }
-            "constructor_declaration" => {
+            "constructor_declaration" | "compact_constructor_declaration" => {
                 if let Some(sym) =
                     extract_constructor(child, source, file_path, parent_qualified_name, imports)
                 {
@@ -411,9 +484,12 @@ fn extract_members(
             | "record_declaration"
             | "annotation_type_declaration" => {
                 if let Some(mut sym) =
-                    extract_type_declaration(child, source, file_path, &None, imports)
+                    extract_type_declaration(child, source, file_path, _package, imports)
                 {
+                    // Override qualified_name to reflect nesting: Parent.Inner
                     sym.qualified_name = format!("{}.{}", parent_qualified_name, sym.name);
+                    // Fix import_path to match the corrected qualified_name
+                    sym.import_path = Some(sym.qualified_name.clone());
                     if sym.visibility != Visibility::Private {
                         members.push(sym);
                     }
@@ -429,7 +505,7 @@ fn extract_method(
     source: &str,
     file_path: &Path,
     parent_qname: &str,
-    imports: &std::collections::HashMap<String, String>,
+    imports: &ImportMap,
 ) -> Option<Symbol<JavaSymbolData>> {
     let name = find_child_by_field(node, "name").map(|n| node_text(n, source).to_string())?;
     let qualified_name = format!("{}.{}", parent_qname, name);
@@ -465,6 +541,8 @@ fn extract_method(
     let mut lang_data = JavaSymbolData {
         annotations: extract_annotations(node, source, imports),
         is_default: mods.is_default,
+        is_synchronized: mods.is_synchronized,
+        is_native: mods.is_native,
         ..Default::default()
     };
 
@@ -482,7 +560,7 @@ fn extract_constructor(
     source: &str,
     file_path: &Path,
     parent_qname: &str,
-    imports: &std::collections::HashMap<String, String>,
+    imports: &ImportMap,
 ) -> Option<Symbol<JavaSymbolData>> {
     let name = find_child_by_field(node, "name").map(|n| node_text(n, source).to_string())?;
     let qualified_name = format!("{}.{}", parent_qname, name);
@@ -529,7 +607,7 @@ fn extract_field(
     source: &str,
     file_path: &Path,
     parent_qname: &str,
-    imports: &std::collections::HashMap<String, String>,
+    imports: &ImportMap,
 ) -> Vec<Symbol<JavaSymbolData>> {
     let mods = modifiers::extract_modifiers(node, source);
     let annotations = extract_annotations(node, source, imports);
@@ -589,6 +667,8 @@ fn extract_field(
                 sym.language_data = JavaSymbolData {
                     annotations: annotations.clone(),
                     is_final: mods.is_final,
+                    is_transient: mods.is_transient,
+                    is_volatile: mods.is_volatile,
                     ..Default::default()
                 };
 
@@ -605,7 +685,7 @@ fn extract_annotation_element(
     source: &str,
     file_path: &Path,
     parent_qname: &str,
-    imports: &std::collections::HashMap<String, String>,
+    imports: &ImportMap,
 ) -> Option<Symbol<JavaSymbolData>> {
     let name = find_child_by_field(node, "name").map(|n| node_text(n, source).to_string())?;
     let qualified_name = format!("{}.{}", parent_qname, name);
@@ -673,6 +753,37 @@ fn extract_enum_constants(
                     child.start_position().row + 1,
                 );
 
+                // Extract enum constant constructor arguments (e.g., MERCURY(3.303e+23, 2.4397e6))
+                if let Some(args) = find_child_by_field(child, "arguments") {
+                    let mut arg_params = Vec::new();
+                    let mut arg_cursor = args.walk();
+                    let mut arg_index = 0;
+                    for arg_child in args.children(&mut arg_cursor) {
+                        // Skip parentheses and commas
+                        if arg_child.kind() == "(" || arg_child.kind() == ")" || arg_child.kind() == "," {
+                            continue;
+                        }
+                        let value = node_text(arg_child, source).to_string();
+                        arg_params.push(Parameter {
+                            name: format!("arg{}", arg_index),
+                            type_annotation: None,
+                            optional: false,
+                            has_default: true,
+                            default_value: Some(value),
+                            is_variadic: false,
+                        });
+                        arg_index += 1;
+                    }
+                    if !arg_params.is_empty() {
+                        sym.signature = Some(Signature {
+                            parameters: arg_params,
+                            return_type: None,
+                            type_parameters: Vec::new(),
+                            is_async: false,
+                        });
+                    }
+                }
+
                 sym.language_data = JavaSymbolData::default();
                 members.push(sym);
             }
@@ -685,7 +796,7 @@ fn extract_enum_constants(
 fn extract_annotations(
     node: Node,
     source: &str,
-    imports: &std::collections::HashMap<String, String>,
+    imports: &ImportMap,
 ) -> Vec<JavaAnnotation> {
     let mut annotations = Vec::new();
     let mut cursor = node.walk();
@@ -709,11 +820,25 @@ fn extract_annotations(
 fn parse_annotation(
     node: Node,
     source: &str,
-    imports: &std::collections::HashMap<String, String>,
+    imports: &ImportMap,
 ) -> Option<JavaAnnotation> {
     let name_node = find_child_by_field(node, "name")?;
     let name = node_text(name_node, source).to_string();
-    let qualified_name = imports.get(&name).cloned();
+    // Try exact import first, then fall back to wildcard prefix resolution
+    let qualified_name = imports.exact.get(&name).cloned().or_else(|| {
+        // For wildcard imports like `import org.springframework.stereotype.*`,
+        // try `org.springframework.stereotype.{name}` as a best-effort resolution.
+        // We can't verify the type actually exists without classpath resolution,
+        // but this gives a useful qualified name for annotation matching.
+        if imports.wildcard_prefixes.len() == 1 {
+            // Unambiguous: only one wildcard import
+            Some(format!("{}.{}", imports.wildcard_prefixes[0], name))
+        } else {
+            // Multiple wildcard imports: ambiguous, can't resolve
+            // (could try heuristics but risk false matches)
+            None
+        }
+    });
 
     let mut attributes = Vec::new();
     if let Some(args) = find_child_by_field(node, "arguments") {
@@ -1038,6 +1163,122 @@ mod tests {
         );
         let members = &syms[0].members;
         assert_eq!(members.len(), 3);
+    }
+
+    #[test]
+    fn test_inner_class_import_path() {
+        let syms = parse(
+            r#"
+            package com.example;
+            public class Outer {
+                public static class Inner {
+                    public void innerMethod() {}
+                }
+                public interface InnerIface {
+                    void doThing();
+                }
+            }
+            "#,
+        );
+        assert_eq!(syms.len(), 1);
+        let outer = &syms[0];
+        assert_eq!(outer.qualified_name, "com.example.Outer");
+        assert_eq!(outer.import_path.as_deref(), Some("com.example.Outer"));
+
+        // Inner class should have correct qualified_name and import_path
+        let inner_class = outer
+            .members
+            .iter()
+            .find(|m| m.name == "Inner")
+            .expect("Inner class not found");
+        assert_eq!(inner_class.qualified_name, "com.example.Outer.Inner");
+        assert_eq!(
+            inner_class.import_path.as_deref(),
+            Some("com.example.Outer.Inner")
+        );
+
+        // Inner interface too
+        let inner_iface = outer
+            .members
+            .iter()
+            .find(|m| m.name == "InnerIface")
+            .expect("InnerIface not found");
+        assert_eq!(inner_iface.qualified_name, "com.example.Outer.InnerIface");
+        assert_eq!(
+            inner_iface.import_path.as_deref(),
+            Some("com.example.Outer.InnerIface")
+        );
+    }
+
+    #[test]
+    fn test_enum_with_arguments() {
+        let syms = parse(
+            r#"
+            package com.example;
+            public enum Planet {
+                MERCURY(3.303e+23, 2.4397e6),
+                VENUS(4.869e+24, 6.0518e6);
+                private final double mass;
+                Planet(double mass, double radius) { this.mass = mass; }
+            }
+            "#,
+        );
+        assert_eq!(syms.len(), 1);
+        let e = &syms[0];
+        assert_eq!(e.kind, SymbolKind::Enum);
+
+        let mercury = e.members.iter().find(|m| m.name == "MERCURY").unwrap();
+        assert_eq!(mercury.kind, SymbolKind::EnumMember);
+        // Should have constructor arguments captured
+        let sig = mercury.signature.as_ref().expect("MERCURY should have arguments");
+        assert_eq!(sig.parameters.len(), 2);
+        assert_eq!(sig.parameters[0].default_value.as_deref(), Some("3.303e+23"));
+        assert_eq!(sig.parameters[1].default_value.as_deref(), Some("2.4397e6"));
+
+        let venus = e.members.iter().find(|m| m.name == "VENUS").unwrap();
+        let sig = venus.signature.as_ref().expect("VENUS should have arguments");
+        assert_eq!(sig.parameters.len(), 2);
+
+        // Simple enum constants (no args) should have no signature
+        // (this test has only MERCURY and VENUS with args)
+    }
+
+    #[test]
+    fn test_record_with_compact_constructor() {
+        let syms = parse(
+            r#"
+            package com.example;
+            public record Range(int start, int end) {
+                public Range {
+                    if (start > end) throw new IllegalArgumentException();
+                }
+            }
+            "#,
+        );
+        assert_eq!(syms.len(), 1);
+        let rec = &syms[0];
+        assert!(rec.language_data.is_record);
+
+        // Should have: compact constructor (with params from record), 2 accessors
+        let ctor = rec
+            .members
+            .iter()
+            .find(|m| m.kind == SymbolKind::Constructor)
+            .expect("constructor not found");
+        assert_eq!(ctor.name, "Range");
+        // The compact constructor should have the record's parameters
+        let params = &ctor.signature.as_ref().unwrap().parameters;
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "start");
+        assert_eq!(params[1].name, "end");
+
+        // Should have 2 accessor methods
+        let accessors: Vec<_> = rec
+            .members
+            .iter()
+            .filter(|m| m.kind == SymbolKind::Method)
+            .collect();
+        assert_eq!(accessors.len(), 2);
     }
 
     #[test]

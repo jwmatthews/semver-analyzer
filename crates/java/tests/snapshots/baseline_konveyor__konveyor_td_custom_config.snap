@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_konveyor.rs
+expression: normalize_rules(&rules)
+---
+- rule_id: sb4-removed-oldservice
+  labels:
+    - source=semver-analyzer
+    - change-type=removed
+    - language=java
+  effort: 5
+  category: mandatory
+  description: "`OldService` has been removed"
+  has_fix_strategy: false

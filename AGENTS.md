@@ -33,7 +33,11 @@ effort removed.
 | TypeScript/React/PatternFly extraction, JSX analysis, CSS profiles | `crates/ts/` | `TsSymbolData`, `ComponentSourceProfile`, `extract_css_profiles` |
 | TypeScript `Language` trait impl, `LanguageSemantics` impl | `crates/ts/src/language.rs` | `is_member_addition_breaking`, `llm_categories`, hierarchy algorithm |
 | TypeScript Konveyor rule generation | `crates/ts/src/konveyor.rs`, `konveyor_v2.rs` | `generate_rules`, `generate_sd_rules` |
-| Java extraction, semantics, manifest parsing | `crates/java/` | `JavaExtractor`, `Java` Language impl |
+| Java extraction, SD pipeline, semantics, manifest parsing | `crates/java/` | `JavaExtractor`, `Java` Language impl, `run_java_sd` |
+| Java `Language` trait impl, `LanguageSemantics` impl | `crates/java/src/language.rs` | `run_extended_analysis`, `find_callers`, `find_references`, `diff_language_data` |
+| Java SD pipeline (source-level diff) | `crates/java/src/sd_pipeline.rs` | `run_java_sd`, `JavaClassProfile`, `diff_class_profiles` |
+| Java Konveyor rule generation | `crates/java/src/konveyor.rs` | `generate_rules_with_config`, `generate_sd_rules`, `JavaKonveyorConfig` |
+| Java cross-file index (call graph) | `crates/java/src/index/mod.rs` | `JavaIndex`, `find_callers`, `find_references` |
 | Konveyor rule types, conditions, fix strategies (shared) | `crates/konveyor-core/` | `KonveyorRule`, `KonveyorCondition`, `FixStrategy` |
 | LLM prompt building, response parsing, spec comparison | `crates/llm/` | `build_file_behavioral_prompt`, `parse_file_behavioral_response` |
 | Pipeline orchestration, CLI, progress reporting | `src/` | `Analyzer::run`, `Analyzer::run_v2`, `cmd_analyze` |

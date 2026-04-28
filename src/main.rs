@@ -77,19 +77,16 @@ async fn run(cli: Cli, reporter: &ProgressReporter) -> Result<()> {
 
 // ─── Tracing initialisation ────────────────────────────────────────────
 
-fn init_tracing(logging: &LoggingArgs, reporter: &ProgressReporter) -> Result<()> {
+fn init_tracing(logging: &LoggingArgs, _reporter: &ProgressReporter) -> Result<()> {
     use semver_analyzer_core::error::DiagnoseExt;
 
-    // Stderr: only warnings and errors reach the console.
-    // All user-facing progress is handled by progress bars and
-    // reporter.println() — tracing events would just bury them.
-    let stderr_layer = fmt::layer()
-        .with_writer(reporter.make_writer())
-        .with_target(false)
-        .without_time()
-        .with_filter(EnvFilter::new("warn"));
-
-    let registry = tracing_subscriber::registry().with(stderr_layer);
+    // All user-facing output is handled by the progress reporter
+    // (phase spinners, counted bars, reporter.println()), the
+    // diagnostics system (render_error, print_degradation_summary),
+    // and direct eprintln! calls. Tracing events go exclusively to
+    // the log file — they would just bury the progress bars on the
+    // console.
+    let registry = tracing_subscriber::registry();
 
     if let Some(ref path) = logging.log_file {
         // Ensure parent directory exists
@@ -961,7 +958,12 @@ fn cmd_extract_java(
         common.git_ref
     ));
 
-    let java = semver_analyzer_java::Java;
+    let config = semver_analyzer_java::JavaRefBuildConfig {
+        java_home: args.java_home.clone(),
+        build_command: args.build_command.clone(),
+        skip_build: args.skip_build,
+    };
+    let java = semver_analyzer_java::Java::with_ref_config(config);
     let surface = java
         .extract(&common.repo, &common.git_ref, None)
         .context("Failed to extract Java API surface")?;
@@ -993,62 +995,78 @@ async fn cmd_analyze_java(
     )
     .entered();
 
-    let java = semver_analyzer_java::Java;
-    let shared = semver_analyzer_core::shared::SharedFindings::<semver_analyzer_java::Java>::new();
+    reporter.println(&format!(
+        "Analyzing {} from {} to {}",
+        common.repo.display(),
+        common.from,
+        common.to
+    ));
 
-    // TD pipeline
-    let td_phase = reporter.start_phase("Extracting Java API surfaces");
+    // Build per-ref configurations
+    let from_config = semver_analyzer_java::JavaRefBuildConfig {
+        java_home: args.from_java_home.clone(),
+        build_command: args
+            .from_build_command
+            .clone()
+            .or_else(|| args.build_command.clone()),
+        skip_build: args.skip_build,
+    };
+    let to_config = semver_analyzer_java::JavaRefBuildConfig {
+        java_home: args.to_java_home.clone(),
+        build_command: args
+            .to_build_command
+            .clone()
+            .or(args.build_command.clone()),
+        skip_build: args.skip_build,
+    };
 
-    let old_surface = java
-        .extract(&common.repo, &common.from, Some(shared.degradation()))
-        .context("Failed to extract old API surface")?;
-    let new_surface = java
-        .extract(&common.repo, &common.to, Some(shared.degradation()))
-        .context("Failed to extract new API surface")?;
+    let lang = Arc::new(semver_analyzer_java::Java::new());
+    let analyzer = orchestrator::Analyzer {
+        lang: lang.clone(),
+        lang_from: Arc::new(semver_analyzer_java::Java::with_ref_config(from_config)),
+        lang_to: Arc::new(semver_analyzer_java::Java::with_ref_config(to_config)),
+    };
 
-    td_phase.finish_with_detail(
-        "Extracted API surfaces",
-        &format!(
-            "old: {} symbols, new: {} symbols",
-            old_surface.symbols.len(),
-            new_surface.symbols.len()
-        ),
-    );
-
-    let diff_phase = reporter.start_phase("Diffing Java API surfaces");
-    let structural_changes = semver_analyzer_core::traits::diff_surfaces_with_semantics(
-        &old_surface,
-        &new_surface,
-        &java,
-    );
-
-    let breaking = structural_changes.iter().filter(|c| c.is_breaking).count();
-    diff_phase.finish_with_detail(
-        "Structural diff complete",
-        &format!(
-            "{} total changes, {} breaking",
-            structural_changes.len(),
-            breaking
-        ),
-    );
+    // Select pipeline: SD (default) or BU (opt-in via --behavioral)
+    let result = if common.behavioral {
+        reporter.println("Pipeline: structural + behavioral (TD+BU)");
+        analyzer
+            .run(
+                &common.repo,
+                &common.from,
+                &common.to,
+                common.no_llm,
+                common.llm_command.as_deref(),
+                None,
+                false,
+                common.llm_timeout,
+                reporter,
+            )
+            .await?
+    } else {
+        reporter.println("Pipeline: structural + source-level diff (TD+SD)");
+        analyzer
+            .run_v2(
+                &common.repo,
+                &common.from,
+                &common.to,
+                common.no_llm,
+                common.llm_command.as_deref(),
+                None,  // build_command
+                None,  // dep_dir
+                None,  // dep_from
+                None,  // dep_to
+                None,  // dep_build_command
+                common.llm_timeout,
+                reporter,
+            )
+            .await?
+    };
 
     // Build report
     let report_phase = reporter.start_phase("Building Java analysis report");
 
-    let results = semver_analyzer_core::AnalysisResult::<semver_analyzer_java::Java> {
-        old_surface: Arc::new(old_surface),
-        new_surface: Arc::new(new_surface),
-        structural_changes: Arc::new(structural_changes),
-        behavioral_changes: Vec::new(),
-        manifest_changes: Vec::new(),
-        llm_api_changes: Vec::new(),
-        inferred_rename_patterns: None,
-        container_changes: Vec::new(),
-        extensions: (),
-        degradation: shared.degradation_arc(),
-    };
-
-    let report = java.build_report(&results, &common.repo, &common.from, &common.to);
+    let report = lang.build_report(&result, &common.repo, &common.from, &common.to);
 
     report_phase.finish_with_detail(
         "Report built",
@@ -1056,11 +1074,11 @@ async fn cmd_analyze_java(
     );
 
     // Output
-    let envelope = build_envelope(&report, &results.structural_changes)?;
+    let envelope = build_envelope(&report, &result.structural_changes)?;
     write_json_output(&envelope, common.output.as_deref(), reporter)?;
 
     // Print degradation summary
-    diagnostics::print_degradation_summary(shared.degradation(), reporter);
+    diagnostics::print_degradation_summary(&result.degradation, reporter);
 
     Ok(())
 }
@@ -1075,47 +1093,104 @@ async fn cmd_konveyor_java(
     let common = &args.common;
     let _span = info_span!("konveyor-java").entered();
 
-    let from_report = common
-        .from_report
-        .as_ref()
-        .context("--from-report is required for konveyor java (--repo mode not yet supported)")?;
+    let report: AnalysisReport<semver_analyzer_java::Java> = if let Some(from_report) =
+        common.from_report.as_ref()
+    {
+        // Load from saved report
+        let phase = reporter.start_phase("Loading Java analysis report");
+        let report_json = read_to_string(from_report)
+            .with_context(|| format!("Failed to read report from {}", from_report.display()))?;
+        let r = serde_json::from_str(&report_json)
+            .with_context(|| "Failed to parse Java analysis report")?;
+        phase.finish("Loaded report");
+        r
+    } else if let (Some(repo), Some(from), Some(to)) =
+        (common.repo.as_ref(), common.from.as_ref(), common.to.as_ref())
+    {
+        // Run analysis inline (--repo mode)
+        reporter.println(&format!(
+            "Analyzing {} from {} to {}",
+            repo.display(),
+            from,
+            to
+        ));
 
-    let phase = reporter.start_phase("Loading Java analysis report");
+        let lang = Arc::new(semver_analyzer_java::Java::new());
+        let analyzer = orchestrator::Analyzer {
+            lang: lang.clone(),
+            lang_from: lang.clone(),
+            lang_to: lang.clone(),
+        };
 
-    let report_json = read_to_string(from_report)
-        .with_context(|| format!("Failed to read report from {}", from_report.display()))?;
+        let result = analyzer
+            .run_v2(
+                repo,
+                from,
+                to,
+                true,  // no_llm — rule generation doesn't need LLM
+                None,
+                None,  // build_command
+                None,  // dep_dir
+                None,  // dep_from
+                None,  // dep_to
+                None,  // dep_build_command
+                120,
+                reporter,
+            )
+            .await?;
 
-    let report: AnalysisReport<semver_analyzer_java::Java> = serde_json::from_str(&report_json)
-        .with_context(|| "Failed to parse Java analysis report")?;
+        let r = lang.build_report(&result, repo, from, to);
+        diagnostics::print_degradation_summary(&result.degradation, reporter);
+        r
+    } else {
+        anyhow::bail!(
+            "Either --from-report or (--repo, --from, --to) are required for konveyor java"
+        );
+    };
 
-    phase.finish("Loaded report");
+    // Build Konveyor config from CLI args
+    let konveyor_config = semver_analyzer_java::JavaKonveyorConfig::from_args(
+        args.project_name.as_deref(),
+        args.rule_prefix.as_deref(),
+        args.migration_guide_url.as_deref(),
+    );
 
     let gen_phase = reporter.start_phase("Generating Java Konveyor rules");
 
-    let rules = semver_analyzer_java::konveyor::generate_rules(&report);
+    // TD rules
+    let mut all_rules =
+        semver_analyzer_java::konveyor::generate_rules_with_config(&report, &konveyor_config);
 
-    gen_phase.finish_with_detail("Generated rules", &format!("{} rules", rules.len()));
+    // SD rules (from source-level diff)
+    if let Some(ref sd_result) = report.extensions.sd_result {
+        let sd_rules =
+            semver_analyzer_java::konveyor::generate_sd_rules(sd_result, &konveyor_config);
+        all_rules.extend(sd_rules);
+    }
+
+    gen_phase.finish_with_detail("Generated rules", &format!("{} rules", all_rules.len()));
 
     // Write rules
     let output_dir = &common.output_dir;
     fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output dir {}", output_dir.display()))?;
 
-    let ruleset = semver_analyzer_java::konveyor::ruleset(
+    let ruleset = semver_analyzer_java::konveyor::ruleset_with_config(
         &report.comparison.from_ref,
         &report.comparison.to_ref,
+        &konveyor_config,
     );
     let ruleset_yaml = serde_yaml::to_string(&ruleset)?;
     let ruleset_path = output_dir.join("ruleset.yaml");
     fs::write(&ruleset_path, &ruleset_yaml)?;
 
-    let rules_yaml = serde_yaml::to_string(&rules)?;
+    let rules_yaml = serde_yaml::to_string(&all_rules)?;
     let rules_path = output_dir.join("rules.yaml");
     fs::write(&rules_path, &rules_yaml)?;
 
     reporter.println(&format!(
         "Wrote {} rules to {}",
-        rules.len(),
+        all_rules.len(),
         output_dir.display()
     ));
 

@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_konveyor.rs
+expression: normalize_rules(&rules)
+---
+- rule_id: java-rename-oldservice
+  labels:
+    - source=semver-analyzer
+    - change-type=renamed
+    - language=java
+  effort: 3
+  category: mandatory
+  description: "`com.example.OldService` renamed to `com.example.NewService`"
+  has_fix_strategy: true

@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: "diff_profiles(&old, &new)"
+---
+- class_name: com.example.Config
+  category: AnnotationChanged
+  description: "Annotation `@RequestMapping` on `Config` changed attributes"
+  is_breaking: true
+  method: ~
+  old_value: "@RequestMapping(\"/api/v1\")"
+  new_value: "@RequestMapping(\"/api/v2\")"

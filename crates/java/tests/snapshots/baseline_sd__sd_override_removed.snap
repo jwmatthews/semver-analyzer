@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: "diff_profiles(&old, &new)"
+---
+- class_name: com.example.Sub
+  category: OverrideRemoved
+  description: "Method `toString` no longer overrides parent — behavior may revert to parent impl"
+  is_breaking: true
+  method: toString
+  old_value: "@Override"
+  new_value: ~

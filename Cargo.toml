@@ -8,7 +8,7 @@ version = "0.0.5"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://forge.hurley.page/shawn_hurley/semver-analyzer"
-description = "Deterministic semantic breaking change analyzer for TypeScript/JavaScript"
+description = "Deterministic semantic breaking change analyzer for TypeScript/JavaScript and Java"
 
 [features]
 default = []

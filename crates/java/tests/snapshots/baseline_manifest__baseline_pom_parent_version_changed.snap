@@ -1,0 +1,10 @@
+---
+source: crates/java/tests/baseline_manifest.rs
+expression: "diff_manifest(old, new)"
+---
+- field: parent.version
+  change_type: ParentVersionChanged
+  is_breaking: false
+  description: "Parent `org.springframework.boot:spring-boot-starter-parent` version changed from `3.2.0` to `4.0.0`"
+  before: 3.2.0
+  after: 4.0.0

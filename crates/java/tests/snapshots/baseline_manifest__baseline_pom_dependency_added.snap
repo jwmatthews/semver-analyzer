@@ -1,0 +1,10 @@
+---
+source: crates/java/tests/baseline_manifest.rs
+expression: "diff_manifest(old, new)"
+---
+- field: "dependency:org.springframework.boot:spring-boot-starter-data-jpa"
+  change_type: DependencyAdded
+  is_breaking: false
+  description: "Dependency `org.springframework.boot:spring-boot-starter-data-jpa` was added"
+  before: ~
+  after: "org.springframework.boot:spring-boot-starter-data-jpa"

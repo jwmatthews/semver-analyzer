@@ -1,0 +1,10 @@
+---
+source: crates/java/tests/baseline_manifest.rs
+expression: "diff_manifest(old, new)"
+---
+- field: "dependency:javax.servlet:javax.servlet-api"
+  change_type: DependencyRemoved
+  is_breaking: true
+  description: "Dependency `javax.servlet:javax.servlet-api` was removed"
+  before: "javax.servlet:javax.servlet-api"
+  after: ~

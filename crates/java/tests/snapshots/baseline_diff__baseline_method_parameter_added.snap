@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_diff.rs
+expression: "diff(&surface(vec![old_cls]), &surface(vec![new_cls]),)"
+---
+- symbol: process
+  qualified_name: com.example.Service.process
+  kind: Method
+  change_type: "Added(Parameter { name: \"options\" })"
+  is_breaking: true
+  description: "Required parameter `options` was added to `process`"
+  before: ~
+  after: "options: Map<String, Object>"
+  has_migration_target: false

@@ -1,0 +1,14 @@
+---
+source: crates/java/tests/baseline_konveyor.rs
+expression: normalize_rules(&rules)
+---
+- rule_id: java-import-cachemanager
+  labels:
+    - source=semver-analyzer
+    - change-type=import-path-change
+    - language=java
+    - has-codemod=true
+  effort: 1
+  category: mandatory
+  description: "`CacheManager` moved from `com.example.cache` to `com.example.cache.auto`"
+  has_fix_strategy: true

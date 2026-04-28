@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_diff.rs
+expression: "diff(&old, &new)"
+---
+- symbol: UserService
+  qualified_name: com.example.UserService
+  kind: Class
+  change_type: "Removed(Symbol { kind: Class })"
+  is_breaking: true
+  description: "Exported class `UserService` was removed"
+  before: "class: UserService"
+  after: ~
+  has_migration_target: false

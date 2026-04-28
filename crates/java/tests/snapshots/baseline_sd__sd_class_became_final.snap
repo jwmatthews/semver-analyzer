@@ -1,0 +1,11 @@
+---
+source: crates/java/tests/baseline_sd.rs
+expression: "diff_profiles(&old, &new)"
+---
+- class_name: com.example.Base
+  category: FinalAdded
+  description: "Class `Base` is now final — cannot be extended"
+  is_breaking: true
+  method: ~
+  old_value: ~
+  new_value: final

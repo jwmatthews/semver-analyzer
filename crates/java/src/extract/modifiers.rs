@@ -16,6 +16,11 @@ pub struct JavaModifiers {
     pub is_final: bool,
     pub is_default: bool,
     pub is_sealed: bool,
+    pub is_non_sealed: bool,
+    pub is_synchronized: bool,
+    pub is_transient: bool,
+    pub is_volatile: bool,
+    pub is_native: bool,
 }
 
 impl Default for JavaModifiers {
@@ -27,6 +32,11 @@ impl Default for JavaModifiers {
             is_final: false,
             is_default: false,
             is_sealed: false,
+            is_non_sealed: false,
+            is_synchronized: false,
+            is_transient: false,
+            is_volatile: false,
+            is_native: false,
         }
     }
 }
@@ -52,6 +62,12 @@ pub fn extract_modifiers(node: Node, _source: &str) -> JavaModifiers {
                     "final" => mods.is_final = true,
                     "default" => mods.is_default = true,
                     "sealed" => mods.is_sealed = true,
+                    // tree-sitter-java may emit "non_sealed" or separate tokens
+                    "non_sealed" => mods.is_non_sealed = true,
+                    "synchronized" => mods.is_synchronized = true,
+                    "transient" => mods.is_transient = true,
+                    "volatile" => mods.is_volatile = true,
+                    "native" => mods.is_native = true,
                     // Skip annotations (handled separately) and other nodes
                     _ => {}
                 }

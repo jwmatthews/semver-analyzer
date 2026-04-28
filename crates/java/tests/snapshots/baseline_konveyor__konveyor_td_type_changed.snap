@@ -1,0 +1,13 @@
+---
+source: crates/java/tests/baseline_konveyor.rs
+expression: normalize_rules(&rules)
+---
+- rule_id: java-type-changed-timeout
+  labels:
+    - source=semver-analyzer
+    - change-type=type-changed
+    - language=java
+  effort: 3
+  category: mandatory
+  description: "Type of `timeout` changed: `int` → `Duration`"
+  has_fix_strategy: true

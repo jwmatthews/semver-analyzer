@@ -60,7 +60,7 @@ pub const DEFAULT_FILE_PATTERN: &str = "*.{ts,tsx,js,jsx,mjs,cjs}";
 pub use konveyor_core::rule::{
     dedup_conditions, extract_file_pattern_from_condition, extract_frontend_refs,
     FileContentFields, FrontendDependencyFields, FrontendPatternFields, FrontendReferencedFields,
-    JavaAnnotatedFields, JavaAnnotationElement, JavaDependencyFields, JavaReferencedFields,
+    JavaDependencyFields, JavaReferencedFields,
     JsonFields, KonveyorCondition, KonveyorLink, KonveyorRule, KonveyorRuleset,
 };
 
