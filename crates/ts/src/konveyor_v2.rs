@@ -2972,8 +2972,17 @@ fn generate_test_impact_rules(
 ) -> Vec<KonveyorRule> {
     let mut rules = Vec::new();
 
+    // ── Phase 1: Direct changes — process individually ──────────────
+    //
+    // Changes with no dependency_chain are direct (the component's own
+    // source changed). These have unique discriminators (different
+    // old_values, different elements) and don't collide.
     for change in changes {
         if !change.has_test_implications {
+            continue;
+        }
+        // Skip transitive changes — handled in Phase 2
+        if change.dependency_chain.is_some() {
             continue;
         }
 
@@ -2982,7 +2991,6 @@ fn generate_test_impact_rules(
         match change.category {
             // ── Role changes: match getByRole('oldValue') ───────────
             SourceLevelCategory::RoleChange => {
-                // Role removed — tests using getByRole('X') will break
                 if let Some(ref old_val) = change.old_value {
                     if !is_concrete_value(old_val) {
                         continue;
@@ -3077,7 +3085,6 @@ fn generate_test_impact_rules(
 
             // ── ARIA label changes: match getByLabelText('oldValue') ─
             SourceLevelCategory::AriaChange => {
-                // Only generate rules for aria-label changes (not aria-hidden, etc.)
                 if !change.description.contains("aria-label") {
                     continue;
                 }
@@ -3176,10 +3183,7 @@ fn generate_test_impact_rules(
 
             // ── DOM structure changes: match getByRole(implicit_role) ─
             SourceLevelCategory::DomStructure => {
-                // Element removed — tests using getByRole for its implicit
-                // role may break (e.g., <button> removed → getByRole('button'))
                 if let Some(ref old_val) = change.old_value {
-                    // Extract element name from values like "<button>" or "<button> (×2)"
                     let element = old_val
                         .trim_start_matches('<')
                         .split('>')
@@ -3244,152 +3248,8 @@ fn generate_test_impact_rules(
                 }
             }
 
-            // ── Data attribute changes: match querySelector/getByAttribute ─
-            SourceLevelCategory::DataAttribute => {
-                // Only generate rules for transitive changes (via dependency chain)
-                if change.dependency_chain.is_none() {
-                    continue;
-                }
-
-                // Skip rules for fully-removed components (not in component_packages).
-                // If the component doesn't exist in v6, the OUIA value change is moot —
-                // the entire component needs migration, which TD rules already cover.
-                if !component_packages.contains_key(&change.component) {
-                    continue;
-                }
-
-                if let Some(ref old_val) = change.old_value {
-                    // Parse the old_value format: `attr_name="value"`
-                    // Example: `data-ouia-component-type="PF5/${componentType}"`
-                    let (attr_name, raw_old_value) = if let Some(idx) = old_val.find("=\"") {
-                        let attr = &old_val[..idx];
-                        let val = old_val[idx + 2..].trim_end_matches('"');
-                        (attr.to_string(), val.to_string())
-                    } else if let Some(idx) = old_val.find(": ") {
-                        // Fallback: `attr: value` format
-                        (old_val[..idx].to_string(), old_val[idx + 2..].to_string())
-                    } else {
-                        continue;
-                    };
-
-                    // Parse new_value with same format
-                    let raw_new_value = change.new_value.as_ref().and_then(|nv| {
-                        if let Some(idx) = nv.find("=\"") {
-                            Some(nv[idx + 2..].trim_end_matches('"').to_string())
-                        } else {
-                            nv.find(": ").map(|idx| nv[idx + 2..].to_string())
-                        }
-                    });
-
-                    // Substitute template variables (e.g., `${componentType}`)
-                    // with the component name. PatternFly convention: the OUIA
-                    // component type matches the React component name.
-                    let component = &change.component;
-                    let old_value = raw_old_value.replace("${componentType}", component);
-                    let new_value = raw_new_value
-                        .as_ref()
-                        .map(|v| v.replace("${componentType}", component));
-
-                    if !is_concrete_value(&old_value) {
-                        continue;
-                    }
-
-                    let prefix = rule_prefix(&change.migration_from);
-                    let rule_id = format!(
-                        "{}-test-{}-data-attr-{}-changed",
-                        prefix,
-                        sanitize(component),
-                        sanitize(&attr_name),
-                    );
-
-                    let message = if let Some(ref new_val) = new_value {
-                        if is_concrete_value(new_val) {
-                            format!(
-                                "{component} `{attr}` value changed from `{old}` to `{new}`.\n\n\
-                                 Update test selectors:\n  \
-                                 `querySelector('[{attr}=\"{old}\"]')` → `querySelector('[{attr}=\"{new}\"]')`",
-                                attr = attr_name,
-                                old = old_value,
-                                new = new_val,
-                            )
-                        } else {
-                            format!(
-                                "{component} `{attr}` value changed from `{old}` to a dynamic value.\n\n\
-                                 Tests using `querySelector('[{attr}=\"{old}\"]')` may need updating.\n\n\
-                                 {desc}",
-                                attr = attr_name,
-                                old = old_value,
-                                desc = change.description,
-                            )
-                        }
-                    } else {
-                        format!(
-                            "{component} `{attr}` value `{old}` was removed.\n\n\
-                             Tests using `querySelector('[{attr}=\"{old}\"]')` will fail.\n\n\
-                             {desc}",
-                            attr = attr_name,
-                            old = old_value,
-                            desc = change.description,
-                        )
-                    };
-
-                    let fix =
-                        new_value
-                            .as_ref()
-                            .filter(|nv| is_concrete_value(nv))
-                            .map(|new_val| {
-                                use semver_analyzer_konveyor_core::FixStrategyEntry;
-                                FixStrategyEntry {
-                                    strategy: "PropValueChange".into(),
-                                    from: Some(old_value.clone()),
-                                    to: Some(new_val.clone()),
-                                    component: Some(component.clone()),
-                                    prop: Some(attr_name.clone()),
-                                    ..Default::default()
-                                }
-                            });
-
-                    rules.push(KonveyorRule {
-                        rule_id,
-                        labels: vec![
-                            "source=semver-analyzer".into(),
-                            "change-type=test-impact".into(),
-                            "impact=frontend-testing".into(),
-                            format!("package={}", pkg),
-                        ],
-                        effort: 1,
-                        category: "optional".into(),
-                        description: format!(
-                            "Test impact: {} `{}` value changed",
-                            component, attr_name,
-                        ),
-                        message,
-                        links: vec![],
-                        when: KonveyorCondition::FrontendReferenced {
-                            referenced: FrontendReferencedFields {
-                                pattern: DATA_ATTR_QUERY_PATTERN.into(),
-                                location: "FUNCTION_CALL".into(),
-                                component: None,
-                                parent: None,
-                                not_parent: None,
-                                child: None,
-                                not_child: None,
-                                requires_child: None,
-                                parent_from: None,
-                                value: Some(format!(".*{}.*", regex_escape(&old_value))),
-                                from: None,
-                                file_pattern: Some(TEST_FILE_PATTERN.into()),
-                            },
-                        },
-                        fix_strategy: fix,
-                    });
-                }
-            }
-
             // ── Attribute conditionality: match getAttribute('attrName') ─
             SourceLevelCategory::AttributeConditionality => {
-                // Extract the attribute name from the description.
-                // Format: "{attr} on <{elem}> in {component} changed from..."
                 let attr_name = match change.description.split(" on <").next() {
                     Some(name) if !name.is_empty() => name.to_string(),
                     _ => continue,
@@ -3455,11 +3315,294 @@ fn generate_test_impact_rules(
                 });
             }
 
+            // DataAttribute and PortalUsage are transitive-only — handled in Phase 2
             _ => {}
         }
     }
 
+    // ── Phase 2: Transitive changes — one consolidated rule per component ─
+    //
+    // Group all transitive changes (dependency_chain: Some) by component.
+    // For each component, build a single rule with OR'd when conditions
+    // to prevent duplicate rule IDs when multiple sub-components produce
+    // the same category of change.
+    let mut transitive_by_component: HashMap<String, Vec<&SourceLevelChange>> = HashMap::new();
+    for change in changes {
+        if !change.has_test_implications {
+            continue;
+        }
+        if change.dependency_chain.is_none() {
+            continue;
+        }
+        transitive_by_component
+            .entry(change.component.clone())
+            .or_default()
+            .push(change);
+    }
+
+    for (component, component_changes) in &transitive_by_component {
+        if !component_packages.contains_key(component) {
+            continue;
+        }
+        let pkg = pkg_for(component, component_packages);
+
+        // Build individual when conditions and message parts for each change.
+        // Use a HashSet to deduplicate identical conditions (e.g., two sub-components
+        // both losing <button> produce the same getByRole('button') condition).
+        let mut conditions: Vec<KonveyorCondition> = Vec::new();
+        let mut seen_condition_keys: HashSet<String> = HashSet::new();
+        let mut message_parts: Vec<String> = Vec::new();
+        let mut max_effort = 1u32;
+
+        for change in component_changes {
+            if let Some((cond, key)) =
+                build_when_for_transitive_change(change, component, &pkg)
+            {
+                if seen_condition_keys.insert(key) {
+                    conditions.push(cond);
+                }
+            }
+            message_parts.push(format!("- {}", change.description));
+            // PortalUsage changes are harder to fix (effort 3)
+            if change.category == SourceLevelCategory::PortalUsage {
+                max_effort = max_effort.max(3);
+            }
+        }
+
+        if conditions.is_empty() {
+            continue;
+        }
+
+        let when = if conditions.len() == 1 {
+            conditions.remove(0)
+        } else {
+            KonveyorCondition::Or { or: conditions }
+        };
+
+        let rule_id = format!(
+            "sd-test-{}-transitive-behavioral-changes",
+            sanitize(&component.to_lowercase()),
+        );
+
+        let message = format!(
+            "{component} is affected by behavioral changes in rendered sub-components:\n\
+             {changes}\n\n\
+             Tests for {component} may need updating. Fix options depend on the specific change:\n\
+             - For portal changes: use waitFor(), popperProps={{{{ appendTo: 'inline' }}}}, \
+             or within(document.body)\n\
+             - For role/DOM changes: update getByRole() queries to match new roles\n\
+             - For attribute changes: update querySelector/getAttribute calls",
+            changes = message_parts.join("\n"),
+        );
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=test-impact".into(),
+                "impact=frontend-testing".into(),
+                format!("package={}", pkg),
+            ],
+            effort: max_effort,
+            category: "potential".into(),
+            description: format!(
+                "Test impact: {} has transitive behavioral changes",
+                component,
+            ),
+            message,
+            links: vec![],
+            when,
+            fix_strategy: None,
+        });
+    }
+
     rules
+}
+
+/// Build a `KonveyorCondition` for a transitive source-level change.
+///
+/// Returns `Some((condition, dedup_key))` where `dedup_key` is a string
+/// that uniquely identifies the condition to prevent duplicates when
+/// multiple sub-components produce the same type of change.
+///
+/// Returns `None` if the change doesn't produce a meaningful test-impact
+/// condition (e.g., non-concrete values, missing data).
+fn build_when_for_transitive_change(
+    change: &SourceLevelChange,
+    component: &str,
+    pkg: &str,
+) -> Option<(KonveyorCondition, String)> {
+    match change.category {
+        SourceLevelCategory::RoleChange => {
+            let old_val = change.old_value.as_ref()?;
+            if !is_concrete_value(old_val) {
+                return None;
+            }
+            let key = format!("role:{}", old_val);
+            Some((
+                KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: ROLE_QUERY_PATTERN.into(),
+                        location: "FUNCTION_CALL".into(),
+                        component: None,
+                        parent: None,
+                        not_parent: None,
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        parent_from: None,
+                        value: Some(format!("^{}$", old_val)),
+                        from: None,
+                        file_pattern: Some(TEST_FILE_PATTERN.into()),
+                    },
+                },
+                key,
+            ))
+        }
+
+        SourceLevelCategory::AriaChange => {
+            if !change.description.contains("aria-label") {
+                return None;
+            }
+            let old_val = change.old_value.as_ref()?;
+            if !is_concrete_value(old_val) {
+                return None;
+            }
+            let key = format!("aria-label:{}", old_val);
+            Some((
+                KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: LABEL_QUERY_PATTERN.into(),
+                        location: "FUNCTION_CALL".into(),
+                        component: None,
+                        parent: None,
+                        not_parent: None,
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        parent_from: None,
+                        value: Some(format!("^{}$", old_val)),
+                        from: None,
+                        file_pattern: Some(TEST_FILE_PATTERN.into()),
+                    },
+                },
+                key,
+            ))
+        }
+
+        SourceLevelCategory::DomStructure => {
+            let old_val = change.old_value.as_ref()?;
+            let element = old_val
+                .trim_start_matches('<')
+                .split('>')
+                .next()
+                .unwrap_or("")
+                .trim();
+            let role = implicit_aria_role(element)?;
+            let key = format!("dom:{}:{}", element, role);
+            Some((
+                KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: ROLE_QUERY_PATTERN.into(),
+                        location: "FUNCTION_CALL".into(),
+                        component: None,
+                        parent: None,
+                        not_parent: None,
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        parent_from: None,
+                        value: Some(format!("^{}$", role)),
+                        from: None,
+                        file_pattern: Some(TEST_FILE_PATTERN.into()),
+                    },
+                },
+                key,
+            ))
+        }
+
+        SourceLevelCategory::DataAttribute => {
+            let old_val = change.old_value.as_ref()?;
+            let (attr_name, raw_old_value) = if let Some(idx) = old_val.find("=\"") {
+                let attr = &old_val[..idx];
+                let val = old_val[idx + 2..].trim_end_matches('"');
+                (attr.to_string(), val.to_string())
+            } else if let Some(idx) = old_val.find(": ") {
+                (old_val[..idx].to_string(), old_val[idx + 2..].to_string())
+            } else {
+                return None;
+            };
+            let old_value = raw_old_value.replace("${componentType}", component);
+            if !is_concrete_value(&old_value) {
+                return None;
+            }
+            let key = format!("data:{}:{}", attr_name, old_value);
+            Some((
+                KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: DATA_ATTR_QUERY_PATTERN.into(),
+                        location: "FUNCTION_CALL".into(),
+                        component: None,
+                        parent: None,
+                        not_parent: None,
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        parent_from: None,
+                        value: Some(format!(".*{}.*", regex_escape(&old_value))),
+                        from: None,
+                        file_pattern: Some(TEST_FILE_PATTERN.into()),
+                    },
+                },
+                key,
+            ))
+        }
+
+        SourceLevelCategory::AttributeConditionality => {
+            let attr_name = match change.description.split(" on <").next() {
+                Some(name) if !name.is_empty() => name.to_string(),
+                _ => return None,
+            };
+            let key = format!("attr-cond:{}", attr_name);
+            Some((
+                KonveyorCondition::FileContent {
+                    filecontent: FileContentFields {
+                        pattern: format!(
+                            "getAttribute\\(\\s*['\"]{}['\"]\\s*\\)",
+                            regex_escape(&attr_name),
+                        ),
+                        file_pattern: TEST_FILE_PATTERN.into(),
+                    },
+                },
+                key,
+            ))
+        }
+
+        SourceLevelCategory::PortalUsage => {
+            let key = "portal".to_string();
+            Some((
+                KonveyorCondition::FrontendReferenced {
+                    referenced: FrontendReferencedFields {
+                        pattern: format!("^{}$", component),
+                        location: "IMPORT".into(),
+                        component: None,
+                        parent: None,
+                        not_parent: None,
+                        child: None,
+                        not_child: None,
+                        requires_child: None,
+                        parent_from: None,
+                        value: None,
+                        from: Some(pkg.to_string()),
+                        file_pattern: None,
+                    },
+                },
+                key,
+            ))
+        }
+
+        _ => None,
+    }
 }
 
 // ── CSS class removal rules ─────────────────────────────────────────────

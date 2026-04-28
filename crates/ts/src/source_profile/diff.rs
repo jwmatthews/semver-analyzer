@@ -77,6 +77,34 @@ fn diff_portal_usage(
             dependency_chain: None,
         });
     }
+
+    // Portal target changed (e.g., createPortal target expression changed)
+    // even though both versions use createPortal.
+    if old.uses_portal && new.uses_portal && old.portal_target != new.portal_target {
+        let old_target = old.portal_target.as_deref().unwrap_or("unknown");
+        let new_target = new.portal_target.as_deref().unwrap_or("unknown");
+
+        changes.push(SourceLevelChange {
+            component: component.to_string(),
+            category: SourceLevelCategory::PortalUsage,
+            description: format!(
+                "{component} changed its portal target from '{old_target}' to '{new_target}' — \
+                 content now renders to a different DOM location"
+            ),
+            old_value: Some(format!("portal_target: {old_target}")),
+            new_value: Some(format!("portal_target: {new_target}")),
+            has_test_implications: true,
+            test_description: Some(
+                "Portal target changed. Tests using screen.getByText() may need \
+                 within(document.body) or baseElement configuration, and click-outside \
+                 handlers may fire before portal content mounts in jsdom."
+                    .to_string(),
+            ),
+            element: None,
+            migration_from: None,
+            dependency_chain: None,
+        });
+    }
 }
 
 // ── Context dependencies ────────────────────────────────────────────────
@@ -847,7 +875,7 @@ fn diff_prop_style_bindings(
 
 // ── Managed attributes (prop overrides HTML attribute) ───────────────────
 
-fn diff_managed_attributes(
+pub(crate) fn diff_managed_attributes(
     old: &ComponentSourceProfile,
     new: &ComponentSourceProfile,
     component: &str,
@@ -1073,6 +1101,45 @@ mod tests {
         assert_eq!(changes[0].category, SourceLevelCategory::PortalUsage);
         assert!(changes[0].has_test_implications);
         assert!(changes[0].test_description.is_some());
+    }
+
+    #[test]
+    fn test_diff_portal_target_changed() {
+        let mut old = make_profile("Popper");
+        old.uses_portal = true;
+        old.portal_target = Some("inline".into());
+
+        let mut new = make_profile("Popper");
+        new.uses_portal = true;
+        new.portal_target = Some("document.body".into());
+
+        let changes = diff_profiles(&old, &new);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].category, SourceLevelCategory::PortalUsage);
+        assert!(changes[0].has_test_implications);
+        assert!(changes[0]
+            .description
+            .contains("changed its portal target"));
+        assert!(changes[0].old_value.as_ref().unwrap().contains("inline"));
+        assert!(changes[0]
+            .new_value
+            .as_ref()
+            .unwrap()
+            .contains("document.body"));
+    }
+
+    #[test]
+    fn test_diff_portal_target_unchanged() {
+        let mut old = make_profile("Popper");
+        old.uses_portal = true;
+        old.portal_target = Some("target".into());
+
+        let mut new = make_profile("Popper");
+        new.uses_portal = true;
+        new.portal_target = Some("target".into());
+
+        let changes = diff_profiles(&old, &new);
+        assert!(changes.is_empty());
     }
 
     #[test]

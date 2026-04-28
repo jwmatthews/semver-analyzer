@@ -21,7 +21,7 @@
 //! All analysis is deterministic — no LLM, no confidence scores.
 
 use crate::composition::{build_composition_tree_v2, DelegateContext};
-use crate::source_profile::{self, diff::diff_profiles};
+use crate::source_profile::{self, diff::{diff_managed_attributes, diff_profiles}};
 
 use crate::sd_types::{
     ComponentSourceProfile, CompositionChange, CompositionChangeType, CompositionTree,
@@ -276,6 +276,71 @@ pub fn run_sd(
     }
 
     // ════════════════════════════════════════════════════════════════
+    // Phase B.5b: Enrich overridden_attributes from helper functions
+    // ════════════════════════════════════════════════════════════════
+    //
+    // For managed attribute bindings with empty overridden_attributes,
+    // resolve the generator function's import, parse its return value,
+    // and fill in the attribute names it produces. This is needed for
+    // helpers like getOUIAProps/useOUIAProps that generate attributes
+    // at runtime (data-ouia-component-type, data-ouia-component-id, etc.)
+    // which are never statically visible in the component's JSX.
+
+    let override_count =
+        enrich_overridden_attributes(repo, to_ref, &mut new_profiles, to_worktree_path);
+    let old_override_count =
+        enrich_overridden_attributes(repo, from_ref, &mut old_profiles, from_worktree_path);
+
+    if override_count + old_override_count > 0 {
+        info!(
+            new = override_count,
+            old = old_override_count,
+            "Phase B.5b complete: overridden_attributes enrichment"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Phase B.5c: Re-diff PropAttributeOverride with enriched profiles
+    // ════════════════════════════════════════════════════════════════
+    //
+    // Phase A emitted PropAttributeOverride source-level changes before
+    // Phase B.5b enrichment ran, so their overridden_attributes were empty
+    // (the data_attributes correlation heuristic doesn't resolve cross-file
+    // helper function imports). Now that both old_profiles and new_profiles
+    // have been enriched with correct overridden_attributes, re-diff the
+    // managed attributes to produce changes with real attribute names.
+    {
+        let mut corrected_changes = Vec::new();
+        for (component_name, new_profile) in &new_profiles {
+            if let Some(old_profile) = old_profiles.get(component_name) {
+                diff_managed_attributes(
+                    old_profile,
+                    new_profile,
+                    component_name,
+                    &mut corrected_changes,
+                );
+            }
+        }
+        let stale_count = all_source_changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::PropAttributeOverride)
+            .count();
+        all_source_changes
+            .retain(|c| c.category != SourceLevelCategory::PropAttributeOverride);
+        all_source_changes.extend(corrected_changes);
+        if stale_count > 0 {
+            info!(
+                stale_removed = stale_count,
+                corrected = all_source_changes
+                    .iter()
+                    .filter(|c| c.category == SourceLevelCategory::PropAttributeOverride)
+                    .count(),
+                "Phase B.5c complete: re-diffed PropAttributeOverride with enriched profiles"
+            );
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
     // Phase A.7: Dependency behavioral analysis (transitive changes)
     // ════════════════════════════════════════════════════════════════
     //
@@ -308,9 +373,21 @@ pub fn run_sd(
         if !transitive_changes.is_empty() {
             info!(
                 changes = transitive_changes.len(),
-                "Phase A.7 complete: transitive behavioral changes detected"
+                "Phase A.7a complete: transitive behavioral changes detected"
             );
             all_source_changes.extend(transitive_changes);
+        }
+    }
+
+    // Phase A.7b: Propagate externally-observable source-level changes
+    // through the rendered_components graph. When a sub-component changes
+    // (portal behavior, DOM structure, ARIA roles, etc.), all parent
+    // components that render it inherit those effects.
+    {
+        let rendered_changes =
+            propagate_rendered_component_changes(&all_source_changes, &new_profiles);
+        if !rendered_changes.is_empty() {
+            all_source_changes.extend(rendered_changes);
         }
     }
 
@@ -1916,6 +1993,192 @@ fn diff_helper_output(
     changes
 }
 
+// ── Phase A.7b: Transitive rendered-component change propagation ─────────
+
+/// Propagate externally-observable source-level changes through the
+/// `rendered_components` dependency graph.
+///
+/// When a sub-component changes in a way that has externally observable
+/// effects (portal behavior, DOM structure, ARIA roles, etc.), every
+/// parent component that renders it inherits those effects. This function
+/// builds a reverse index from `rendered_components` and emits derived
+/// `SourceLevelChange` entries for each parent, one level deep.
+///
+/// Categories worth propagating (externally observable):
+/// - `PortalUsage` — changes where rendered content lives in the DOM
+/// - `DomStructure` — changes what HTML elements exist
+/// - `RoleChange` — changes ARIA roles on rendered elements
+/// - `AriaChange` — changes ARIA attributes on rendered elements
+///
+/// Categories NOT propagated (internal implementation details):
+/// - `ForwardRef`, `Memo`, `CssToken`, `PropDefault`, `Composition`,
+///   `ContextDependency`, `PropAttributeOverride`, `AttributeConditionality`,
+///   `RenderedComponent`, `DataAttribute` (already handled by Phase A.7a)
+///
+/// PropDefault changes on portal-using components are a special case:
+/// they control WHERE content renders (e.g., Popper's `appendTo` default
+/// changing from `'inline'` to `() => document.body`). These are propagated
+/// as derived `PortalUsage` changes to all parent components.
+fn propagate_rendered_component_changes(
+    source_changes: &[SourceLevelChange],
+    new_profiles: &HashMap<String, ComponentSourceProfile>,
+) -> Vec<SourceLevelChange> {
+    let _span = info_span!("phase_a7b_rendered_propagation").entered();
+    let mut results = Vec::new();
+
+    // Categories that propagate transitively through rendered_components
+    const TRANSITIVE_CATEGORIES: &[SourceLevelCategory] = &[
+        SourceLevelCategory::PortalUsage,
+        SourceLevelCategory::DomStructure,
+        SourceLevelCategory::RoleChange,
+        SourceLevelCategory::AriaChange,
+    ];
+
+    // Props that control portal rendering behavior. When a PropDefault change
+    // is on one of these props AND the component uses createPortal, propagate
+    // as a PortalUsage change.
+    const PORTAL_BEHAVIOR_PROPS: &[&str] = &[
+        "appendTo",
+        "container",
+        "mountNode",
+        "portalTarget",
+        "getContainer",
+    ];
+
+    // Build reverse index: sub-component name → [parent components that render it]
+    let mut renderers: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (comp_name, profile) in new_profiles {
+        for rendered in &profile.rendered_components {
+            renderers
+                .entry(rendered.name.as_str())
+                .or_default()
+                .push(comp_name.as_str());
+        }
+    }
+
+    if renderers.is_empty() {
+        return results;
+    }
+
+    // Collect changes worth propagating
+    for change in source_changes {
+        // Skip changes that already have a dependency chain (already transitive)
+        if change.dependency_chain.is_some() {
+            continue;
+        }
+
+        let should_propagate = if TRANSITIVE_CATEGORIES.contains(&change.category) {
+            true
+        } else if change.category == SourceLevelCategory::PropDefault {
+            // Special case: PropDefault on a portal-using component where the
+            // prop controls portal behavior (e.g., Popper.appendTo)
+            let is_portal_component = new_profiles
+                .get(&change.component)
+                .map(|p| p.uses_portal)
+                .unwrap_or(false);
+
+            if is_portal_component {
+                PORTAL_BEHAVIOR_PROPS
+                    .iter()
+                    .any(|prop| change.description.contains(prop))
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !should_propagate {
+            continue;
+        }
+
+        // Find all components that render this sub-component
+        let dependents = match renderers.get(change.component.as_str()) {
+            Some(deps) => deps,
+            None => continue,
+        };
+
+        // Determine the derived category. PropDefault changes on portal
+        // components become PortalUsage for the parent.
+        let derived_category = if change.category == SourceLevelCategory::PropDefault {
+            SourceLevelCategory::PortalUsage
+        } else {
+            change.category.clone()
+        };
+
+        for dep_component in dependents {
+            let desc = format!(
+                "{dep_component} renders {sub} which has a behavioral change: {original}",
+                sub = change.component,
+                original = change.description,
+            );
+
+            let test_desc = if derived_category == SourceLevelCategory::PortalUsage {
+                Some(format!(
+                    "Tests opening {dep_component} and querying for popup/overlay content \
+                     via screen.getByText() or screen.getByRole() may fail. Content may now \
+                     render via portal to a different DOM location. Use waitFor(), \
+                     within(document.body), or pass popperProps={{{{ appendTo: 'inline' }}}} \
+                     in test renders."
+                ))
+            } else {
+                change.test_description.as_ref().map(|td| {
+                    format!(
+                        "Via {sub}: {td}",
+                        sub = change.component,
+                    )
+                })
+            };
+
+            results.push(SourceLevelChange {
+                component: dep_component.to_string(),
+                category: derived_category.clone(),
+                description: desc,
+                old_value: change.old_value.clone(),
+                new_value: change.new_value.clone(),
+                has_test_implications: true,
+                test_description: test_desc,
+                element: change.element.clone(),
+                migration_from: None,
+                dependency_chain: Some(vec![
+                    dep_component.to_string(),
+                    change.component.clone(),
+                    change.description.clone(),
+                ]),
+            });
+        }
+    }
+
+    // Deduplicate: when the same parent gets multiple changes of the same
+    // category with the same old/new values (e.g., from rendering two
+    // sub-components that both lost <button>, or from both a direct
+    // PortalUsage and a PropDefault→PortalUsage propagation), keep only
+    // the first. This prevents downstream rule generation from emitting
+    // duplicate rule IDs.
+    let mut seen: HashSet<(String, SourceLevelCategory, Option<String>, Option<String>)> =
+        HashSet::new();
+    let pre_dedup = results.len();
+    results.retain(|c| {
+        seen.insert((
+            c.component.clone(),
+            c.category.clone(),
+            c.old_value.clone(),
+            c.new_value.clone(),
+        ))
+    });
+    let deduped = pre_dedup - results.len();
+
+    if !results.is_empty() {
+        info!(
+            changes = results.len(),
+            deduped,
+            "Phase A.7b: transitive rendered-component changes propagated"
+        );
+    }
+
+    results
+}
+
 /// Extract string literals from a function body.
 ///
 /// Uses simple regex-like matching for quoted strings. This is intentionally
@@ -2219,6 +2482,188 @@ fn enrich_all_props_from_extends(
                 extends = ?extends_props,
                 "extends enrichment: no props resolved from any extends type"
             );
+        }
+    }
+
+    enriched_count
+}
+
+// ── Phase B.5b: Enrich overridden_attributes from helper function sources ─
+
+/// Enrich `overridden_attributes` on managed attribute bindings by parsing
+/// the helper function's return value to extract the object property keys.
+///
+/// For each profile with managed_attributes that have empty `overridden_attributes`:
+/// 1. Read the component source to find the import path for the generator function
+/// 2. Resolve the import to a file path (relative to the component)
+/// 3. Read the helper source file
+/// 4. Parse the helper to extract return-object property keys
+/// 5. Set `overridden_attributes` from the extracted keys
+///
+/// Uses a cache so each helper file is parsed only once even when 30+
+/// components import the same helper.
+fn enrich_overridden_attributes(
+    repo: &Path,
+    git_ref: &str,
+    profiles: &mut HashMap<String, ComponentSourceProfile>,
+    _worktree_path: Option<&Path>,
+) -> usize {
+    let _span = info_span!("enrich_overridden_attributes").entered();
+
+    // Cache: (resolved_file_path, function_name) -> Vec<String> (attribute keys)
+    let mut helper_cache: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut enriched_count = 0usize;
+
+    // Collect component names to iterate (avoid borrow conflict)
+    let component_names: Vec<String> = profiles.keys().cloned().collect();
+
+    for component_name in &component_names {
+        let profile = match profiles.get(component_name) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Find bindings that have empty overridden_attributes
+        let needs_enrichment: Vec<(String, String)> = profile
+            .managed_attributes
+            .iter()
+            .filter(|b| b.overridden_attributes.is_empty())
+            .map(|b| (b.generator_function.clone(), profile.file.clone()))
+            .collect();
+
+        if needs_enrichment.is_empty() {
+            continue;
+        }
+
+        // Read the component source to find imports
+        let source = match read_git_file(repo, git_ref, &profile.file) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let import_map = parse_import_sources(&source, &profile.file);
+
+        for (generator_function, component_file) in &needs_enrichment {
+            // Strip method prefix (e.g., "this.getOUIAProps" -> "getOUIAProps")
+            let bare_name = generator_function
+                .rsplit('.')
+                .next()
+                .unwrap_or(generator_function);
+
+            // Check cache first
+            let import_source = match import_map.get(bare_name) {
+                Some(s) => s.clone(),
+                None => continue, // Not imported — might be a local function or method
+            };
+
+            // Resolve the import to a file path relative to the component.
+            // This mirrors the resolution logic from enrich_all_props_from_extends:
+            // 1. resolve_relative_import → raw joined path
+            // 2. try_barrel_resolution → probe .ts/.tsx/index.ts/index.tsx
+            // 3. If the resolved file is a barrel, follow re-export chains
+            let raw_path =
+                match resolve_relative_import(component_file, &import_source, &import_map) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+            // Probe extensions and index files
+            let resolved_path = try_barrel_resolution(repo, git_ref, &raw_path, bare_name)
+                .unwrap_or(raw_path);
+
+            let cache_key = (resolved_path.clone(), bare_name.to_string());
+
+            if !helper_cache.contains_key(&cache_key) {
+                // Read the resolved file
+                let resolved_source = read_git_file(repo, git_ref, &resolved_path);
+
+                // Try extracting directly from the resolved file first
+                let mut keys = resolved_source
+                    .as_ref()
+                    .map(|src| {
+                        crate::source_profile::managed_attrs::extract_return_object_keys(
+                            src,
+                            bare_name,
+                        )
+                    })
+                    .unwrap_or_default();
+
+                // If direct extraction failed (function not found — probably a
+                // barrel file that re-exports from another module), follow
+                // re-export chains to find the actual helper source.
+                if keys.is_empty() {
+                    if let Some(ref barrel_source) = resolved_source {
+                        let reexport_sources =
+                            find_reexport_sources(barrel_source, bare_name, &resolved_path);
+                        for candidate in &reexport_sources {
+                            // Try the candidate directly, then probe extensions
+                            let try_paths = [
+                                candidate.clone(),
+                                format!("{}.ts", candidate.trim_end_matches(".ts")),
+                                format!("{}.tsx", candidate.trim_end_matches(".ts")),
+                            ];
+                            for try_path in &try_paths {
+                                if let Some(src) = read_git_file(repo, git_ref, try_path) {
+                                    let found =
+                                        crate::source_profile::managed_attrs::extract_return_object_keys(
+                                            &src,
+                                            bare_name,
+                                        );
+                                    if !found.is_empty() {
+                                        keys = found;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !keys.is_empty() {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if !keys.is_empty() {
+                    debug!(
+                        helper = %bare_name,
+                        file = %resolved_path,
+                        keys = ?keys,
+                        "Extracted return object keys from helper function"
+                    );
+                }
+
+                helper_cache.insert(cache_key.clone(), keys);
+            }
+
+            let keys = match helper_cache.get(&cache_key) {
+                Some(k) if !k.is_empty() => k.clone(),
+                _ => continue,
+            };
+
+            // Update the profile's managed_attributes with the resolved keys
+            if let Some(profile) = profiles.get_mut(component_name) {
+                let mut any_updated = false;
+                for binding in &mut profile.managed_attributes {
+                    let binding_bare = binding
+                        .generator_function
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&binding.generator_function);
+
+                    if binding_bare == bare_name && binding.overridden_attributes.is_empty() {
+                        binding.overridden_attributes = keys.clone();
+                        any_updated = true;
+                    }
+                }
+                if any_updated {
+                    enriched_count += 1;
+                    trace!(
+                        component = %component_name,
+                        generator = %generator_function,
+                        attrs = ?keys,
+                        "Enriched overridden_attributes from helper return object"
+                    );
+                }
+            }
         }
     }
 

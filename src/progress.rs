@@ -2,13 +2,8 @@
 //!
 //! Provides [`ProgressReporter`] which wraps `indicatif::MultiProgress` to
 //! display spinners for timed phases and bar graphs for counted work.
-//!
-//! Also provides [`IndicatifWriter`] — an `io::Write` implementation that
-//! routes output through `MultiProgress::println()` so tracing log lines
-//! don't clobber active progress bars.
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -76,14 +71,6 @@ impl ProgressReporter {
     /// Print a line to stderr without clobbering any active progress bars.
     pub fn println(&self, msg: &str) {
         let _ = self.multi.println(msg);
-    }
-
-    /// Obtain an [`IndicatifWriter`] suitable for use as a
-    /// `tracing_subscriber::fmt::MakeWriter`.
-    pub fn make_writer(&self) -> IndicatifWriter {
-        IndicatifWriter {
-            multi: self.multi.clone(),
-        }
     }
 }
 
@@ -179,40 +166,6 @@ impl Drop for CountedProgress {
         let done_style = ProgressStyle::with_template("✓ {msg}  {len} items  [{elapsed}]").unwrap();
         self.pb.set_style(done_style);
         self.pb.finish();
-    }
-}
-
-// ── IndicatifWriter ─────────────────────────────────────────────────────
-
-/// An `io::Write` implementation that routes output through
-/// `MultiProgress::println()` so that log lines from the tracing
-/// subscriber don't overwrite active progress bars.
-#[derive(Clone)]
-pub struct IndicatifWriter {
-    multi: Arc<MultiProgress>,
-}
-
-impl io::Write for IndicatifWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let msg = String::from_utf8_lossy(buf);
-        // Trim trailing newline — println adds its own
-        let trimmed = msg.trim_end_matches('\n');
-        if !trimmed.is_empty() {
-            let _ = self.multi.println(trimmed);
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for IndicatifWriter {
-    type Writer = IndicatifWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
     }
 }
 

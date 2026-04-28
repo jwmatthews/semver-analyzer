@@ -1894,10 +1894,21 @@ pub fn generate_rules(
         // type_summaries is always populated in the v2 pipeline.
     }
 
-    // Manifest changes
+    // Manifest changes — only emit rules for change types with targeted when clauses.
+    // Generic catch-all types (EntryPointChanged, ExportsEntryRemoved, EngineConstraintChanged,
+    // etc.) produce `builtin.filecontent` rules that match all package.json files including
+    // node_modules/, generating massive false positive counts with no actionable code fix.
     for manifest in &report.manifest_changes {
-        let rule = manifest_change_to_rule(manifest, file_pattern, &mut id_counts);
-        rules.push(rule);
+        if matches!(
+            manifest.change_type,
+            TsManifestChangeType::ModuleSystemChanged
+                | TsManifestChangeType::PeerDependencyAdded
+                | TsManifestChangeType::PeerDependencyRemoved
+                | TsManifestChangeType::PeerDependencyRangeChanged
+        ) {
+            let rule = manifest_change_to_rule(manifest, file_pattern, &mut id_counts);
+            rules.push(rule);
+        }
     }
 
     // Emit consumer CSS scanning rules when CSS version prefix changes are detected.

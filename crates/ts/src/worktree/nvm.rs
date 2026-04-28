@@ -57,26 +57,35 @@ pub fn resolve_node_bin_dir(version: &str) -> Result<PathBuf, WorktreeError> {
 /// a `PATH` entry with the nvm bin directory prepended. The caller passes
 /// the result to `Command::envs()`.
 ///
-/// When `node_version` is `None`, returns an empty vec (inherit parent PATH).
+/// Always includes `COREPACK_ENABLE_AUTO_PIN=0` to prevent Corepack from
+/// mutating `package.json` in worktrees that lack a `packageManager` field
+/// (e.g., older project versions predating Corepack adoption).
 pub fn build_node_env(
     node_version: Option<&str>,
 ) -> Result<Vec<(String, String)>, WorktreeError> {
-    let version = match node_version {
-        Some(v) => v,
-        None => return Ok(vec![]),
-    };
+    // Prevent Corepack from auto-adding a packageManager field to package.json.
+    // Without this, repos without the field (common in older versions) fail
+    // because Corepack mutates package.json and may select the wrong yarn version.
+    let mut env = vec![(
+        "COREPACK_ENABLE_AUTO_PIN".to_string(),
+        "0".to_string(),
+    )];
 
-    let bin_dir = resolve_node_bin_dir(version)?;
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", bin_dir.display(), current_path);
+    if let Some(version) = node_version {
+        let bin_dir = resolve_node_bin_dir(version)?;
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", bin_dir.display(), current_path);
 
-    tracing::info!(
-        node_version = %version,
-        bin_dir = %bin_dir.display(),
-        "Resolved Node.js version via nvm"
-    );
+        tracing::info!(
+            node_version = %version,
+            bin_dir = %bin_dir.display(),
+            "Resolved Node.js version via nvm"
+        );
 
-    Ok(vec![("PATH".to_string(), new_path)])
+        env.push(("PATH".to_string(), new_path));
+    }
+
+    Ok(env)
 }
 
 #[cfg(test)]
@@ -85,9 +94,11 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    fn build_node_env_none_returns_empty() {
+    fn build_node_env_none_returns_corepack_pin_only() {
         let result = build_node_env(None).unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result.len(), 1, "should return exactly one env var");
+        assert_eq!(result[0].0, "COREPACK_ENABLE_AUTO_PIN");
+        assert_eq!(result[0].1, "0");
     }
 
     #[test]
@@ -167,10 +178,12 @@ mod tests {
         };
 
         let env = build_node_env(Some(&version)).unwrap();
-        assert_eq!(env.len(), 1, "should return exactly one env var");
-        assert_eq!(env[0].0, "PATH", "env var key should be PATH");
+        assert_eq!(env.len(), 2, "should return COREPACK_ENABLE_AUTO_PIN + PATH");
+        assert_eq!(env[0].0, "COREPACK_ENABLE_AUTO_PIN");
+        assert_eq!(env[0].1, "0");
+        assert_eq!(env[1].0, "PATH", "second env var key should be PATH");
 
-        let new_path = &env[0].1;
+        let new_path = &env[1].1;
         let first_component = new_path.split(':').next().unwrap();
         let node_binary = PathBuf::from(first_component).join("node");
         assert!(

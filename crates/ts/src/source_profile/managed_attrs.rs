@@ -16,7 +16,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Result of analyzing destructuring patterns in a function's parameters
 /// or body (for class components using `this.props`).
@@ -189,14 +189,41 @@ fn build_bindings(
         }
     }
 
-    // Deduplicate by (prop_name, generator_function, target_element)
-    let mut seen = HashSet::new();
-    bindings.retain(|b| {
-        seen.insert((
+    // Deduplicate by (prop_name, generator_function, target_element).
+    //
+    // When a component has multiple render paths (e.g., typeahead vs standard
+    // mode) that produce different spread orders for the same target element,
+    // prefer `component_overrides: true`. If ANY render path has the managed
+    // spread after the rest spread, consumer HTML attributes can be silently
+    // overridden — that's the case we need to warn about.
+    //
+    // Also merge overridden_attributes from all duplicates (union).
+    let mut best: HashMap<(String, String, String), usize> = HashMap::new();
+    for (i, b) in bindings.iter().enumerate() {
+        let key = (
             b.prop_name.clone(),
             b.generator_function.clone(),
             b.target_element.clone(),
-        ))
+        );
+        match best.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(i);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let existing_idx = *e.get();
+                // Prefer component_overrides: true (more conservative)
+                if b.component_overrides && !bindings[existing_idx].component_overrides {
+                    e.insert(i);
+                }
+            }
+        }
+    }
+    let keep_indices: HashSet<usize> = best.values().cloned().collect();
+    let mut idx = 0usize;
+    bindings.retain(|_| {
+        let k = keep_indices.contains(&idx);
+        idx += 1;
+        k
     });
 
     bindings
@@ -1056,6 +1083,207 @@ fn jsx_member_obj_name(obj: &JSXMemberExpressionObject) -> String {
     }
 }
 
+/// Extract the property keys from a named function's return object.
+///
+/// Given the source of a helper file and a function name, parses the file
+/// to find the function, then extracts the object literal keys from its
+/// return statement (or arrow expression body).
+///
+/// For `getOUIAProps` returning:
+///   `return { 'data-ouia-component-type': ..., 'data-ouia-safe': ... }`
+/// Returns: `["data-ouia-component-type", "data-ouia-safe", "data-ouia-component-id"]`
+///
+/// Handles:
+/// - `function foo() { return { ... }; }`
+/// - `const foo = () => ({ ... })`
+/// - `export const foo = (...) => ({ ... })`
+/// - `export function foo() { ... }`
+/// - Multiple return statements (unions all keys)
+pub fn extract_return_object_keys(source: &str, function_name: &str) -> Vec<String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::tsx();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+
+    let mut keys = Vec::new();
+
+    for stmt in &parsed.program.body {
+        extract_keys_from_stmt(stmt, function_name, &mut keys);
+    }
+
+    // Deduplicate and sort for deterministic output
+    let mut seen = HashSet::new();
+    keys.retain(|k| seen.insert(k.clone()));
+    keys.sort();
+    keys
+}
+
+/// Walk statements to find a named function/const and extract its return object keys.
+fn extract_keys_from_stmt<'a>(
+    stmt: &'a Statement<'a>,
+    function_name: &str,
+    keys: &mut Vec<String>,
+) {
+    match stmt {
+        Statement::FunctionDeclaration(f) => {
+            if let Some(id) = &f.id {
+                if id.name == function_name {
+                    if let Some(body) = &f.body {
+                        extract_keys_from_body_stmts(&body.statements, keys);
+                    }
+                }
+            }
+        }
+        Statement::VariableDeclaration(var_decl) => {
+            for declarator in &var_decl.declarations {
+                let name = match &declarator.id {
+                    BindingPattern::BindingIdentifier(id) => id.name.as_str(),
+                    _ => continue,
+                };
+                if name != function_name {
+                    continue;
+                }
+                if let Some(init) = &declarator.init {
+                    extract_keys_from_arrow_or_function(init, keys);
+                }
+            }
+        }
+        Statement::ExportNamedDeclaration(export) => {
+            if let Some(decl) = &export.declaration {
+                match decl {
+                    Declaration::FunctionDeclaration(f) => {
+                        if let Some(id) = &f.id {
+                            if id.name == function_name {
+                                if let Some(body) = &f.body {
+                                    extract_keys_from_body_stmts(&body.statements, keys);
+                                }
+                            }
+                        }
+                    }
+                    Declaration::VariableDeclaration(var_decl) => {
+                        for declarator in &var_decl.declarations {
+                            let name = match &declarator.id {
+                                BindingPattern::BindingIdentifier(id) => id.name.as_str(),
+                                _ => continue,
+                            };
+                            if name != function_name {
+                                continue;
+                            }
+                            if let Some(init) = &declarator.init {
+                                extract_keys_from_arrow_or_function(init, keys);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Statement::ExportDefaultDeclaration(export) => {
+            // Only match if function_name is "default"
+            if function_name == "default" {
+                if let Some(expr) = export.declaration.as_expression() {
+                    extract_keys_from_arrow_or_function(expr, keys);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract return object keys from an arrow function or function expression.
+fn extract_keys_from_arrow_or_function<'a>(
+    expr: &'a Expression<'a>,
+    keys: &mut Vec<String>,
+) {
+    match expr {
+        Expression::ArrowFunctionExpression(arrow) => {
+            // Arrow with expression body: `=> ({ key1: ..., key2: ... })`
+            if arrow.expression {
+                for stmt in &arrow.body.statements {
+                    if let Statement::ExpressionStatement(expr_stmt) = stmt {
+                        extract_keys_from_object_expr(&expr_stmt.expression, keys);
+                    }
+                }
+            } else {
+                // Arrow with block body: `=> { return { ... }; }`
+                extract_keys_from_body_stmts(&arrow.body.statements, keys);
+            }
+        }
+        Expression::FunctionExpression(func) => {
+            if let Some(body) = &func.body {
+                extract_keys_from_body_stmts(&body.statements, keys);
+            }
+        }
+        // Unwrap call expressions like React.memo(() => ...)
+        Expression::CallExpression(call) => {
+            for arg in &call.arguments {
+                if let Some(e) = arg.as_expression() {
+                    extract_keys_from_arrow_or_function(e, keys);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract return object keys from a list of function body statements.
+fn extract_keys_from_body_stmts<'a>(
+    stmts: &'a [Statement<'a>],
+    keys: &mut Vec<String>,
+) {
+    for stmt in stmts {
+        if let Statement::ReturnStatement(ret) = stmt {
+            if let Some(arg) = &ret.argument {
+                extract_keys_from_object_expr(arg, keys);
+            }
+        }
+        // Also check if/else blocks for conditional returns
+        if let Statement::IfStatement(if_stmt) = stmt {
+            if let Statement::BlockStatement(block) = &if_stmt.consequent {
+                extract_keys_from_body_stmts(&block.body, keys);
+            }
+            if let Some(Statement::BlockStatement(block)) = if_stmt.alternate.as_ref() {
+                extract_keys_from_body_stmts(&block.body, keys);
+            }
+        }
+    }
+}
+
+/// Extract property keys from an object expression (potentially wrapped).
+fn extract_keys_from_object_expr<'a>(
+    expr: &'a Expression<'a>,
+    keys: &mut Vec<String>,
+) {
+    match expr {
+        Expression::ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                    match &p.key {
+                        PropertyKey::StringLiteral(s) => {
+                            keys.push(s.value.to_string());
+                        }
+                        PropertyKey::StaticIdentifier(id) => {
+                            keys.push(id.name.to_string());
+                        }
+                        _ => {} // Computed keys — skip
+                    }
+                }
+            }
+        }
+        // Unwrap parentheses: `({ ... })`
+        Expression::ParenthesizedExpression(paren) => {
+            extract_keys_from_object_expr(&paren.expression, keys);
+        }
+        // Unwrap TS casts: `{ ... } as ReturnType`
+        Expression::TSAsExpression(ts) => {
+            extract_keys_from_object_expr(&ts.expression, keys);
+        }
+        Expression::TSSatisfiesExpression(ts) => {
+            extract_keys_from_object_expr(&ts.expression, keys);
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1411,5 +1639,85 @@ mod tests {
             !bindings.is_empty(),
             "Should detect prop through ?? expression"
         );
+    }
+
+    // ── extract_return_object_keys tests ─────────────────────────────
+
+    /// Test: Extract keys from getOUIAProps (function declaration with return).
+    #[test]
+    fn test_extract_keys_function_declaration() {
+        let source = r#"
+            export function getOUIAProps(componentType: string, id: OuiaId, ouiaSafe: boolean = true) {
+                return {
+                    'data-ouia-component-type': `PF6/${componentType}`,
+                    'data-ouia-safe': ouiaSafe,
+                    'data-ouia-component-id': id
+                };
+            }
+        "#;
+
+        let keys = extract_return_object_keys(source, "getOUIAProps");
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&"data-ouia-component-id".to_string()));
+        assert!(keys.contains(&"data-ouia-component-type".to_string()));
+        assert!(keys.contains(&"data-ouia-safe".to_string()));
+    }
+
+    /// Test: Extract keys from useOUIAProps (exported const arrow with implicit return).
+    #[test]
+    fn test_extract_keys_arrow_expression_body() {
+        let source = r#"
+            export const useOUIAProps = (componentType: string, id?: OuiaId, ouiaSafe: boolean = true, variant?: string) => ({
+                'data-ouia-component-type': `PF6/${componentType}`,
+                'data-ouia-safe': ouiaSafe,
+                'data-ouia-component-id': useOUIAId(componentType, id, variant)
+            });
+        "#;
+
+        let keys = extract_return_object_keys(source, "useOUIAProps");
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&"data-ouia-component-id".to_string()));
+        assert!(keys.contains(&"data-ouia-component-type".to_string()));
+        assert!(keys.contains(&"data-ouia-safe".to_string()));
+    }
+
+    /// Test: No keys from a function that doesn't return an object.
+    #[test]
+    fn test_extract_keys_no_object_return() {
+        let source = r#"
+            export function helper(x: number): number {
+                return x + 1;
+            }
+        "#;
+
+        let keys = extract_return_object_keys(source, "helper");
+        assert!(keys.is_empty());
+    }
+
+    /// Test: Function not found returns empty.
+    #[test]
+    fn test_extract_keys_function_not_found() {
+        let source = r#"
+            export function foo() { return {}; }
+        "#;
+
+        let keys = extract_return_object_keys(source, "bar");
+        assert!(keys.is_empty());
+    }
+
+    /// Test: Arrow with block body and return statement.
+    #[test]
+    fn test_extract_keys_arrow_block_body() {
+        let source = r#"
+            const getProps = (name: string) => {
+                const prefix = 'my-';
+                return { 'data-testid': prefix + name, role: 'button' };
+            };
+        "#;
+
+        let keys = extract_return_object_keys(source, "getProps");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"data-testid".to_string()));
+        assert!(keys.contains(&"role".to_string()));
     }
 }
