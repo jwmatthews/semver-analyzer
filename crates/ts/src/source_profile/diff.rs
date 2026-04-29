@@ -1036,9 +1036,32 @@ fn diff_children_slot(
         && !old.children_slot_path.is_empty()
         && !new.children_slot_path.is_empty()
     {
+        // Check if the new path introduces an HTML element wrapper around
+        // {children} that wasn't there before. When this happens, tests using
+        // getByText() will match the wrapper element (e.g., <span>) instead
+        // of the component's root element (e.g., <button>), breaking
+        // assertions like toBeInstanceOf(HTMLButtonElement) and toHaveFocus().
+        let new_html_wrapper = new
+            .children_slot_path
+            .iter()
+            .find(|tag| is_html_element(tag));
+        let old_has_html_wrapper = old
+            .children_slot_path
+            .iter()
+            .any(|tag| is_html_element(tag));
+        let wrapper_introduced = new_html_wrapper.is_some() && !old_has_html_wrapper;
+
+        let (category, has_test_implications) = if wrapper_introduced {
+            (SourceLevelCategory::DomStructure, true)
+        } else {
+            (SourceLevelCategory::Composition, false)
+        };
+
+        let wrapper_tag = new_html_wrapper.cloned();
+
         changes.push(SourceLevelChange {
             component: component.to_string(),
-            category: SourceLevelCategory::Composition,
+            category,
             description: format!(
                 "Internal wrapper structure around children in {component} changed from {} to {}",
                 old.children_slot_path.join(" > "),
@@ -1046,9 +1069,19 @@ fn diff_children_slot(
             ),
             old_value: Some(old.children_slot_path.join(" > ")),
             new_value: Some(new.children_slot_path.join(" > ")),
-            has_test_implications: false,
-            test_description: None,
-            element: None,
+            has_test_implications,
+            test_description: if wrapper_introduced {
+                Some(format!(
+                    "Children of {} are now wrapped in <{}>. Tests using getByText() \
+                     will match the wrapper element, not the component root. \
+                     Use getByRole() or .closest() instead.",
+                    component,
+                    wrapper_tag.as_deref().unwrap_or("element"),
+                ))
+            } else {
+                None
+            },
+            element: wrapper_tag,
             migration_from: None,
             dependency_chain: None,
         });
@@ -1083,6 +1116,16 @@ fn diff_children_slot(
             dependency_chain: None,
         });
     }
+}
+
+/// Check if a tag name is a standard HTML element (lowercase) rather than
+/// a React component (PascalCase). Used to detect when a new HTML wrapper
+/// element is introduced around `{children}`.
+fn is_html_element(tag: &str) -> bool {
+    tag.chars()
+        .next()
+        .map(|c| c.is_ascii_lowercase())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1658,5 +1701,64 @@ mod tests {
             .filter(|c| c.category == SourceLevelCategory::AttributeConditionality)
             .collect();
         assert!(cond_changes.is_empty());
+    }
+
+    #[test]
+    fn test_children_wrapper_html_element_introduced() {
+        // When children_slot_path changes from a React component wrapper
+        // to an HTML element, this is a DomStructure change with test
+        // implications (getByText now returns the wrapper, not the root).
+        let mut old = make_profile("Button");
+        old.children_slot_path = vec!["Component".into()];
+
+        let mut new = make_profile("Button");
+        new.children_slot_path = vec!["span".into()];
+
+        let changes = diff_profiles(&old, &new);
+        let wrapper_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| {
+                c.category == SourceLevelCategory::DomStructure
+                    && c.description.contains("wrapper structure")
+            })
+            .collect();
+
+        assert_eq!(wrapper_changes.len(), 1);
+        assert!(wrapper_changes[0].has_test_implications);
+        assert_eq!(
+            wrapper_changes[0].element.as_deref(),
+            Some("span"),
+        );
+        assert!(
+            wrapper_changes[0]
+                .test_description
+                .as_ref()
+                .unwrap()
+                .contains("getByText()"),
+        );
+    }
+
+    #[test]
+    fn test_children_wrapper_component_to_component_stays_composition() {
+        // When children_slot_path changes between React components,
+        // this stays as Composition (no DOM impact).
+        let mut old = make_profile("Modal");
+        old.children_slot_path = vec!["ModalContent".into()];
+
+        let mut new = make_profile("Modal");
+        new.children_slot_path = vec!["ModalDialog".into()];
+
+        let changes = diff_profiles(&old, &new);
+        let wrapper_changes: Vec<_> = changes
+            .iter()
+            .filter(|c| c.description.contains("wrapper structure"))
+            .collect();
+
+        assert_eq!(wrapper_changes.len(), 1);
+        assert_eq!(
+            wrapper_changes[0].category,
+            SourceLevelCategory::Composition,
+        );
+        assert!(!wrapper_changes[0].has_test_implications);
     }
 }
