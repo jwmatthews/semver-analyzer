@@ -901,6 +901,12 @@ pub struct SdPipelineResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_css_blocks: Vec<String>,
 
+    /// Top-level SCSS/CSS entry point files removed between dep-repo
+    /// versions (e.g., "patternfly-charts-theme-dark.scss"). Consumers
+    /// importing these files will get build errors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_css_entry_files: Vec<String>,
+
     /// CSS classes where a version prefix swap produces a non-existent class.
     ///
     /// Each entry is `(old_class, dead_swapped_class)`. For example,

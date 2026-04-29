@@ -437,7 +437,11 @@ fn make_import_relocation_rule(
                 ..Default::default()
             },
         },
-        fix_strategy: Some(FixStrategyEntry::rename(old_qname, new_qname)),
+        fix_strategy: Some(FixStrategyEntry::with_from_to(
+            "ImportPathChange",
+            old_qname,
+            new_qname,
+        )),
     }
 }
 
@@ -588,6 +592,54 @@ fn make_type_changed_rule(
         id_counts,
     );
 
+    // Extract method name and declaring class from qualified name
+    // e.g., "org.hibernate.Interceptor.onFlushDirty" → class="Interceptor", method="onFlushDirty"
+    let (declaring_class, method_name) = extract_class_and_member(qualified_name);
+
+    // Build a condition that matches both:
+    // 1. Direct type references (TYPE scope) — for code that uses the type directly
+    // 2. Method definitions in classes extending/implementing the declaring class
+    //    (DEFINITION scope + extends/implements filter) — for consumer overrides
+    let when = if let (Some(class), Some(method)) = (&declaring_class, &method_name) {
+        KonveyorCondition::Or {
+            or: vec![
+                KonveyorCondition::JavaReferenced {
+                    referenced: JavaReferencedFields {
+                        pattern: regex_escape(qualified_name),
+                        scope: Some("TYPE".into()),
+                        ..Default::default()
+                    },
+                },
+                KonveyorCondition::JavaReferenced {
+                    referenced: JavaReferencedFields {
+                        pattern: method.clone(),
+                        scope: Some("DEFINITION".into()),
+                        kind: Some("method".into()),
+                        extends: Some(class.clone()),
+                        ..Default::default()
+                    },
+                },
+                KonveyorCondition::JavaReferenced {
+                    referenced: JavaReferencedFields {
+                        pattern: method.clone(),
+                        scope: Some("DEFINITION".into()),
+                        kind: Some("method".into()),
+                        implements: Some(class.clone()),
+                        ..Default::default()
+                    },
+                },
+            ],
+        }
+    } else {
+        KonveyorCondition::JavaReferenced {
+            referenced: JavaReferencedFields {
+                pattern: regex_escape(qualified_name),
+                scope: Some("TYPE".into()),
+                ..Default::default()
+            },
+        }
+    };
+
     KonveyorRule {
         rule_id,
         labels: vec![
@@ -603,13 +655,7 @@ fn make_type_changed_rule(
             description, before, after
         ),
         links: vec![],
-        when: KonveyorCondition::JavaReferenced {
-            referenced: JavaReferencedFields {
-                pattern: regex_escape(qualified_name),
-                scope: Some("TYPE".into()),
-                ..Default::default()
-            },
-        },
+        when,
         fix_strategy: Some(FixStrategyEntry::with_from_to("UpdateType", before, after)),
     }
 }
@@ -632,6 +678,52 @@ fn make_signature_changed_rule(
         id_counts,
     );
 
+    // Extract method name and declaring class from qualified name
+    let (declaring_class, method_name) = extract_class_and_member(qualified_name);
+
+    // Build conditions matching both callers and overriders
+    let when = if let (Some(class), Some(method)) = (&declaring_class, &method_name) {
+        KonveyorCondition::Or {
+            or: vec![
+                // Match direct method calls
+                KonveyorCondition::JavaReferenced {
+                    referenced: JavaReferencedFields {
+                        pattern: regex_escape(qualified_name),
+                        scope: Some("METHOD_CALL".into()),
+                        ..Default::default()
+                    },
+                },
+                // Match method definitions in subclasses (overrides)
+                KonveyorCondition::JavaReferenced {
+                    referenced: JavaReferencedFields {
+                        pattern: method.clone(),
+                        scope: Some("DEFINITION".into()),
+                        kind: Some("method".into()),
+                        extends: Some(class.clone()),
+                        ..Default::default()
+                    },
+                },
+                KonveyorCondition::JavaReferenced {
+                    referenced: JavaReferencedFields {
+                        pattern: method.clone(),
+                        scope: Some("DEFINITION".into()),
+                        kind: Some("method".into()),
+                        implements: Some(class.clone()),
+                        ..Default::default()
+                    },
+                },
+            ],
+        }
+    } else {
+        KonveyorCondition::JavaReferenced {
+            referenced: JavaReferencedFields {
+                pattern: regex_escape(qualified_name),
+                scope: Some("METHOD_CALL".into()),
+                ..Default::default()
+            },
+        }
+    };
+
     KonveyorRule {
         rule_id,
         labels: vec![
@@ -647,13 +739,7 @@ fn make_signature_changed_rule(
             description, before, after
         ),
         links: vec![],
-        when: KonveyorCondition::JavaReferenced {
-            referenced: JavaReferencedFields {
-                pattern: regex_escape(qualified_name),
-                scope: Some("METHOD_CALL".into()),
-                ..Default::default()
-            },
-        },
+        when,
         fix_strategy: Some(FixStrategyEntry::with_from_to(
             "UpdateSignature",
             before,
@@ -753,6 +839,242 @@ fn make_dependency_rule(
     }
 }
 
+// ── Class migration rules (mostly-emptied base classes) ─────────────────
+
+/// Generate migration rules for classes that had most of their methods removed.
+///
+/// These are typically abstract base classes or convenience implementations
+/// (e.g., `EmptyInterceptor`) that consumers extend. When most methods are
+/// removed, consumers need to switch to implementing the interface directly.
+///
+/// Each generated rule:
+/// - Matches at IMPORT scope (consumer imports the emptied class)
+/// - Uses DEFINITION scope + extends filter (consumer extends the class)
+/// - Carries rich LLM context with the list of removed methods and their new signatures
+pub fn generate_class_migration_rules(
+    report: &AnalysisReport<Java>,
+    config: &JavaKonveyorConfig,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+    let mut id_counts: HashMap<String, usize> = HashMap::new();
+
+    // Collect per-class removed methods from the report
+    let mut class_removed_methods: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut class_packages: HashMap<String, String> = HashMap::new();
+
+    for fc in &report.changes {
+        if !matches!(fc.status, semver_analyzer_core::FileStatus::Modified) {
+            continue;
+        }
+        for ac in &fc.breaking_api_changes {
+            if ac.change != semver_analyzer_core::ApiChangeType::Removed {
+                continue;
+            }
+            // Only method-level removals (member of a class)
+            let (class_opt, method_opt) = extract_class_and_member(&ac.qualified_name);
+            if let (Some(_class_name), Some(method_name)) = (class_opt, method_opt) {
+                let class_qn = ac
+                    .qualified_name
+                    .rsplit_once('.')
+                    .map(|(prefix, _)| prefix.to_string())
+                    .unwrap_or_default();
+
+                let pkg = class_qn
+                    .rsplit_once('.')
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or_default();
+
+                class_removed_methods
+                    .entry(class_qn.clone())
+                    .or_default()
+                    .push((method_name, ac.description.clone()));
+                class_packages.insert(class_qn, pkg);
+            }
+        }
+    }
+
+    // Generate rules for classes with 5+ removed methods
+    for (class_qn, removed_methods) in &class_removed_methods {
+        if removed_methods.len() < 5 {
+            continue;
+        }
+
+        let class_name = class_qn.rsplit('.').next().unwrap_or(class_qn);
+        let pkg = class_packages
+            .get(class_qn.as_str())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        // Build a rich migration context listing all removed methods
+        let method_list: Vec<String> = removed_methods
+            .iter()
+            .map(|(name, _desc)| format!("  - {name}"))
+            .collect();
+
+        let message = format!(
+            "`{}` has had {} methods removed, indicating a major API redesign.\n\n\
+             Consumers extending this class should migrate to implementing the \
+             corresponding interface directly.\n\n\
+             Removed methods:\n{}\n\n\
+             Update your class to implement the interface instead of extending \
+             this base class. Add `@Override` implementations for the methods \
+             you need.",
+            class_name,
+            removed_methods.len(),
+            method_list.join("\n"),
+        );
+
+        let rule_id = unique_id(
+            &format!(
+                "{}-class-migrate-{}",
+                config.rule_id_prefix,
+                slugify(class_name)
+            ),
+            &mut id_counts,
+        );
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=class-migration".into(),
+                "language=java".into(),
+            ],
+            effort: 5,
+            category: "mandatory".into(),
+            description: format!(
+                "`{}` base class emptied — migrate to interface",
+                class_name
+            ),
+            message,
+            links: vec![],
+            when: KonveyorCondition::Or {
+                or: vec![
+                    // Match files importing the emptied class
+                    KonveyorCondition::JavaReferenced {
+                        referenced: JavaReferencedFields {
+                            pattern: regex_escape(class_qn),
+                            scope: Some("IMPORT".into()),
+                            ..Default::default()
+                        },
+                    },
+                    // Match classes extending the emptied class
+                    KonveyorCondition::JavaReferenced {
+                        referenced: JavaReferencedFields {
+                            pattern: class_name.to_string(),
+                            scope: Some("DEFINITION".into()),
+                            kind: Some("class".into()),
+                            extends: Some(class_name.to_string()),
+                            ..Default::default()
+                        },
+                    },
+                ],
+            },
+            fix_strategy: {
+                let interface_name = class_name
+                    .strip_prefix("Empty")
+                    .or_else(|| class_name.strip_prefix("Abstract"))
+                    .unwrap_or(class_name);
+                Some(FixStrategyEntry::with_from_to(
+                    "LlmAssisted",
+                    format!("extends {class_name}"),
+                    format!("implements {interface_name} (from package {pkg})"),
+                ))
+            },
+        });
+    }
+
+    rules
+}
+
+// ── Namespace migration rules ───────────────────────────────────────────
+
+/// Parse a `"old.pkg=new.pkg"` migration pair.
+pub fn parse_namespace_migration(s: &str) -> Option<(String, String)> {
+    let (old, new) = s.split_once('=')?;
+    let old = old.trim();
+    let new = new.trim();
+    if old.is_empty() || new.is_empty() {
+        return None;
+    }
+    Some((old.to_string(), new.to_string()))
+}
+
+/// Generate namespace migration rules from `old=new` pairs.
+///
+/// Each pair produces a single import-scoped rule that matches any import
+/// starting with the old namespace prefix and replaces it with the new one.
+pub fn generate_namespace_migration_rules(
+    migrations: &[(String, String)],
+    config: &JavaKonveyorConfig,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+    let mut id_counts: HashMap<String, usize> = HashMap::new();
+
+    for (old_ns, new_ns) in migrations {
+        rules.push(make_namespace_migration_rule(old_ns, new_ns, config, &mut id_counts));
+    }
+
+    rules
+}
+
+fn make_namespace_migration_rule(
+    old_ns: &str,
+    new_ns: &str,
+    config: &JavaKonveyorConfig,
+    id_counts: &mut HashMap<String, usize>,
+) -> KonveyorRule {
+    let rule_id = unique_id(
+        &format!("{}-ns-migrate-{}", config.rule_id_prefix, slugify(old_ns)),
+        id_counts,
+    );
+
+    let links = config
+        .migration_guide_url
+        .as_ref()
+        .map(|url| {
+            vec![KonveyorLink {
+                url: url.clone(),
+                title: config
+                    .migration_guide_title
+                    .clone()
+                    .unwrap_or_else(|| "Migration Guide".into()),
+            }]
+        })
+        .unwrap_or_default();
+
+    KonveyorRule {
+        rule_id,
+        labels: vec![
+            "source=semver-analyzer".into(),
+            "change-type=import-path-change".into(),
+            "has-codemod=true".into(),
+            "language=java".into(),
+        ],
+        effort: 1,
+        category: "mandatory".into(),
+        description: format!("Migrate `{}` imports to `{}`", old_ns, new_ns),
+        message: format!(
+            "The `{}` namespace has been replaced by `{}`.\n\n\
+             Replace all `import {}.*` with `import {}.*`.",
+            old_ns, new_ns, old_ns, new_ns
+        ),
+        links,
+        when: KonveyorCondition::JavaReferenced {
+            referenced: JavaReferencedFields {
+                pattern: format!("{}\\.", regex_escape(old_ns)),
+                scope: Some("IMPORT".into()),
+                ..Default::default()
+            },
+        },
+        fix_strategy: Some(FixStrategyEntry::with_from_to(
+            "ImportPathChange",
+            old_ns,
+            new_ns,
+        )),
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 fn unique_id(base: &str, counts: &mut HashMap<String, usize>) -> String {
@@ -778,4 +1100,42 @@ fn slugify(s: &str) -> String {
 
 fn regex_escape(s: &str) -> String {
     s.replace('.', "\\.")
+}
+
+/// Extract the declaring class simple name and member name from a qualified name.
+///
+/// e.g., `"org.hibernate.Interceptor.onFlushDirty"` → `(Some("Interceptor"), Some("onFlushDirty"))`
+/// e.g., `"org.hibernate.Session"` → `(None, None)` — no member
+///
+/// Uses the Java convention that class names start with an uppercase letter
+/// and member names start with a lowercase letter.
+fn extract_class_and_member(qualified_name: &str) -> (Option<String>, Option<String>) {
+    let parts: Vec<&str> = qualified_name.split('.').collect();
+    if parts.len() < 2 {
+        return (None, None);
+    }
+
+    // Walk from the end to find the member (lowercase start) and class (uppercase start)
+    let last = parts[parts.len() - 1];
+    let second_last = parts[parts.len() - 2];
+
+    // If second_last starts uppercase and last starts lowercase → class.method
+    if second_last
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+        && last
+            .chars()
+            .next()
+            .map(|c| c.is_lowercase())
+            .unwrap_or(false)
+    {
+        return (
+            Some(second_last.to_string()),
+            Some(last.to_string()),
+        );
+    }
+
+    (None, None)
 }

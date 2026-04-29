@@ -527,6 +527,9 @@ pub struct ExtendedAnalysisParams {
     /// directory-level diffing. For TypeScript/CSS: removed CSS component
     /// blocks (e.g., `["select", "chip"]`).
     pub removed_dep_components: Vec<String>,
+    /// Top-level SCSS/CSS entry point files removed between dep-repo
+    /// versions (e.g., `["patternfly-charts-theme-dark.scss"]`).
+    pub removed_dep_entry_files: Vec<String>,
     /// Dependency repo packages (name → version at new ref).
     /// Used to generate dep-update rules for packages outside the main
     /// analyzed monorepo.

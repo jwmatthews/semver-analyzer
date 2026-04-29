@@ -73,4 +73,10 @@ pub struct JavaKonveyorArgs {
     /// Migration guide URL to include in rule links.
     #[arg(long)]
     pub migration_guide_url: Option<String>,
+
+    /// Namespace migration pairs (e.g., "javax.persistence=jakarta.persistence").
+    /// Generates import relocation rules for entire package namespaces.
+    /// Can be specified multiple times.
+    #[arg(long = "namespace-migration", value_name = "OLD=NEW")]
+    pub namespace_migrations: Vec<String>,
 }

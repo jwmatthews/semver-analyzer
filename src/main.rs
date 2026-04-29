@@ -1175,7 +1175,42 @@ async fn cmd_konveyor_java(
         all_rules.extend(sd_rules);
     }
 
+    // Class migration rules (mostly-emptied base classes)
+    let class_rules =
+        semver_analyzer_java::konveyor::generate_class_migration_rules(&report, &konveyor_config);
+    if !class_rules.is_empty() {
+        reporter.println(&format!(
+            "Generated {} class migration rules",
+            class_rules.len()
+        ));
+        all_rules.extend(class_rules);
+    }
+
+    // Namespace migration rules (e.g., javax.persistence=jakarta.persistence)
+    if !args.namespace_migrations.is_empty() {
+        let ns_pairs: Vec<(String, String)> = args
+            .namespace_migrations
+            .iter()
+            .filter_map(|s| semver_analyzer_java::konveyor::parse_namespace_migration(s))
+            .collect();
+
+        if !ns_pairs.is_empty() {
+            let ns_rules = semver_analyzer_java::konveyor::generate_namespace_migration_rules(
+                &ns_pairs,
+                &konveyor_config,
+            );
+            reporter.println(&format!(
+                "Generated {} namespace migration rules",
+                ns_rules.len()
+            ));
+            all_rules.extend(ns_rules);
+        }
+    }
+
     gen_phase.finish_with_detail("Generated rules", &format!("{} rules", all_rules.len()));
+
+    // Extract fix strategies from rules
+    let strategies = semver_analyzer_konveyor_core::extract_fix_strategies(&all_rules);
 
     // Write rules
     let output_dir = &common.output_dir;
@@ -1195,10 +1230,21 @@ async fn cmd_konveyor_java(
     let rules_path = output_dir.join("rules.yaml");
     fs::write(&rules_path, &rules_yaml)?;
 
+    // Write fix-strategies.json
+    let fix_dir = output_dir.join("fix-guidance");
+    fs::create_dir_all(&fix_dir)
+        .with_context(|| format!("Failed to create fix-guidance dir {}", fix_dir.display()))?;
+    semver_analyzer_konveyor_core::write_fix_strategies(&fix_dir, &strategies)?;
+
     reporter.println(&format!(
         "Wrote {} rules to {}",
         all_rules.len(),
         output_dir.display()
+    ));
+    reporter.println(&format!(
+        "Wrote {} fix strategies to {}/fix-strategies.json",
+        strategies.len(),
+        fix_dir.display()
     ));
 
     Ok(())

@@ -110,6 +110,11 @@ pub fn generate_sd_rules(
     // ── CSS class removal rules ─────────────────────────────────────
     rules.extend(generate_css_class_removal_rules(&sd.removed_css_blocks));
 
+    // ── Removed CSS entry point file rules ──────────────────────────
+    rules.extend(generate_removed_css_file_rules(
+        &sd.removed_css_entry_files,
+    ));
+
     // ── Dead CSS class rules (prefix swap produces non-existent class) ──
     rules.extend(generate_dead_css_class_rules(
         &sd.dead_css_classes_after_swap,
@@ -4068,6 +4073,62 @@ fn generate_css_class_removal_rules(removed_blocks: &[String]) -> Vec<KonveyorRu
                 cssclass: FrontendPatternFields {
                     pattern,
                     file_pattern: Some(CSS_FILE_PATTERN.into()),
+                },
+            },
+            fix_strategy: None,
+        });
+    }
+
+    rules
+}
+
+/// Generate rules for removed CSS entry point files.
+///
+/// When top-level SCSS files (e.g., `patternfly-charts-theme-dark.scss`) are
+/// removed between dep-repo versions, consumer projects that import them will
+/// get build errors. This generates `builtin.filecontent` rules that match
+/// import statements referencing the removed file.
+fn generate_removed_css_file_rules(removed_files: &[String]) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+
+    for scss_file in removed_files {
+        // Strip .scss extension to get the CSS name consumers import
+        let css_name = scss_file
+            .strip_suffix(".scss")
+            .unwrap_or(scss_file);
+
+        if css_name.is_empty() {
+            continue;
+        }
+
+        let rule_id = format!("sd-css-file-removed-{}", sanitize(css_name));
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=css-file-removed".into(),
+                "impact=build-failure".into(),
+            ],
+            effort: 1,
+            category: "mandatory".into(),
+            description: format!(
+                "CSS entry point '{}.css' was removed",
+                css_name,
+            ),
+            message: format!(
+                "The CSS file '{css_name}.css' (from @patternfly/patternfly) \
+                 was removed. Importing this file will cause a build error.\n\n\
+                 Remove the import statement.",
+            ),
+            links: vec![],
+            when: KonveyorCondition::FileContent {
+                filecontent: FileContentFields {
+                    pattern: format!(
+                        "@patternfly/patternfly/{}",
+                        regex::escape(css_name),
+                    ),
+                    file_pattern: r".*\.(ts|tsx|js|jsx|scss|css)$".into(),
                 },
             },
             fix_strategy: None,

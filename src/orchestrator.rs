@@ -641,6 +641,16 @@ impl<L: Language> Analyzer<L> {
                         Vec::new()
                     };
 
+                    // Detect top-level CSS entry point files removed between versions
+                    // (e.g., patternfly-charts-theme-dark.scss).
+                    let removed_css_entry_files = if let (Some(dep_dir), Some(from), Some(to)) =
+                        (&dep_dir_sd, &dep_from_sd, &dep_to_sd)
+                    {
+                        detect_removed_css_entry_files(dep_dir, from, to)
+                    } else {
+                        Vec::new()
+                    };
+
                     // Analyze CSS class inventories: extract full class lists from
                     // both versions and detect dead classes (prefix swap → non-existent).
                     // Builds a worktree for from_ref too so we get compiled CSS.
@@ -706,6 +716,7 @@ impl<L: Language> Analyzer<L> {
                         to_ref: to_sd.clone(),
                         dep_dir: css_dir,
                         removed_dep_components: removed_css_blocks,
+                        removed_dep_entry_files: removed_css_entry_files,
                         dep_repo_packages,
                         from_worktree_path: from_wt_path,
                         to_worktree_path: to_wt_path,
@@ -2483,6 +2494,64 @@ fn detect_removed_css_blocks(dep_dir: &Path, from_ref: &str, to_ref: &str) -> Ve
         .into_iter()
         .map(|name| pascal_to_kebab(&name))
         .collect()
+}
+
+/// Detect top-level SCSS entry point files removed between two refs.
+///
+/// Lists `.scss` files directly under `src/patternfly/` at each ref using
+/// `git ls-tree`, then returns filenames that exist in `from_ref` but not
+/// in `to_ref`. These correspond to importable CSS entry points that
+/// consumers may reference (e.g., `patternfly-charts-theme-dark.scss`).
+fn detect_removed_css_entry_files(dep_dir: &Path, from_ref: &str, to_ref: &str) -> Vec<String> {
+    let list_scss = |git_ref: &str| -> std::collections::HashSet<String> {
+        let output = std::process::Command::new("git")
+            .args([
+                "ls-tree",
+                "--name-only",
+                git_ref,
+                "src/patternfly/",
+            ])
+            .current_dir(dep_dir)
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                stdout
+                    .lines()
+                    .filter_map(|line| {
+                        let name = line
+                            .trim()
+                            .strip_prefix("src/patternfly/")
+                            .unwrap_or(line.trim());
+                        // Only include .scss files (the CSS entry points)
+                        if name.ends_with(".scss") {
+                            Some(name.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            _ => std::collections::HashSet::new(),
+        }
+    };
+
+    let old_files = list_scss(from_ref);
+    let new_files = list_scss(to_ref);
+
+    let mut removed: Vec<String> = old_files.difference(&new_files).cloned().collect();
+    removed.sort();
+
+    if !removed.is_empty() {
+        tracing::info!(
+            count = removed.len(),
+            files = ?removed,
+            "Detected removed CSS entry point files between dep-repo versions"
+        );
+    }
+
+    removed
 }
 
 /// Result of CSS class inventory analysis between two dep-repo versions.
