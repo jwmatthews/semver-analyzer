@@ -4269,13 +4269,23 @@ fn generate_removed_css_file_rules(removed_files: &[String]) -> Vec<KonveyorRule
                  Remove the import statement.",
             ),
             links: vec![],
-            when: KonveyorCondition::FileContent {
-                filecontent: FileContentFields {
+            when: KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
                     pattern: format!(
                         "@patternfly/patternfly/{}",
-                        regex::escape(css_name),
+                        css_name,
                     ),
-                    file_pattern: r".*\.(ts|tsx|js|jsx|scss|css)$".into(),
+                    location: "IMPORT".into(),
+                    component: None,
+                    parent: None,
+                    not_parent: None,
+                    child: None,
+                    not_child: None,
+                    requires_child: None,
+                    parent_from: None,
+                    value: None,
+                    from: None,
+                    file_pattern: None,
                 },
             },
             fix_strategy: None,
@@ -4483,113 +4493,15 @@ pub fn generate_enumerated_css_class_rules(
         }
     }
 
-    // Generate companion rules for test files. The frontend.cssclass scanner
-    // detects CSS classes in CSS files and className JSX attributes, but does
-    // NOT detect class strings in querySelector(), toHaveClass(), or other
-    // test-specific patterns. These companion rules use builtin.filecontent
-    // (plain regex) to catch those references in test files.
-    //
-    // One rule per BEM component block (e.g., "c-table") rather than per
-    // individual class to keep the rule count manageable.
-    let test_file_rules =
-        generate_css_test_file_rules(&rename_rules, &old_prefix, &new_prefix);
-
     tracing::info!(
         rename_count = rename_rules.len(),
         removed_count = removed_rules.len(),
-        test_file_count = test_file_rules.len(),
         "Generated enumerated CSS class rules"
     );
 
     let mut all = rename_rules;
     all.extend(removed_rules);
-    all.extend(test_file_rules);
     all
-}
-
-/// Generate `builtin.filecontent` rules for CSS class references in test files.
-///
-/// The `frontend.cssclass` scanner doesn't detect CSS class strings inside
-/// `querySelector()`, `toHaveClass()`, or other test-helper calls. These
-/// companion rules use plain regex matching to catch `pf-v5-c-*` patterns
-/// in test files so the `CssVariablePrefix` fix can rename them.
-///
-/// Groups individual class renames by BEM component block (e.g., all classes
-/// under `pf-v5-c-table` share one rule) to avoid generating thousands of rules.
-fn generate_css_test_file_rules(
-    rename_rules: &[KonveyorRule],
-    old_prefix: &str,
-    new_prefix: &str,
-) -> Vec<KonveyorRule> {
-    // Collect unique BEM component blocks from rename rules.
-    // E.g., from "pf-v5-c-table__action" extract "table",
-    // from "pf-v5-c-expandable-section__toggle" extract "expandable-section".
-    let mut blocks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for rule in rename_rules {
-        if let Some(strategy) = &rule.fix_strategy {
-            if let Some(from) = &strategy.from {
-                // Strip the version prefix to get the full class name,
-                // then take the BEM block (everything before the first "__" or ".pf-m-")
-                if let Some(rest) = from.strip_prefix(old_prefix) {
-                    let block = rest
-                        .split("__")
-                        .next()
-                        .unwrap_or(rest)
-                        .split(".pf-")
-                        .next()
-                        .unwrap_or(rest);
-                    if !block.is_empty() {
-                        blocks.insert(block.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    let mut rules = Vec::new();
-    for block in &blocks {
-        let old_class_prefix = format!("{}{}", old_prefix, block);
-        let new_class_prefix = format!("{}{}", new_prefix, block);
-
-        let rule_id = format!("semver-css-class-rename-{}-in-tests", sanitize(block));
-
-        rules.push(KonveyorRule {
-            rule_id,
-            labels: vec![
-                "source=semver-analyzer".into(),
-                "change-type=css-class".into(),
-                "has-codemod=true".into(),
-                "impact=frontend-testing".into(),
-            ],
-            effort: 1,
-            category: "optional".into(),
-            description: format!(
-                "Test file references '{}' CSS class prefix (needs v5→v6 rename)",
-                old_class_prefix,
-            ),
-            message: format!(
-                "This test file references CSS classes with the '{}' prefix \
-                 (e.g., in querySelector, toHaveClass, or string selectors). \
-                 These classes were renamed to '{}' in the new version.\n\n\
-                 Update all '{}' references to '{}'.",
-                old_class_prefix, new_class_prefix, old_class_prefix, new_class_prefix,
-            ),
-            links: vec![],
-            when: KonveyorCondition::FileContent {
-                filecontent: FileContentFields {
-                    pattern: regex::escape(&old_class_prefix),
-                    file_pattern: r".*\.(test|spec)\.(ts|tsx|js|jsx)$".into(),
-                },
-            },
-            fix_strategy: Some(FixStrategyEntry::with_from_to(
-                "CssVariablePrefix",
-                &old_class_prefix,
-                &new_class_prefix,
-            )),
-        });
-    }
-
-    rules
 }
 
 /// Detect the most common version prefix from a set of CSS class names.
