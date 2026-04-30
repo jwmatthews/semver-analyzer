@@ -94,6 +94,12 @@ pub fn generate_sd_rules(
         &component_packages,
     ));
 
+    // ── Portal prop rules (appendTo string values, removed props) ──
+    rules.extend(generate_portal_prop_rules(
+        &sd.source_level_changes,
+        &component_packages,
+    ));
+
     // ── Composition inversion rules (internal → render prop) ──────
     rules.extend(generate_composition_inversion_rules(
         sd,
@@ -3513,6 +3519,147 @@ fn generate_test_impact_rules(
             when,
             fix_strategy: None,
         });
+    }
+
+    rules
+}
+
+/// Generate prop-level rules for components with PortalUsage changes.
+///
+/// When a component's portal rendering behavior changed (e.g., Tooltip/Popover's
+/// Popper `appendTo` default changed from `'inline'` to `() => document.body`),
+/// generate JSX_PROP rules that catch:
+///
+/// 1. `appendTo="inline"` or `appendTo="parent"` — string values that may not
+///    be accepted by the component's `appendTo` prop type
+/// 2. `popperProps={...}` — prop that may have been removed from the component
+///
+/// These complement the IMPORT-level transitive behavioral change rules by
+/// providing specific prop-level detection.
+fn generate_portal_prop_rules(
+    changes: &[SourceLevelChange],
+    component_packages: &HashMap<String, String>,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+    let mut seen_components = std::collections::HashSet::new();
+
+    for change in changes {
+        if change.category != SourceLevelCategory::PortalUsage {
+            continue;
+        }
+        // Only process direct changes (not transitive)
+        if change.dependency_chain.is_some() {
+            continue;
+        }
+
+        let component = &change.component;
+        if !seen_components.insert(component.clone()) {
+            continue;
+        }
+
+        let pkg = pkg_for(component, component_packages);
+        let prefix = rule_prefix(&change.migration_from);
+
+        // Rule A: appendTo with string value
+        // Components affected by portal changes may no longer accept string
+        // values for appendTo (e.g., Tooltip accepts HTMLElement|Function but
+        // not "inline"). Generate a rule that flags string values.
+        let rule_id_appendto = format!(
+            "{}-{}-appendto-string-invalid",
+            prefix,
+            sanitize(&component.to_lowercase()),
+        );
+        rules.push(KonveyorRule {
+            rule_id: rule_id_appendto,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=prop-value-change".into(),
+                format!("package={}", pkg),
+            ],
+            effort: 1,
+            category: "mandatory".into(),
+            description: format!(
+                "{} appendTo prop may not accept string values",
+                component,
+            ),
+            message: format!(
+                "{component}'s portal rendering behavior changed. The appendTo \
+                 prop may no longer accept string values like \"inline\" or \"parent\".\n\n\
+                 Remove appendTo=\"inline\" — the default portal behavior is \
+                 sufficient in most cases. If you need specific portal targeting, \
+                 use a function: appendTo={{() => document.body}}.",
+            ),
+            links: vec![],
+            when: KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: "^appendTo$".into(),
+                    location: "JSX_PROP".into(),
+                    component: Some(format!("^{}$", component)),
+                    from: Some(pkg.clone()),
+                    value: Some("^(inline|parent)$".into()),
+                    parent: None,
+                    not_parent: None,
+                    child: None,
+                    not_child: None,
+                    requires_child: None,
+                    parent_from: None,
+                    file_pattern: None,
+                },
+            },
+            fix_strategy: Some(FixStrategyEntry::new("RemoveAttribute")),
+        });
+
+        // Rule B: popperProps (may not exist on this component)
+        // Some components had popperProps in v5 but removed it in v6.
+        // Generate a rule that flags any usage of popperProps.
+        let rule_id_popper = format!(
+            "{}-{}-popperprops-removed",
+            prefix,
+            sanitize(&component.to_lowercase()),
+        );
+        rules.push(KonveyorRule {
+            rule_id: rule_id_popper,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=prop-removal".into(),
+                format!("package={}", pkg),
+            ],
+            effort: 1,
+            category: "optional".into(),
+            description: format!(
+                "{} popperProps prop may have been removed",
+                component,
+            ),
+            message: format!(
+                "{component} may no longer accept popperProps. If this causes a \
+                 TypeScript error, remove the popperProps prop entirely.",
+            ),
+            links: vec![],
+            when: KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: "^popperProps$".into(),
+                    location: "JSX_PROP".into(),
+                    component: Some(format!("^{}$", component)),
+                    from: Some(pkg.clone()),
+                    parent: None,
+                    not_parent: None,
+                    child: None,
+                    not_child: None,
+                    requires_child: None,
+                    parent_from: None,
+                    value: None,
+                    file_pattern: None,
+                },
+            },
+            fix_strategy: Some(FixStrategyEntry::new("RemoveAttribute")),
+        });
+    }
+
+    if !rules.is_empty() {
+        tracing::info!(
+            count = rules.len(),
+            "Generated portal prop rules"
+        );
     }
 
     rules

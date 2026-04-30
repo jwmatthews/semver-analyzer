@@ -117,7 +117,12 @@ pub fn generate_rules_with_config(
                         let before_class = before.rsplit('.').next().unwrap_or(before);
                         let after_class = after.rsplit('.').next().unwrap_or(after);
                         if before_class == after_class && before != after {
-                            relocations.push((&ac.symbol, before, after));
+                            // Package relocation -- verify packages are related
+                            // to avoid false matches across unrelated subsystems
+                            // (e.g., criterion.Property → spatial.sqlserver.Property)
+                            if packages_are_related(before, after) {
+                                relocations.push((&ac.symbol, before, after));
+                            }
                         } else if before_class != after_class {
                             rules.push(make_rename_rule(
                                 &ac.symbol,
@@ -132,6 +137,29 @@ pub fn generate_rules_with_config(
                 }
                 semver_analyzer_core::ApiChangeType::Removed => {
                     if let Some(ref mt) = ac.migration_target {
+                        // Reject migration targets with incompatible base types
+                        // or unrelated packages -- treat as plain removal instead.
+                        let is_valid_target = packages_are_related(
+                            &mt.removed_qualified_name,
+                            &mt.replacement_qualified_name,
+                        ) && !has_incompatible_base_type(
+                            mt.old_extends.as_deref(),
+                            mt.new_extends.as_deref(),
+                        );
+
+                        if !is_valid_target {
+                            let qname = ac.before.as_deref().unwrap_or(&ac.symbol);
+                            if !is_type_parameter_pattern(qname) {
+                                rules.push(make_removal_rule(
+                                    &ac.symbol,
+                                    &mt.removed_qualified_name,
+                                    &ac.description,
+                                    config,
+                                    &mut id_counts,
+                                ));
+                            }
+                            continue;
+                        }
                         rules.push(make_removal_with_target_rule(
                             &ac.symbol,
                             &mt.removed_qualified_name,
@@ -143,6 +171,14 @@ pub fn generate_rules_with_config(
                         ));
                     } else {
                         let qname = ac.before.as_deref().unwrap_or(&ac.symbol);
+
+                        // Skip type parameter removals -- patterns like "T", "E", "R"
+                        // are too short and match nearly every Java file. Type parameter
+                        // changes on methods are typically non-breaking for callers.
+                        if is_type_parameter_pattern(qname) {
+                            continue;
+                        }
+
                         rules.push(make_removal_rule(
                             &ac.symbol,
                             qname,
@@ -438,7 +474,7 @@ fn make_import_relocation_rule(
             },
         },
         fix_strategy: Some(FixStrategyEntry::with_from_to(
-            "ImportPathChange",
+            "JavaImportRename",
             old_qname,
             new_qname,
         )),
@@ -453,10 +489,44 @@ fn make_rename_rule(
     config: &JavaKonveyorConfig,
     id_counts: &mut HashMap<String, usize>,
 ) -> KonveyorRule {
+    let is_fqn = old_name.contains('.');
+
     let rule_id = unique_id(
-        &format!("{}-rename-{}", config.rule_id_prefix, slugify(symbol)),
+        &format!(
+            "{}-{}-{}",
+            config.rule_id_prefix,
+            if is_fqn { "migrate" } else { "rename" },
+            slugify(symbol)
+        ),
         id_counts,
     );
+
+    // FQN renames (class/type renames): use JavaImportRename strategy for
+    // safe, import-aware, word-boundary-aware replacement.
+    // Bare method renames: use LlmAssisted because short method names like
+    // "read" or "connection" cause false positives with text replacement.
+    let fix_strategy = if is_fqn {
+        Some(FixStrategyEntry::with_from_to(
+            "JavaImportRename",
+            old_name,
+            new_name,
+        ))
+    } else {
+        Some(FixStrategyEntry::with_from_to(
+            "LlmAssisted",
+            old_name,
+            new_name,
+        ))
+    };
+
+    // For bare method names, add word boundary anchors to the scanner
+    // pattern to prevent matching inside unrelated identifiers
+    // (e.g., "read" matching inside "Thread").
+    let scanner_pattern = if is_fqn {
+        old_name.to_string()
+    } else {
+        format!("\\b{}\\b", old_name)
+    };
 
     KonveyorRule {
         rule_id,
@@ -477,21 +547,21 @@ fn make_rename_rule(
             or: vec![
                 KonveyorCondition::JavaReferenced {
                     referenced: JavaReferencedFields {
-                        pattern: old_name.to_string(),
+                        pattern: scanner_pattern.clone(),
                         scope: Some("IMPORT".into()),
                         ..Default::default()
                     },
                 },
                 KonveyorCondition::JavaReferenced {
                     referenced: JavaReferencedFields {
-                        pattern: old_name.to_string(),
+                        pattern: scanner_pattern,
                         scope: Some("TYPE".into()),
                         ..Default::default()
                     },
                 },
             ],
         },
-        fix_strategy: Some(FixStrategyEntry::rename(old_name, new_name)),
+        fix_strategy,
     }
 }
 
@@ -570,7 +640,11 @@ fn make_removal_with_target_rule(
                 ..Default::default()
             },
         },
-        fix_strategy: Some(FixStrategyEntry::rename(old_qname, new_qname)),
+        fix_strategy: Some(FixStrategyEntry::with_from_to(
+            "JavaImportRename",
+            old_qname,
+            new_qname,
+        )),
     }
 }
 
@@ -989,30 +1063,89 @@ pub fn generate_class_migration_rules(
 
 // ── Namespace migration rules ───────────────────────────────────────────
 
-/// Parse a `"old.pkg=new.pkg"` migration pair.
-pub fn parse_namespace_migration(s: &str) -> Option<(String, String)> {
-    let (old, new) = s.split_once('=')?;
-    let old = old.trim();
-    let new = new.trim();
-    if old.is_empty() || new.is_empty() {
-        return None;
-    }
-    Some((old.to_string(), new.to_string()))
+/// A parsed namespace migration with optional dependency coordinate.
+#[derive(Debug, Clone)]
+pub struct NamespaceMigration {
+    pub old_ns: String,
+    pub new_ns: String,
+    /// Optional Maven/Gradle coordinate: `"group:artifact:version"`
+    pub dependency: Option<(String, String)>, // (group:artifact, version)
 }
 
-/// Generate namespace migration rules from `old=new` pairs.
+/// Parse a namespace migration string.
 ///
-/// Each pair produces a single import-scoped rule that matches any import
-/// starting with the old namespace prefix and replaces it with the new one.
+/// Formats:
+/// - `"javax.persistence=jakarta.persistence"` — import rename only
+/// - `"javax.persistence=jakarta.persistence@jakarta.persistence:jakarta.persistence-api:3.1.0"` — import rename + dependency update
+pub fn parse_namespace_migration(s: &str) -> Option<NamespaceMigration> {
+    let (old, rest) = s.split_once('=')?;
+    let old = old.trim();
+    if old.is_empty() {
+        return None;
+    }
+
+    // Check for @dependency suffix
+    let (new_ns, dependency) = if let Some((ns, dep_str)) = rest.trim().split_once('@') {
+        let dep = parse_dependency_coordinate(dep_str.trim());
+        (ns.trim(), dep)
+    } else {
+        (rest.trim(), None)
+    };
+
+    if new_ns.is_empty() {
+        return None;
+    }
+
+    Some(NamespaceMigration {
+        old_ns: old.to_string(),
+        new_ns: new_ns.to_string(),
+        dependency,
+    })
+}
+
+/// Parse a Maven/Gradle dependency coordinate `"group:artifact:version"`.
+/// Returns `(group:artifact, version)`.
+fn parse_dependency_coordinate(s: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() >= 3 {
+        let group_artifact = format!("{}:{}", parts[0], parts[1]);
+        let version = parts[2].to_string();
+        Some((group_artifact, version))
+    } else {
+        None
+    }
+}
+
+/// Generate namespace migration rules from parsed migrations.
+///
+/// Each migration produces:
+/// 1. An import-scoped rule with `JavaImportRename` strategy
+/// 2. If a dependency coordinate is provided, a companion `EnsureDependency` rule
 pub fn generate_namespace_migration_rules(
-    migrations: &[(String, String)],
+    migrations: &[NamespaceMigration],
     config: &JavaKonveyorConfig,
 ) -> Vec<KonveyorRule> {
     let mut rules = Vec::new();
     let mut id_counts: HashMap<String, usize> = HashMap::new();
 
-    for (old_ns, new_ns) in migrations {
-        rules.push(make_namespace_migration_rule(old_ns, new_ns, config, &mut id_counts));
+    for mig in migrations {
+        rules.push(make_namespace_migration_rule(
+            &mig.old_ns,
+            &mig.new_ns,
+            config,
+            &mut id_counts,
+        ));
+
+        // Emit companion dependency update rule if coordinates provided
+        if let Some((ref coord, ref version)) = mig.dependency {
+            rules.push(make_namespace_dependency_rule(
+                &mig.old_ns,
+                coord,
+                version,
+                config,
+                &mut id_counts,
+            ));
+        }
     }
 
     rules
@@ -1068,9 +1201,60 @@ fn make_namespace_migration_rule(
             },
         },
         fix_strategy: Some(FixStrategyEntry::with_from_to(
-            "ImportPathChange",
+            "JavaImportRename",
             old_ns,
             new_ns,
+        )),
+    }
+}
+
+fn make_namespace_dependency_rule(
+    old_ns: &str,
+    new_coordinate: &str, // "group:artifact"
+    new_version: &str,
+    config: &JavaKonveyorConfig,
+    id_counts: &mut HashMap<String, usize>,
+) -> KonveyorRule {
+    let rule_id = unique_id(
+        &format!("{}-ns-dep-{}", config.rule_id_prefix, slugify(old_ns)),
+        id_counts,
+    );
+
+    // Extract the old artifact name from the namespace for dependency matching.
+    // e.g., "javax.persistence" → match any dependency containing "javax.persistence"
+    let old_artifact_pattern = old_ns.replace('.', ".*");
+
+    KonveyorRule {
+        rule_id,
+        labels: vec![
+            "source=semver-analyzer".into(),
+            "change-type=dependency-update".into(),
+            "has-codemod=true".into(),
+            "language=java".into(),
+        ],
+        effort: 1,
+        category: "mandatory".into(),
+        description: format!(
+            "Update `{}` dependency to `{}:{}`",
+            old_ns, new_coordinate, new_version
+        ),
+        message: format!(
+            "The `{}` namespace requires updating the build dependency.\n\n\
+             Update your build file to use `{}:{}`.",
+            old_ns, new_coordinate, new_version
+        ),
+        links: vec![],
+        when: KonveyorCondition::JavaDependency {
+            dependency: JavaDependencyFields {
+                name: None,
+                nameregex: Some(old_artifact_pattern),
+                upperbound: None,
+                lowerbound: None,
+            },
+        },
+        fix_strategy: Some(FixStrategyEntry::ensure_dependency(
+            new_coordinate,
+            new_version,
         )),
     }
 }
@@ -1096,6 +1280,122 @@ fn slugify(s: &str) -> String {
         })
         .collect::<String>()
         .to_lowercase()
+}
+
+/// Check if old and new extends clauses indicate an incompatible base type change.
+///
+/// Returns `true` (incompatible) when:
+/// - Both have extends, the base class name is the same, but type parameters differ
+///   (e.g., `AbstractSingleColumnStandardBasicType<String>` vs `<Object>`)
+/// - Both have extends but the base class names are completely different
+///   (e.g., `AbstractTypeDescriptor<X>` vs `AbstractClassJavaType<Y>`)
+///
+/// Returns `false` (compatible or unknown) when:
+/// - Either extends is None (no data to compare)
+/// - Both are exactly the same
+fn has_incompatible_base_type(old_extends: Option<&str>, new_extends: Option<&str>) -> bool {
+    let (old_ext, new_ext) = match (old_extends, new_extends) {
+        (Some(o), Some(n)) => (o, n),
+        _ => return false,
+    };
+
+    if old_ext == new_ext {
+        return false;
+    }
+
+    // Extract base class name (before '<') and type parameters (inside '<>')
+    let (old_base, old_params) = split_generic(old_ext);
+    let (new_base, new_params) = split_generic(new_ext);
+
+    if old_base != new_base {
+        // Completely different base classes -- incompatible
+        return true;
+    }
+
+    // Same base class but different type parameters
+    if old_params != new_params {
+        return true;
+    }
+
+    false
+}
+
+/// Split a type expression into base name and generic parameters.
+/// e.g., `"AbstractSingleColumnStandardBasicType<String>"` → `("AbstractSingleColumnStandardBasicType", "<String>")`
+/// e.g., `"Foo"` → `("Foo", "")`
+fn split_generic(s: &str) -> (&str, &str) {
+    if let Some(pos) = s.find('<') {
+        (&s[..pos], &s[pos..])
+    } else {
+        (s, "")
+    }
+}
+
+/// Check if two fully-qualified names are in related packages.
+///
+/// Returns `true` if the packages share at least 3 segments (e.g.,
+/// `org.hibernate.dialect` and `org.hibernate.community.dialect` share
+/// `org.hibernate` = 2 common segments, plus the fact that the target
+/// contains a suffix of the source path like `dialect`).
+///
+/// This filters out false renames where a class was removed in one subsystem
+/// and a same-named class exists in an unrelated subsystem (e.g.,
+/// `criterion.Property` → `spatial.dialect.sqlserver.Property`).
+fn packages_are_related(old_fqn: &str, new_fqn: &str) -> bool {
+    let old_pkg = old_fqn.rsplit_once('.').map(|(p, _)| p).unwrap_or(old_fqn);
+    let new_pkg = new_fqn.rsplit_once('.').map(|(p, _)| p).unwrap_or(new_fqn);
+
+    let old_parts: Vec<&str> = old_pkg.split('.').collect();
+    let new_parts: Vec<&str> = new_pkg.split('.').collect();
+
+    // Count common prefix segments
+    let common = old_parts
+        .iter()
+        .zip(new_parts.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // Require at least 3 common segments for large libraries
+    // (org.hibernate.X must share at least org.hibernate.X)
+    if common >= 3 {
+        return true;
+    }
+
+    // Special case: dialect → community.dialect is a known reorganization pattern
+    // Check if the last segment of the old package appears in the new package
+    if common >= 2 {
+        if let Some(old_subsystem) = old_parts.get(common) {
+            if new_parts[common..].contains(old_subsystem) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if a pattern looks like a Java type parameter (e.g., "T", "E",
+/// "R", "S extends Foo") rather than a real class/method name. These
+/// generate overly broad scanner rules that match nearly every file.
+fn is_type_parameter_pattern(pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    // Single uppercase letter: T, E, R, S, N, Y, P, etc.
+    if trimmed.len() == 1 && trimmed.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+        return true;
+    }
+    // Bounded type parameter: "T extends Foo", "E extends Enum<E>"
+    if trimmed.contains(" extends ") {
+        let first = trimmed.split_whitespace().next().unwrap_or("");
+        if first.len() <= 2 && first.chars().all(|c| c.is_ascii_uppercase()) {
+            return true;
+        }
+    }
+    // "Serializable" used as a type parameter pattern is also too broad
+    // (matches java.io.Serializable imports in most files)
+    if trimmed == "Serializable" {
+        return true;
+    }
+    false
 }
 
 fn regex_escape(s: &str) -> String {

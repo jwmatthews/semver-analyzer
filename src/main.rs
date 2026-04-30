@@ -1186,17 +1186,17 @@ async fn cmd_konveyor_java(
         all_rules.extend(class_rules);
     }
 
-    // Namespace migration rules (e.g., javax.persistence=jakarta.persistence)
+    // Namespace migration rules (e.g., javax.persistence=jakarta.persistence@group:artifact:version)
     if !args.namespace_migrations.is_empty() {
-        let ns_pairs: Vec<(String, String)> = args
+        let ns_migrations: Vec<semver_analyzer_java::konveyor::NamespaceMigration> = args
             .namespace_migrations
             .iter()
             .filter_map(|s| semver_analyzer_java::konveyor::parse_namespace_migration(s))
             .collect();
 
-        if !ns_pairs.is_empty() {
+        if !ns_migrations.is_empty() {
             let ns_rules = semver_analyzer_java::konveyor::generate_namespace_migration_rules(
-                &ns_pairs,
+                &ns_migrations,
                 &konveyor_config,
             );
             reporter.println(&format!(
