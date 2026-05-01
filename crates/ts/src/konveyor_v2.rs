@@ -121,6 +121,12 @@ pub fn generate_sd_rules(
         &sd.removed_css_entry_files,
     ));
 
+    // ── Deprecated prop rules (@deprecated JSDoc) ────────────────────
+    rules.extend(generate_deprecated_prop_rules(
+        &sd.source_level_changes,
+        &component_packages,
+    ));
+
     // ── Dead CSS class rules (prefix swap produces non-existent class) ──
     rules.extend(generate_dead_css_class_rules(
         &sd.dead_css_classes_after_swap,
@@ -2946,6 +2952,12 @@ const TEXT_QUERY_PATTERN: &str =
 const TEST_FILE_PATTERN: &str = ".*\\.(test|spec)\\.(ts|tsx|js|jsx)$";
 
 /// Map HTML element names to their implicit ARIA roles.
+///
+/// For `<input>`, the implicit role depends on the `type` attribute, but
+/// since the source profile doesn't yet track `type`, we return `"textbox"`
+/// as the default (correct for `<input type="text">`). Use
+/// [`implicit_role_for_input_override`] to infer the actual implicit role
+/// when an explicit `role` attribute overrides the default.
 fn implicit_aria_role(element: &str) -> Option<&'static str> {
     match element {
         "button" => Some("button"),
@@ -2970,6 +2982,26 @@ fn implicit_aria_role(element: &str) -> Option<&'static str> {
         "section" => Some("region"),
         "aside" => Some("complementary"),
         "progress" => Some("progressbar"),
+        _ => None,
+    }
+}
+
+/// Infer the implicit role of an `<input>` element when we know an
+/// explicit `role` was added to override it. The explicit role hints at
+/// what `type` the input has:
+///
+/// - `role="switch"` → was `<input type="checkbox">` (implicit: "checkbox")
+/// - `role="slider"` → was `<input type="range">` (implicit: "slider")
+/// - `role="spinbutton"` → was `<input type="number">` (implicit: "spinbutton")
+///
+/// Returns `None` if the override doesn't help infer the old role.
+fn implicit_role_for_input_override(explicit_role: &str) -> Option<&'static str> {
+    match explicit_role {
+        "switch" => Some("checkbox"),
+        "slider" => Some("slider"),
+        "spinbutton" => Some("spinbutton"),
+        "combobox" => Some("textbox"),
+        "searchbox" => Some("textbox"),
         _ => None,
     }
 }
@@ -3093,6 +3125,90 @@ fn generate_test_impact_rules(
                         },
                         fix_strategy: None,
                     });
+                } else if let Some(ref new_val) = change.new_value {
+                    // Role ADDED — the element previously had no explicit role,
+                    // so consumers used the implicit role from the element type.
+                    // Infer the old implicit role and generate a rule for it.
+                    if !is_concrete_value(new_val) {
+                        continue;
+                    }
+
+                    let element = change.element.as_deref().unwrap_or("");
+                    let inferred_old = if element == "input" {
+                        implicit_role_for_input_override(new_val)
+                    } else {
+                        implicit_aria_role(element)
+                    };
+
+                    if let Some(old_implicit) = inferred_old {
+                        // Only generate a rule if the new explicit role differs
+                        // from the old implicit role (otherwise nothing changed
+                        // for consumers).
+                        if old_implicit == new_val {
+                            continue;
+                        }
+
+                        let prefix = rule_prefix(&change.migration_from);
+                        let elem_part = change
+                            .element
+                            .as_deref()
+                            .map(|e| format!("-{}", sanitize(e)))
+                            .unwrap_or_default();
+                        let rule_id = format!(
+                            "{}-test-{}-role-{}{}-overridden",
+                            prefix,
+                            sanitize(&change.component),
+                            sanitize(old_implicit),
+                            elem_part,
+                        );
+
+                        let message = format!(
+                            "{} changed from implicit role '{}' (from <{}>) to explicit role='{}'.\n\n\
+                             Update test queries:\n  \
+                             getByRole('{}') → getByRole('{}')",
+                            change.component,
+                            old_implicit,
+                            element,
+                            new_val,
+                            old_implicit,
+                            new_val,
+                        );
+
+                        rules.push(KonveyorRule {
+                            rule_id,
+                            labels: vec![
+                                "source=semver-analyzer".into(),
+                                "change-type=test-impact".into(),
+                                "impact=frontend-testing".into(),
+                                format!("package={}", pkg),
+                            ],
+                            effort: 1,
+                            category: "optional".into(),
+                            description: format!(
+                                "Test impact: {} implicit role '{}' overridden by '{}'",
+                                change.component, old_implicit, new_val,
+                            ),
+                            message,
+                            links: vec![],
+                            when: KonveyorCondition::FrontendReferenced {
+                                referenced: FrontendReferencedFields {
+                                    pattern: ROLE_QUERY_PATTERN.into(),
+                                    location: "FUNCTION_CALL".into(),
+                                    component: None,
+                                    parent: None,
+                                    not_parent: None,
+                                    child: None,
+                                    not_child: None,
+                                    requires_child: None,
+                                    parent_from: None,
+                                    value: Some(format!("^{}$", old_implicit)),
+                                    from: None,
+                                    file_pattern: Some(TEST_FILE_PATTERN.into()),
+                                },
+                            },
+                            fix_strategy: None,
+                        });
+                    }
                 }
             }
 
@@ -4177,6 +4293,85 @@ fn regex_escape(s: &str) -> String {
         }
     }
     result
+}
+
+// ── Deprecated prop rules ───────────────────────────────────────────────
+
+/// Generate targeted rules for props marked `@deprecated` in JSDoc.
+///
+/// Each rule uses `JSX_PROP` location with the prop name as pattern, so it
+/// only fires when consumer code actually passes the deprecated prop to the
+/// component. This avoids false positives on files that import but don't use
+/// the deprecated prop.
+fn generate_deprecated_prop_rules(
+    changes: &[SourceLevelChange],
+    component_packages: &HashMap<String, String>,
+) -> Vec<KonveyorRule> {
+    let mut rules = Vec::new();
+
+    for change in changes {
+        if change.category != SourceLevelCategory::PropDeprecated {
+            continue;
+        }
+
+        let prop_name = match &change.old_value {
+            Some(name) => name,
+            None => continue,
+        };
+        let deprecation_msg = change.new_value.as_deref().unwrap_or("Deprecated");
+
+        let pkg = pkg_for(&change.component, component_packages);
+
+        let prefix = rule_prefix(&change.migration_from);
+        let rule_id = format!(
+            "{}-deprecated-prop-{}-{}",
+            prefix,
+            sanitize(&change.component),
+            sanitize(prop_name),
+        );
+
+        let message = format!(
+            "Prop '{}' on {} is deprecated. {}\n\n\
+             Replace or remove this prop.",
+            prop_name, change.component, deprecation_msg,
+        );
+
+        rules.push(KonveyorRule {
+            rule_id,
+            labels: vec![
+                "source=semver-analyzer".into(),
+                "change-type=prop-deprecated".into(),
+                format!("package={}", pkg),
+            ],
+            effort: 1,
+            category: "optional".into(),
+            description: format!(
+                "Deprecated prop '{}' on {}",
+                prop_name, change.component,
+            ),
+            message,
+            links: vec![],
+            when: KonveyorCondition::FrontendReferenced {
+                referenced: FrontendReferencedFields {
+                    pattern: format!("^{}$", prop_name),
+                    location: "JSX_PROP".into(),
+                    component: Some(format!("^{}$", change.component)),
+                    parent: None,
+                    not_parent: None,
+                    child: None,
+                    not_child: None,
+                    requires_child: None,
+                    parent_from: None,
+                    value: None,
+                    from: Some(pkg.clone()),
+                    file_pattern: None,
+                },
+            },
+            fix_strategy: None,
+        });
+    }
+
+    rules
 }
 
 const CSS_FILE_PATTERN: &str = ".*\\.css$";

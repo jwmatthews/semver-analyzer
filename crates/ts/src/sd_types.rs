@@ -364,6 +364,11 @@ pub struct ComponentSourceProfile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prop_types: BTreeMap<String, String>,
 
+    /// Props marked with `@deprecated` in JSDoc comments.
+    /// Maps prop name → deprecation message (e.g., "Use startActions instead").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deprecated_props: BTreeMap<String, String>,
+
     // ── cloneElement prop threading ──────────────────────────────────────
     /// Props injected into children via `React.Children.map` + `cloneElement`.
     /// Each entry lists the prop names passed in cloneElement's second argument.
@@ -427,6 +432,16 @@ pub struct ManagedAttributeBinding {
     /// by the managed spread. Correlated from the data_attributes map.
     /// e.g., ["data-ouia-component-id", "data-ouia-component-type"]
     pub overridden_attributes: Vec<String>,
+
+    /// The 0-based argument position of this prop in the helper function call.
+    /// Used during enrichment to correlate with the helper function's parameter
+    /// names and determine which return-object keys this specific prop controls.
+    ///
+    /// For example, in `getOUIAProps('MenuToggle', ouiaId, ouiaSafe)`:
+    /// - `ouiaId` has `arg_position: Some(1)`
+    /// - `ouiaSafe` has `arg_position: Some(2)`
+    #[serde(default)]
+    pub arg_position: Option<usize>,
 
     /// Whether the managed spread comes AFTER the rest spread on the
     /// same JSX element, meaning the component's generated attributes
@@ -553,6 +568,9 @@ pub enum SourceLevelCategory {
     /// is no longer guaranteed. Tests using `getAttribute()` expecting a specific
     /// value may now receive `null`.
     AttributeConditionality,
+    /// Prop marked as `@deprecated` in the new version's JSDoc.
+    /// The prop still compiles but has a documented replacement.
+    PropDeprecated,
 }
 
 // ── Composition Tree ────────────────────────────────────────────────────

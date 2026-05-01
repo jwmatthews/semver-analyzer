@@ -33,6 +33,7 @@ pub fn diff_profiles(
     diff_prop_style_bindings(old, new, component, &mut changes);
     diff_managed_attributes(old, new, component, &mut changes);
     diff_children_slot(old, new, component, &mut changes);
+    diff_deprecated_props(old, new, component, &mut changes);
 
     changes
 }
@@ -1128,6 +1129,45 @@ fn is_html_element(tag: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── Deprecated props ────────────────────────────────────────────────────
+
+fn diff_deprecated_props(
+    old: &ComponentSourceProfile,
+    new: &ComponentSourceProfile,
+    component: &str,
+    changes: &mut Vec<SourceLevelChange>,
+) {
+    // Detect props that are newly marked @deprecated in the new version.
+    // Only emit a change when the prop exists in both versions (it's still
+    // in `all_props`) but was NOT deprecated in old and IS deprecated in new.
+    for (prop_name, message) in &new.deprecated_props {
+        // Must exist in both versions (not a newly added prop)
+        if !old.all_props.contains(prop_name) {
+            continue;
+        }
+        // Must not have been deprecated in the old version
+        if old.deprecated_props.contains_key(prop_name) {
+            continue;
+        }
+
+        changes.push(SourceLevelChange {
+            component: component.to_string(),
+            category: SourceLevelCategory::PropDeprecated,
+            description: format!(
+                "Prop '{}' on {} is now deprecated: {}",
+                prop_name, component, message,
+            ),
+            old_value: Some(prop_name.clone()),
+            new_value: Some(message.clone()),
+            has_test_implications: false,
+            test_description: None,
+            element: None,
+            dependency_chain: None,
+            migration_from: None,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1489,6 +1529,7 @@ mod tests {
                 "data-ouia-component-type".into(),
             ],
             component_overrides: true,
+            arg_position: Some(1),
         });
 
         let changes = diff_profiles(&old, &new);
@@ -1517,6 +1558,7 @@ mod tests {
             target_element: "button".into(),
             overridden_attributes: vec!["data-ouia-component-id".into()],
             component_overrides: true,
+            arg_position: Some(1),
         });
         let new = make_profile("MenuToggle");
 
@@ -1539,6 +1581,7 @@ mod tests {
             target_element: "button".into(),
             overridden_attributes: vec!["data-ouia-component-id".into()],
             component_overrides: true,
+            arg_position: Some(1),
         };
 
         let mut profile = make_profile("MenuToggle");
@@ -1760,5 +1803,70 @@ mod tests {
             SourceLevelCategory::Composition,
         );
         assert!(!wrapper_changes[0].has_test_implications);
+    }
+
+    #[test]
+    fn test_deprecated_prop_detected() {
+        let mut old = make_profile("Slider");
+        old.all_props.insert("leftActions".into());
+        // Not deprecated in old version
+
+        let mut new = make_profile("Slider");
+        new.all_props.insert("leftActions".into());
+        new.deprecated_props.insert(
+            "leftActions".into(),
+            "Use startActions instead. Actions placed at the start of the slider.".into(),
+        );
+
+        let changes = diff_profiles(&old, &new);
+        let dep: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::PropDeprecated)
+            .collect();
+
+        assert_eq!(dep.len(), 1);
+        assert_eq!(dep[0].old_value.as_deref(), Some("leftActions"));
+        assert!(dep[0].new_value.as_deref().unwrap().contains("startActions"));
+        assert!(!dep[0].has_test_implications);
+    }
+
+    #[test]
+    fn test_deprecated_prop_not_emitted_when_already_deprecated() {
+        let mut old = make_profile("Slider");
+        old.all_props.insert("leftActions".into());
+        old.deprecated_props
+            .insert("leftActions".into(), "Old deprecation".into());
+
+        let mut new = make_profile("Slider");
+        new.all_props.insert("leftActions".into());
+        new.deprecated_props
+            .insert("leftActions".into(), "Use startActions instead.".into());
+
+        let changes = diff_profiles(&old, &new);
+        let dep: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::PropDeprecated)
+            .collect();
+
+        assert_eq!(dep.len(), 0, "Should not emit when already deprecated in old version");
+    }
+
+    #[test]
+    fn test_deprecated_prop_not_emitted_for_new_prop() {
+        let old = make_profile("Slider");
+        // leftActions does NOT exist in old version
+
+        let mut new = make_profile("Slider");
+        new.all_props.insert("leftActions".into());
+        new.deprecated_props
+            .insert("leftActions".into(), "Use startActions instead.".into());
+
+        let changes = diff_profiles(&old, &new);
+        let dep: Vec<_> = changes
+            .iter()
+            .filter(|c| c.category == SourceLevelCategory::PropDeprecated)
+            .collect();
+
+        assert_eq!(dep.len(), 0, "Should not emit for props not in old version");
     }
 }

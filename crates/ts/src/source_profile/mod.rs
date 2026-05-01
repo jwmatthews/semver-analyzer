@@ -115,6 +115,7 @@ pub fn extract_profile(name: &str, file: &str, source: &str) -> ComponentSourceP
     profile.all_props = ast_info.all_props;
     profile.required_props = ast_info.required_props;
     profile.prop_types = ast_info.prop_types;
+    profile.deprecated_props = ast_info.deprecated_props;
 
     // 8. Prop-to-style bindings — trace which props gate CSS class application
     profile.prop_style_bindings = extract_prop_style_bindings(source, &profile.all_props);
@@ -206,6 +207,8 @@ struct FullSourceInfo {
     required_props: BTreeSet<String>,
     /// Prop name → type annotation string.
     prop_types: BTreeMap<String, String>,
+    /// Props marked `@deprecated` in JSDoc. Maps prop name → deprecation message.
+    deprecated_props: BTreeMap<String, String>,
 
     // ── cloneElement ────────────────────────────────────────────────
     /// Props injected via cloneElement, detected during AST walk.
@@ -223,9 +226,10 @@ fn extract_source_info(source: &str, component_name: &str) -> FullSourceInfo {
 
     let mut info = FullSourceInfo::default();
 
+    let comments = &parsed.program.comments;
     for stmt in &parsed.program.body {
         // Extract imports, interfaces, and JSX from top-level statements
-        extract_from_module_stmt(stmt, source, component_name, &mut info);
+        extract_from_module_stmt(stmt, source, component_name, &mut info, comments);
     }
 
     info
@@ -237,6 +241,7 @@ fn extract_from_module_stmt<'a>(
     source: &str,
     component_name: &str,
     info: &mut FullSourceInfo,
+    comments: &[oxc_ast::ast::Comment],
 ) {
     match stmt {
         // ── Import declarations ─────────────────────────────────────
@@ -269,7 +274,7 @@ fn extract_from_module_stmt<'a>(
         // ── Export named (may contain interface or class declarations) ──
         Statement::ExportNamedDeclaration(export) => {
             if let Some(decl) = &export.declaration {
-                extract_from_decl(decl, source, component_name, info);
+                extract_from_decl(decl, source, component_name, info, comments);
             }
         }
         Statement::ExportDefaultDeclaration(export) => {
@@ -280,7 +285,7 @@ fn extract_from_module_stmt<'a>(
 
         // ── Bare declarations (interface, class, function, variable) ──
         Statement::TSInterfaceDeclaration(iface) => {
-            extract_extends_from_interface(iface, component_name, source, info);
+            extract_extends_from_interface(iface, component_name, source, info, comments);
         }
 
         // Walk all other statements for JSX
@@ -294,10 +299,11 @@ fn extract_from_decl<'a>(
     source: &str,
     component_name: &str,
     info: &mut FullSourceInfo,
+    comments: &[oxc_ast::ast::Comment],
 ) {
     match decl {
         Declaration::TSInterfaceDeclaration(iface) => {
-            extract_extends_from_interface(iface, component_name, source, info);
+            extract_extends_from_interface(iface, component_name, source, info, comments);
         }
         Declaration::FunctionDeclaration(f) => {
             if let Some(body) = &f.body {
@@ -342,6 +348,7 @@ fn extract_extends_from_interface(
     component_name: &str,
     source: &str,
     info: &mut FullSourceInfo,
+    comments: &[oxc_ast::ast::Comment],
 ) {
     let iface_name = iface.id.name.as_str();
 
@@ -380,12 +387,64 @@ fn extract_extends_from_interface(
                     // Strip the leading `: ` from the type annotation span
                     let type_str = type_str.trim_start_matches(':').trim();
                     if !type_str.is_empty() {
-                        info.prop_types.insert(prop_name, type_str.to_string());
+                        info.prop_types.insert(prop_name.clone(), type_str.to_string());
                     }
+                }
+
+                // Check for @deprecated JSDoc comment on this property.
+                // OXC attaches comments to the node they precede via
+                // `attached_to`. We look for a leading block comment
+                // whose content contains "@deprecated".
+                let prop_start = prop.span.start;
+                if let Some(msg) = find_deprecated_jsdoc(comments, source, prop_start) {
+                    info.deprecated_props.insert(prop_name, msg);
                 }
             }
         }
     }
+}
+
+/// Find a `@deprecated` JSDoc comment attached to the node at `node_start`.
+///
+/// Searches the sorted comment list for a leading block comment (`/** ... */`)
+/// whose `attached_to` matches `node_start` and whose content contains
+/// `@deprecated`. Returns the deprecation message (text after `@deprecated`),
+/// or `None` if no such comment exists.
+fn find_deprecated_jsdoc(
+    comments: &[oxc_ast::ast::Comment],
+    source: &str,
+    node_start: u32,
+) -> Option<String> {
+    // Comments are sorted by position. Search backwards from the node start
+    // for efficiency, but OXC also provides `attached_to` for direct lookup.
+    for comment in comments {
+        if comment.attached_to != node_start {
+            continue;
+        }
+        if !comment.is_jsdoc() {
+            continue;
+        }
+
+        let content_span = comment.content_span();
+        let content = &source[content_span.start as usize..content_span.end as usize];
+
+        if let Some(idx) = content.find("@deprecated") {
+            let after = content[idx + "@deprecated".len()..].trim();
+            // Strip leading/trailing whitespace and common JSDoc artifacts
+            let msg = after
+                .trim_start_matches('*')
+                .trim()
+                .trim_end_matches("*/")
+                .trim()
+                .to_string();
+            return Some(if msg.is_empty() {
+                "Deprecated".to_string()
+            } else {
+                msg.to_string()
+            });
+        }
+    }
+    None
 }
 
 /// Resolve the actual Props type name from a heritage clause.
