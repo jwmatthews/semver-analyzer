@@ -2941,14 +2941,18 @@ fn generate_required_prop_added_rules(
 // structure has changed between versions.
 
 /// Testing Library query function pattern (all variants).
+// Test-impact query patterns. The callee resolver produces qualified names
+// like "screen.getByRole" for member-expression calls, so we use `(^|\\.)`
+// instead of a bare `^` to match both `getByRole` and `screen.getByRole`
+// (or `container.querySelector`, `within(el).getByRole`, etc.).
 const ROLE_QUERY_PATTERN: &str =
-    "^(getByRole|queryByRole|findByRole|getAllByRole|queryAllByRole|findAllByRole)$";
+    "(^|\\.)(getByRole|queryByRole|findByRole|getAllByRole|queryAllByRole|findAllByRole)$";
 const LABEL_QUERY_PATTERN: &str =
-    "^(getByLabelText|queryByLabelText|findByLabelText|getAllByLabelText|queryAllByLabelText|findAllByLabelText)$";
+    "(^|\\.)(getByLabelText|queryByLabelText|findByLabelText|getAllByLabelText|queryAllByLabelText|findAllByLabelText)$";
 const DATA_ATTR_QUERY_PATTERN: &str =
-    "^(querySelector|querySelectorAll|getByAttribute|queryByAttribute|findByAttribute)$";
+    "(^|\\.)(querySelector|querySelectorAll|getByAttribute|queryByAttribute|findByAttribute)$";
 const TEXT_QUERY_PATTERN: &str =
-    "^(getByText|queryByText|findByText|getAllByText|queryAllByText|findAllByText|getByLabelText|queryByLabelText|findByLabelText|getAllByLabelText|queryAllByLabelText|findAllByLabelText)$";
+    "(^|\\.)(getByText|queryByText|findByText|getAllByText|queryAllByText|findAllByText|getByLabelText|queryByLabelText|findByLabelText|getAllByLabelText|queryAllByLabelText|findAllByLabelText)$";
 const TEST_FILE_PATTERN: &str = ".*\\.(test|spec)\\.(ts|tsx|js|jsx)$";
 
 /// Map HTML element names to their implicit ARIA roles.
@@ -3434,7 +3438,7 @@ fn generate_test_impact_rules(
                     when: KonveyorCondition::FileContent {
                         filecontent: FileContentFields {
                             pattern: format!(
-                                "getAttribute\\(\\s*['\"]{}['\"]\\s*\\)",
+                                "(getAttribute|toHaveAttribute|\\.not\\.toHaveAttribute)\\(\\s*['\"]{}['\"]\\s*[,)]",
                                 regex_escape(&attr_name),
                             ),
                             file_pattern: TEST_FILE_PATTERN.into(),
@@ -3930,7 +3934,7 @@ fn build_when_for_transitive_change(
                 KonveyorCondition::FileContent {
                     filecontent: FileContentFields {
                         pattern: format!(
-                            "getAttribute\\(\\s*['\"]{}['\"]\\s*\\)",
+                            "(getAttribute|toHaveAttribute|\\.not\\.toHaveAttribute)\\(\\s*['\"]{}['\"]\\s*[,)]",
                             regex_escape(&attr_name),
                         ),
                         file_pattern: TEST_FILE_PATTERN.into(),
