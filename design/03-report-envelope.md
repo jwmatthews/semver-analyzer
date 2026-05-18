@@ -34,8 +34,7 @@ The `ReportEnvelope` is a two-tier JSON artifact:
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportEnvelope {
     /// Which language produced this report.
-    /// Matches `L::name()` from the Language trait.
-    /// e.g., "typescript", "go", "java", "python", "csharp".
+    /// Matches `L::NAME` from the Language trait.
     pub language: String,
 
     /// Tool version that produced this report.
@@ -108,31 +107,73 @@ impl ReportEnvelope {
     /// Deserialize the language-specific report section.
     ///
     /// Returns an error if:
-    /// - `L::name()` doesn't match `self.language`
+    /// - `L::NAME` doesn't match `self.language`
     /// - The JSON fails to deserialize into `LanguageReport<L>`
-    pub fn language_report<L: Language>(&self) -> Result<LanguageReport<L>> {
-        if L::name() != self.language {
+    pub fn language_report<L: Language>(&self) -> anyhow::Result<LanguageReport<L>> {
+        if L::NAME != self.language {
             anyhow::bail!(
                 "Report was produced by '{}' but requested as '{}'",
                 self.language,
-                L::name()
+                L::NAME
             );
         }
         Ok(serde_json::from_value(self.language_report.clone())?)
     }
-
-    /// Construct an envelope from a typed analysis report.
-    pub fn from_report<L: Language>(report: &AnalysisReport<L>) -> Result<Self> {
-        Ok(Self {
-            language: L::name().to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            summary: report.summary(),
-            structural_changes: report.all_structural_changes(),
-            language_report: serde_json::to_value(&report.language_report())?,
-        })
-    }
 }
 ```
+
+Note: `ReportEnvelope` has only one method -- `language_report::<L>()`. There
+is no `from_report()` constructor; envelope construction is handled by the
+orchestrator, not by the envelope itself.
+
+### `LanguageReport<L>`
+
+The language-specific section, deserialized only by consumers that know the
+concrete `Language` implementation:
+
+```rust
+pub struct LanguageReport<L: Language> {
+    /// Behavioral changes with language-specific categories and evidence.
+    pub behavioral_changes: Vec<LanguageBehavioralChange<L>>,
+
+    /// Manifest changes with language-specific change types.
+    pub manifest_changes: Vec<LanguageManifestChange<L>>,
+
+    /// Framework-specific analysis data.
+    pub data: L::ReportData,
+}
+```
+
+These use envelope-specific wrapper types (not the same as `BehavioralChange<L>`
+and `ManifestChange<L>` from `report.rs`):
+
+```rust
+/// A behavioral change with language-specific types.
+pub struct LanguageBehavioralChange<L: Language> {
+    pub symbol: String,
+    pub category: Option<L::Category>,
+    pub description: String,
+    pub confidence: f64,
+    pub evidence: L::Evidence,
+    pub is_internal_only: bool,
+}
+
+/// A manifest change with language-specific types.
+pub struct LanguageManifestChange<L: Language> {
+    pub field: String,
+    pub change_type: L::ManifestChangeType,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub description: String,
+    pub is_breaking: bool,
+}
+```
+
+The key difference from the core `BehavioralChange<L>` / `ManifestChange<L>`
+types: `LanguageBehavioralChange` carries `L::Evidence` (language-specific
+evidence data), and `LanguageManifestChange` carries `L::ManifestChangeType`
+(language-specific manifest change classification). These associated types
+are defined by each `Language` implementation.
 
 ---
 

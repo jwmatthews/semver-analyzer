@@ -163,7 +163,7 @@ TrulyRemoved                                   // genuinely gone, no replacement
 | `JavaSourceChange` | class_name, category, description, old_value, new_value, is_breaking, method, dependency_chain | Source-level change |
 | `JavaSdPipelineResult` | source_level_changes, old_profiles, new_profiles, module_changes, inheritance_summary | Full SD output |
 
-**`JavaSourceCategory`** (22): AnnotationRemoved, AnnotationAdded, AnnotationChanged, DelegationChanged, ExceptionAdded, ExceptionRemoved, SynchronizationRemoved, SynchronizationAdded, SerializationFieldAdded, SerializationFieldRemoved, SerializationFieldTypeChanged, TransientChanged, OverrideRemoved, OverrideAdded, ConstructorDependencyChanged, ModuleExportRemoved, ModuleExportAdded, ModuleRequiresChanged, FinalAdded, FinalRemoved, SealedChanged, InheritanceChanged, NativeRemoved
+**`JavaSourceCategory`** (23): AnnotationRemoved, AnnotationAdded, AnnotationChanged, DelegationChanged, ExceptionAdded, ExceptionRemoved, SynchronizationRemoved, SynchronizationAdded, SerializationFieldAdded, SerializationFieldRemoved, SerializationFieldTypeChanged, TransientChanged, OverrideRemoved, OverrideAdded, ConstructorDependencyChanged, ModuleExportRemoved, ModuleExportAdded, ModuleRequiresChanged, FinalAdded, FinalRemoved, SealedChanged, InheritanceChanged, NativeRemoved
 
 ---
 

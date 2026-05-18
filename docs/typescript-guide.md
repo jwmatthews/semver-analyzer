@@ -80,7 +80,12 @@ The analyzer builds **composition trees** for multi-component families (e.g., `T
 7. DOM nesting -- HTML validity requirements (e.g., `<li>` inside `<ul>`)
 8. cloneElement -- Missing injected props breaks functionality
 
-Each edge has a **strength**: `Required` (rendering breaks without this nesting) or `Allowed` (valid placement but not the only option).
+Each edge has a **strength** encoding two constraint dimensions -- CHP (child-must-have-parent) and PMC (parent-must-have-child):
+
+- `Required` (CHP=YES, PMC=YES) -- rendering breaks without this nesting in both directions
+- `Structural` (CHP=YES, PMC=NO) -- child must be inside this parent, but parent does not require the child
+- `Wrapper` (CHP=NO, PMC=YES) -- parent must contain this child, but child can appear elsewhere
+- `Allowed` (CHP=NO, PMC=NO) -- valid placement but not enforced in either direction
 
 **Composition changes detected:**
 
@@ -92,10 +97,10 @@ Each edge has a **strength**: `Required` (rendering breaks without this nesting)
 | Member added | New component added to the family |
 | New required child | New intermediate wrapper required between parent and children |
 
-**Conformance rules** are generated from `Required` edges. These detect incorrect nesting in consumer code:
+**Conformance rules** are generated from edges with CHP or PMC constraints. These detect incorrect nesting in consumer code:
 
-- `notParent` -- Child must be placed inside a specific parent
-- `requiresChild` -- Parent must contain specific children
+- `notParent` -- Child must be placed inside a specific parent (generated from `Structural` and `Required` edges)
+- `requiresChild` -- Parent must contain specific children (generated from `Wrapper` and `Required` edges)
 - `invalidDirectChild` -- Child needs an intermediate wrapper
 
 ### CSS Token Analysis
@@ -230,7 +235,7 @@ See [docs/report-format.md](report-format.md) for the complete report schema.
 ### General
 
 - **ESM/CJS declaration deduplication**: Projects that emit both ESM and CJS builds will have roughly doubled symbol counts. The analyzer picks up `.d.ts` from both output directories.
-- **Language support**: Only TypeScript/JavaScript is currently supported.
+- **Language support**: TypeScript/JavaScript and Java are supported. Java requires `--features java` to build.
 
 ### Structural Analysis
 

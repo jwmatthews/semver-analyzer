@@ -64,7 +64,7 @@ Given `old_surface` and `new_surface`, produces `Vec<StructuralChange>`:
 
 `Vec<StructuralChange>` where each change has:
 - `change_type: StructuralChangeType` (5 variants: `Added(ChangeSubject)`, `Removed(ChangeSubject)`, `Changed(ChangeSubject)`, `Renamed { from, to }`, `Relocated { from, to }`)
-- `symbol`, `qualified_name`, `kind`, `package`, `before`, `after`, `description`, `is_breaking`, `migration_target`
+- `symbol`, `qualified_name`, `kind`, `package`, `before`, `after`, `description`, `is_breaking`, `impact: Option<ImpactAnalysis>`, `migration_target`
 
 ---
 
@@ -76,40 +76,80 @@ Analyzes source code changes at the AST level without LLM. Produces deterministi
 
 ### TypeScript SD Pipeline
 
+Phases execute in interleaved order (not grouped by letter):
+
+**A** -> **B** -> **A.5** -> **B.5** -> **B.5b** -> **B.5c** -> **A.7a** -> **A.7b** -> **B1** -> **B3**
+
 **Phase A -- Changed File Analysis**
 1. Find changed `.tsx` files via `git diff --name-only`
 2. For each changed file, extract `ComponentSourceProfile` at both refs (25+ fields: rendered elements, ARIA attributes, prop defaults, CSS tokens, BEM structure, portal usage, contexts, etc.)
 3. Diff profiles to produce `SourceLevelChange` entries across 15 categories
 
-**Phase A.5 -- Deprecated Migration Diffing**
-- Pairs deprecated components with their replacements
-- Diffs the replacement's old vs new profile against the deprecated component
-
-**Phase A.7 -- Transitive Behavioral Changes**
-- Traces changed helper functions through import chains
-- If a helper changed and is imported by a component, generates transitive change entries
-
-**Phase B -- Full Composition Analysis**
+**Phase B -- Full To-Version Extraction** (lines ~134-186)
 1. Enumerate ALL component files at the to-ref
-2. Extract source profiles for every component
-3. Build composition trees via `build_composition_tree_v2()` (10-step signal algorithm)
-4. Diff old vs new composition trees
-5. Generate conformance checks
+2. Extract source profiles for every component into `new_profiles`
+3. Handle deprecated/non-deprecated name collisions (main path wins)
+
+**Phase A.5 -- Deprecated Migration Diffing**
+- Runs after B because it needs the full `new_profiles` map
+- For deprecated components removed in the new version, finds same-named non-deprecated replacements
+- Diffs the deprecated component's old profile against the replacement's new profile
+- Tags resulting changes with `migration_from` to distinguish from same-component evolution
+
+**Phase B.5 -- Extends Resolution**
+- Resolves `extends_props` entries (e.g., `extends OUIAProps`) to actual prop lists by following imports and parsing extended interfaces
+- Enriches `all_props` for both old and new profiles
+- Required before Phase A.7 because managed attribute detection uses `all_props` as `known_props`
+
+**Phase B.5b -- Overridden Attributes Enrichment**
+- For `ManagedAttributeBinding` entries with empty `overridden_attributes`, resolves the generator function's import
+- Parses the function's return value to fill in the attribute names it produces at runtime
+- Needed for helpers like `getOUIAProps` that generate attributes (`data-ouia-component-type`, etc.) not statically visible in JSX
+
+**Phase B.5c -- Re-diff PropAttributeOverride**
+- Phase A emitted `PropAttributeOverride` changes before B.5b enrichment, so their `overridden_attributes` were empty
+- Re-diffs managed attributes with the enriched profiles to produce changes with real attribute names
+- Replaces the stale Phase A entries with corrected versions
+
+**Phase A.7a -- Transitive Managed Attribute Dependencies**
+- Parses changed functions via `git diff` (runs inside SD, not in orchestrator)
+- For each changed helper function used as a `generator_function` in `ManagedAttributeBinding`, generates transitive behavioral change entries
+- Detects when helpers like `getOUIAProps`/`useOUIAProps` change behavior affecting all consuming components
+
+**Phase A.7b -- Rendered Component Propagation**
+- Propagates externally-observable source-level changes through the `rendered_components` graph
+- When a sub-component changes (portal behavior, DOM structure, ARIA roles, etc.), all parent components that render it inherit those effects
+
+**Phase B1 -- Composition Tree Building** (lines ~402-672)
+- Builds composition trees per family using `build_composition_tree_v2()` (~20-step signal algorithm)
+- Dependency-aware: families with `extends_props` to another family are deferred until the delegate family's tree is built
+- Two-phase resolution: independent families first, then deferred families in topological order
+
+**Phase B3 -- Composition Diff + Conformance** (lines ~674-729)
+- Diff old vs new composition trees for changed families
+- Generate conformance checks from all to-version trees
 
 **Composition Tree Builder** (`crates/ts/src/composition/mod.rs`):
-10 signal steps combine evidence to build parent-child edges:
+~20 signal steps combine evidence to build parent-child edges:
 1. Internal rendering (from `rendered_components` in JSX)
 1.5. Delegate tree projection
 2. CSS direct-child selectors (`.parent > .child`)
 3. CSS grid parent-child (grid-template vs grid-column)
+3b. Implicit grid children
+3c. Re-parent through `display:contents`
 4. CSS flex context (flex container -> flex items)
 5. CSS descendant selectors (`.parent .child`)
 5.5. CSS layout children
 6. React context (provider/consumer)
 7. DOM nesting (`<ul>` -> `<li>`)
 8. cloneElement threading
-8.5-8.7. BEM orphan fallback, secondary block, prop-passed detection
-9. Suppress root edges when intermediate exists
+8.5. BEM element orphan fallback
+8.6. Secondary BEM block sub-root
+8.7. Prop-passed detection
+8.8. Downgrade bidirectional CHP cycles
+9. Dedup edges
+9.5. Pure composition wrapper PMC upgrade
+9.6. Suppress root shortcuts
 10. Drop unconnected members
 
 **EdgeStrength** (4-valued enum modeling two dimensions):
@@ -131,18 +171,46 @@ Analyzes source code changes at the AST level without LLM. Produces deterministi
 
 ### Java SD Pipeline
 
-**Phase A**: Find changed `.java` files, extract `JavaClassProfile` at both refs, diff them
-**Phase B**: Extract all profiles, resolve inheritance chains (transitive `Serializable` detection)
-**Phase B.5**: Build inheritance summary
-**Phase B3**: Module system diff (`module-info.java` directives)
+**Phase A -- Changed File Diff**
+- Find changed `.java` files via `git diff --name-only --diff-filter=AMRC` (excludes test files, `package-info.java`)
+- Extract `JavaClassProfile` at both refs using tree-sitter
+- Diff old vs new profiles to produce `JavaSourceChange` entries
 
-22 source-level change categories including: annotation changes, synchronization, exceptions, serialization, override, constructor dependencies, module exports, final/sealed, inheritance, native.
+**Phase B -- Full Extraction**
+- Extract all `JavaClassProfile`s at the to-ref (from worktree if available, else via `git show`)
+
+**Phase B.5 -- Inheritance Resolution**
+- Resolve inheritance chains to detect transitive `Serializable` implementation
+- For changed classes that are serializable, diff serialization-specific fields (serial version UID, serializable field changes)
+
+**Phase B1 -- Inheritance Summary**
+- Build inheritance trees from all new-version profiles
+- Detect hierarchy breakages (changed superclass, removed interface implementation)
+
+**Phase B3 -- Module System Diff**
+- Diff `module-info.java` directives between old and new versions
+- Detects added/removed exports, requires, opens directives
+
+23 source-level change categories including: annotation changes, synchronization, exceptions, serialization, override, constructor dependencies, module exports, final/sealed, inheritance, native.
 
 ### Output
 
 TypeScript: `SdPipelineResult` with ~20 fields including `source_level_changes`, `composition_trees`, `composition_changes`, `conformance_checks`, component props/types inventories, CSS inventories, deprecated replacements.
 
 Java: `JavaSdPipelineResult` with `source_level_changes`, profiles, module changes, inheritance summary.
+
+---
+
+## Extended Analysis Phase (Post-SD, Pre-Report)
+
+**Runs after SD completes, in the orchestrator. Source: `src/orchestrator.rs` (calls `Language::finalize_extensions()`)**
+
+After both TD and SD finish, the orchestrator runs cross-pipeline post-processing before building the report. For TypeScript, this is implemented in `crates/ts/src/language.rs` (`finalize_extensions`) and `crates/ts/src/deprecated_replacements.rs`:
+
+1. **Deprecated replacement detection (rendering swap)** -- Primary method. Examines SD composition data to find deprecated components whose host component started rendering a differently-named replacement component (e.g., deprecated `ApplicationLauncher` replaced by `Dropdown`)
+2. **Deprecated replacement detection (commit co-change)** -- Fallback for components not detected by rendering swap. Analyzes git commit history to find deprecated components that were added in the same commit as their replacement
+3. **Deprecated migration diffing for renamed replacements** -- Diffs renamed deprecated components against their replacements (e.g., `ChipGroup` vs `LabelGroup`). Phase A.5 only handles same-name lookups; this covers cross-name renames
+4. **Structural change transformation** -- Rewrites TD structural changes based on detected deprecated replacements (e.g., marks a removal as "replaced by X" instead of plain removal)
 
 ---
 
@@ -158,6 +226,7 @@ Uses LLM to detect behavioral changes not visible from type signatures.
 2. For each changed function, find associated test files
 3. Diff test assertions between refs
 4. Skip functions already flagged by TD (via `SharedFindings` broadcast channel)
+5. **Deterministic body analysis**: Delegates to `Language::body_analyzer()` (e.g., JSX diff + CSS scan for TypeScript). For each exported changed function with old/new bodies, runs language-specific AST analysis to detect behavioral changes without LLM (DOM structure changes, CSS class changes, ARIA attribute changes, etc.)
 
 ### BU Phase 2 -- LLM Analysis
 

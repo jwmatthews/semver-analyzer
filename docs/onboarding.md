@@ -24,7 +24,7 @@ The primary consumer is the [Konveyor](https://konveyor.io/) project, which uses
 ## Languages Supported
 
 - **TypeScript/JavaScript/React** -- Full support including component hierarchy, JSX structure, CSS, ARIA accessibility
-- **Java** -- Full support including annotations, module system, serialization, Maven/Gradle manifests
+- **Java** -- Full support including annotations, module system, serialization, Maven/Gradle manifests (requires `--features java` to build)
 - **Python, Go** -- Planned but not implemented
 
 ## The Three Pipelines

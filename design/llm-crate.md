@@ -7,7 +7,7 @@ Language-agnostic LLM behavioral analysis. Shells out to an external CLI command
 ```
 crates/llm/src/
   lib.rs            LlmBehaviorAnalyzer struct + BehaviorAnalyzer trait impl
-  invoke.rs         CLI execution + response parsing (6 parsers)
+  invoke.rs         CLI execution + response parsing (8 parsers)
   prompts.rs        Prompt builders (7 prompts + FunctionSpec JSON schema)
   spec_compare.rs   Tier 1 structural spec comparison (no LLM needed)
 ```
@@ -84,7 +84,7 @@ Returns confidence 0.80 for breaking, 0.0 for not. If structural comparison find
 
 ### Tier 2: LLM Comparison
 
-Only invoked when Tier 1 finds no issues but the specs have differing `notes`. Asks the LLM to compare the two specs directly.
+Only invoked when Tier 1 finds no issues and either spec has non-empty `notes` (i.e., `!old.notes.is_empty() || !new.notes.is_empty()`). Asks the LLM to compare the two specs directly.
 
 ## Response Parsing (`invoke.rs`)
 

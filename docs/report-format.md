@@ -363,10 +363,11 @@ Present as `sd_result` when the default SD pipeline runs (absent with `--behavio
 |-------|------|---------|-------------|
 | `parent` | string | -- | Parent component |
 | `child` | string | -- | Child component |
-| `relationship` | string | -- | `"bem_element"`, `"independent_block"`, `"internal"`, `"direct_child"`, `"unknown"` |
+| `relationship` | string | -- | `"bem_element"`, `"independent_block"`, `"internal"`, `"direct_child"`, `"prop_passed"`, `"unknown"` |
 | `required` | boolean | -- | Whether this nesting is required |
 | `bem_evidence` | string | null | BEM evidence description |
-| `strength` | string | `"allowed"` | `"required"` or `"allowed"` |
+| `strength` | string | `"allowed"` | `"allowed"`, `"structural"`, `"wrapper"`, or `"required"` |
+| `prop_name` | string | null | Prop name when relationship is `"prop_passed"` (e.g., `"sidebar"`, `"labelHelp"`) |
 
 ### CompositionChange
 
@@ -458,7 +459,7 @@ Plain string: `"removed"`, `"signature_changed"`, `"type_changed"`, `"visibility
 
 ### SourceLevelCategory
 
-Plain string: `"dom_structure"`, `"aria_change"`, `"role_change"`, `"data_attribute"`, `"css_token"`, `"prop_default"`, `"portal_usage"`, `"context_dependency"`, `"composition"`, `"forward_ref"`, `"memo"`, `"rendered_component"`, `"prop_attribute_override"`
+Plain string: `"dom_structure"`, `"aria_change"`, `"role_change"`, `"data_attribute"`, `"css_token"`, `"prop_default"`, `"portal_usage"`, `"context_dependency"`, `"composition"`, `"forward_ref"`, `"memo"`, `"rendered_component"`, `"prop_attribute_override"`, `"attribute_conditionality"`, `"prop_deprecated"`
 
 ### TsManifestChangeType
 
@@ -466,11 +467,16 @@ Plain string: `"entry_point_changed"`, `"exports_entry_removed"`, `"exports_entr
 
 ### ChildRelationship
 
-Plain string: `"bem_element"`, `"independent_block"`, `"internal"`, `"direct_child"`, `"unknown"`
+Plain string: `"bem_element"`, `"independent_block"`, `"internal"`, `"direct_child"`, `"prop_passed"`, `"unknown"`
 
 ### EdgeStrength
 
-Plain string: `"required"`, `"allowed"` (default: `"allowed"`)
+Plain string: `"allowed"`, `"structural"`, `"wrapper"`, `"required"` (default: `"allowed"`)
+
+- `"allowed"` -- Valid nesting but not enforced (CHP=NO, PMC=NO). No conformance rules generated.
+- `"structural"` -- Child must be inside this parent (CHP=YES, PMC=NO). Generates `notParent` rules only.
+- `"wrapper"` -- Parent must contain this child (CHP=NO, PMC=YES). Generates `requiresChild` rules only.
+- `"required"` -- Both directions enforced (CHP=YES, PMC=YES). Generates both `notParent` and `requiresChild` rules.
 
 ### ComponentStatus
 
@@ -499,6 +505,6 @@ Plain string: `"test_delta"`, `"llm_analysis"`, `"body_analysis"`, `"call_graph_
    - `RemovalDisposition`: Internally tagged with `"type"` discriminator (`{ "type": "moved_to_related_type", ... }`)
    - `CompositionChangeType`, `ConformanceCheckType`: Externally tagged (`{ "variant_name": { ...fields } }`)
 
-6. **Default values**: `EdgeStrength` defaults to `"allowed"`, `ExpectedChild.required` defaults to `false`, `ExpectedChild.mechanism` defaults to `"child"`. Missing fields deserialize to these defaults.
+6. **Default values**: `EdgeStrength` defaults to `"allowed"`, `ExpectedChild.required` defaults to `false`, `ExpectedChild.mechanism` defaults to `"child"`, `CompositionEdge.prop_name` defaults to `null`. Missing fields deserialize to these defaults.
 
 7. **`ConstantGroup` string fields**: `common_prefix_pattern` and `strategy_hint` always appear in JSON (even as `""`). They are not skipped when empty.

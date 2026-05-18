@@ -1,165 +1,102 @@
-# Core Types
+# Core Types Reference
 
-## API Surface Model
+Every public struct and enum in `crates/core/src/types/`. Grouped by module.
 
-These types represent a language's public API surface. They are populated by
-a language crate's `ApiExtractor` and consumed by the diff engine. The types
-are language-agnostic -- each field either applies universally or is naturally
-`None`/`false`/empty for languages that don't have the concept.
+---
 
-### `ApiSurface`
+## Module: `surface` (`crates/core/src/types/surface.rs`)
 
-The top-level container. One per git ref.
+### `ApiSurface<M>`
+
+Language-agnostic public API surface extracted from source code at a git ref.
+Used by the TD (Top-Down) pipeline.
 
 ```rust
-pub struct ApiSurface {
-    pub symbols: Vec<Symbol>,
+// surface.rs:28
+pub struct ApiSurface<M: Default + Clone + PartialEq = ()> {
+    pub symbols: Vec<Symbol<M>>,
 }
 ```
 
-### `Symbol`
+### `Symbol<M>`
 
 A single exported symbol in the API surface. Symbols form a tree: a `Class`
-symbol has `members` which are themselves `Symbol` values (methods, properties,
-enum members, etc.).
+symbol has `members` which are themselves `Symbol<M>` values.
 
 ```rust
-pub struct Symbol {
-    /// Simple name (e.g., "createUser", "Button", "ClientOptions").
-    pub name: String,
-
-    /// Fully qualified name including module path.
-    /// TS: "src/api/users.createUser". Go: "pkg/client.Client". Java: "com.foo.UserService".
-    pub qualified_name: String,
-
-    /// What kind of symbol this is.
-    pub kind: SymbolKind,
-
-    /// Visibility level.
-    pub visibility: Visibility,
-
-    /// Source file containing this symbol.
-    pub file: PathBuf,
-
-    /// Line number in the source file (1-indexed).
-    pub line: usize,
-
-    /// Function/method signature (None for non-callable symbols like constants).
-    pub signature: Option<Signature>,
-
-    /// Parent class/struct (`extends` clause).
-    /// TS: `class EmailValidator extends BaseValidator` -> "BaseValidator"
-    /// Java: `class ArrayList extends AbstractList` -> "AbstractList"
-    /// Go/Python: None (Go has no inheritance; Python uses `implements` for base classes)
-    pub extends: Option<String>,
-
-    /// Implemented interfaces.
-    /// TS: `class Foo implements Bar, Baz` -> ["Bar", "Baz"]
-    /// Java: `class Foo implements Serializable` -> ["Serializable"]
-    /// Go: implicit, but extractable
-    pub implements: Vec<String>,
-
-    /// Whether this symbol is abstract.
-    /// TS, Java, C#: `abstract class Foo` or `abstract method()`.
-    /// Python: `@abstractmethod`.
-    /// Go: always false (no abstract concept).
-    pub is_abstract: bool,
-
-    /// Types referenced in this symbol's signature.
-    /// Used for transitive impact analysis.
-    pub type_dependencies: Vec<String>,
-
-    /// Whether this member is readonly.
-    /// TS: `readonly`. Java: `final`. C#: `readonly`.
-    /// Go/Python: always false.
-    pub is_readonly: bool,
-
-    /// Whether this member is static.
-    /// TS, Java, C#: `static`. Python: `@staticmethod`.
-    /// Go: always false.
-    pub is_static: bool,
-
-    /// Accessor kind (get/set properties).
-    /// TS: `get foo()`, `set foo()`. C#: `get { }`, `set { }`. Python: `@property`.
-    /// Go/Java: always None.
-    pub accessor_kind: Option<AccessorKind>,
-
-    /// Child members (methods, properties, enum variants, struct fields).
-    pub members: Vec<Symbol>,
+// surface.rs:55
+pub struct Symbol<M: Default + Clone + PartialEq = ()> {
+    pub name: String,                       // Simple name (e.g., "createUser")
+    pub qualified_name: String,             // Fully qualified (e.g., "src/api/users.createUser")
+    pub kind: SymbolKind,                   // What kind of symbol
+    pub visibility: Visibility,             // Export visibility level
+    pub file: PathBuf,                      // Source file
+    pub package: Option<String>,            // Distribution/dependency identity (e.g., npm package name)
+    pub import_path: Option<String>,        // Consumer-facing import specifier (e.g., subpath export)
+    pub line: usize,                        // Line number (1-indexed)
+    pub signature: Option<Signature>,       // Function/method signature (None for non-callable)
+    pub extends: Option<String>,            // Parent class (`extends` clause)
+    pub implements: Vec<String>,            // Implemented interfaces
+    pub is_abstract: bool,                  // Whether abstract (class or method)
+    pub type_dependencies: Vec<String>,     // Types referenced in signature
+    pub is_readonly: bool,                  // Whether readonly
+    pub is_static: bool,                    // Whether static
+    pub accessor_kind: Option<AccessorKind>,// Get/set accessor kind
+    pub members: Vec<Symbol<M>>,            // Child members (methods, properties, enum variants)
+    pub language_data: M,                   // Per-symbol language-specific metadata
 }
 ```
 
-**Design decision -- flat struct with optional fields vs. kind-specific structs:**
-
-We considered having separate struct types per kind (e.g., `ClassSymbol`,
-`FunctionSymbol`, `InterfaceSymbol`) but rejected this because:
-
-1. The diff engine operates generically over `Symbol` -- it compares members,
-   checks modifiers, and diffs signatures regardless of kind
-2. Most fields are applicable to multiple kinds across languages (e.g., `extends`
-   applies to classes in TS/Java/C# and interfaces in TS)
-3. Unused fields default to `None`/`false`/empty, which is clean and correct
-4. Only the `ApiExtractor` (language-specific) creates these -- so the
-   "invalid state" of e.g., `is_abstract = true` on an enum member is a bug in
-   the extractor, not a type system problem worth solving with separate structs
+20 fields total. `language_data` is `TsSymbolData` for TypeScript, `()` for core/tests.
 
 ### `SymbolKind`
 
+15 variants.
+
 ```rust
+// surface.rs:222
 pub enum SymbolKind {
-    Function,       // TS: `function foo()`. Go: `func foo()`. Python: `def foo()`.
-    Method,         // TS: class method. Go: `func (r Recv) Method()`. Java: `void method()`.
-    Class,          // TS, Java, Python, C#. Go: no classes (use Struct).
-    Struct,         // Go, C#. NEW -- not in current codebase.
-    Interface,      // TS, Go, Java, C#. Python: Protocol/ABC.
-    TypeAlias,      // TS: `type Foo = ...`. Go: `type Foo = ...`. C#: `using Foo = ...`.
-    Enum,           // TS, Java, Python, C#. Go: pseudo-enums via const iota.
-    EnumMember,     // Member of an enum.
-    Constant,       // TS: `const X`. Go: `const X`. Java: `static final X`.
-    Variable,       // TS: `let/var`. Go: `var`. Java/C#: field.
-    Property,       // Interface/class member, struct field. Also covers accessors.
-    Constructor,    // TS, Java, C#, Python (`__init__`). Go: no constructors.
-    Namespace,      // TS, C#. Go/Java/Python: packages/modules (not symbols).
+    Function,
+    Method,
+    Class,
+    Struct,          // Value type (Go, C#)
+    Interface,
+    TypeAlias,
+    Enum,
+    EnumMember,
+    Constant,
+    Variable,
+    Property,
+    Constructor,
+    GetAccessor,     // Still present -- NOT removed
+    SetAccessor,     // Still present -- NOT removed
+    Namespace,
 }
 ```
 
-**Changes from current design:**
-
-| Change | Reasoning |
-|--------|-----------|
-| Added `Struct` | Go and C# distinguish structs from classes. Go has no classes at all -- everything is a struct. |
-| Removed `GetAccessor`, `SetAccessor` | These were redundant with `Property` + the `accessor_kind` field on `Symbol`. The diff engine never pattern-matched on `GetAccessor`/`SetAccessor` -- it only compared `accessor_kind` for equality. Removing them simplifies the enum without losing information. |
+Serde: `#[serde(rename_all = "snake_case")]`.
 
 ### `Visibility`
 
+5 variants. Default: `Public`.
+
 ```rust
+// surface.rs:247
 pub enum Visibility {
-    /// Explicitly private. TS: `private`/`#field`. Java: `private`. C#: `private`.
-    Private,
-    /// Module/package-internal. TS: not exported. Go: lowercase. Java: package-private.
-    Internal,
-    /// Accessible to subclasses. Java: `protected`. C#: `protected`. Python: `_prefix`.
-    /// NEW -- not in current codebase.
-    Protected,
-    /// Public within the package. TS: class member. Java: `public`. C#: `public`.
-    Public,
-    /// Exported from the package for external consumers. TS: `export`. Go: uppercase.
-    Exported,
+    Exported,    // Module-level export (JS/TS `export`, Python `__all__`, Rust `pub`)
+    Public,      // Public member (default)
+    Protected,   // Subclass-accessible (Java/C# `protected`, Python `_prefix`)
+    Internal,    // Module-internal (not exported)
+    Private,     // Explicitly private (`private` keyword or `#field`)
 }
 ```
 
-**Change from current design:** Added `Protected`. Java, C#, and Python all have
-a visibility level between internal and public. The current code maps TypeScript
-`protected` to `Internal`, losing the distinction.
-
-**Important:** The numeric ranking of visibility levels is NOT hardcoded. It is
-provided by `LanguageSemantics::visibility_rank()` because the ordering differs
-by language. Java's `protected` is more visible than package-private. C# has
-additional levels (`private protected`, `protected internal`).
+Serde: `#[serde(rename_all = "snake_case")]`.
 
 ### `AccessorKind`
 
 ```rust
+// surface.rs:267
 pub enum AccessorKind {
     Get,
     Set,
@@ -167,132 +104,466 @@ pub enum AccessorKind {
 }
 ```
 
-Unchanged. Applies to TS, C#, and Python (`@property`). Go and Java don't use
-accessor properties (Java uses getter/setter methods, which are modeled as
-`Method` symbols).
-
 ### `Signature`
 
+Function or method signature.
+
 ```rust
+// surface.rs:276
 pub struct Signature {
-    /// Ordered list of parameters.
     pub parameters: Vec<Parameter>,
-
-    /// Return type as a canonicalized string. None if not annotated.
-    /// Go: multiple returns modeled as tuple string "(User, error)".
-    pub return_type: Option<String>,
-
-    /// Generic type parameters.
+    pub return_type: Option<String>,           // Canonicalized (e.g., "Promise<User>")
     pub type_parameters: Vec<TypeParameter>,
-
-    /// Whether the function is async.
-    /// TS, Python, C#: marked with `async` keyword.
-    /// Go: always false (goroutines, no async marker).
-    /// Java: always false (returns CompletableFuture but no keyword).
     pub is_async: bool,
 }
 ```
 
-**Note on `is_async`:** This field is currently **never read** by the diff engine.
-The current code detects async transitions by parsing the return type string
-(`starts_with("Promise<")`). With the new design, async detection moves entirely
-to the `MessageFormatter`. The `is_async` field is kept as metadata so the
-formatter can use it directly instead of parsing return type strings.
-
 ### `Parameter`
 
 ```rust
+// surface.rs:306
 pub struct Parameter {
-    /// Parameter name.
     pub name: String,
-
-    /// Type annotation as a canonicalized string.
     pub type_annotation: Option<String>,
-
-    /// Whether the parameter is optional.
-    /// TS: `param?: Type`. Python: `param: Type = None`. C#: nullable.
-    /// Go/Java: always false (no optional parameters).
-    pub optional: bool,
-
-    /// Whether the parameter has a default value.
-    /// TS, Python, C#: yes. Go/Java: always false.
-    pub has_default: bool,
-
-    /// The actual default value expression as a string.
-    pub default_value: Option<String>,
-
-    /// Whether this is a rest/variadic parameter.
-    /// TS: `...args`. Go: `...args`. Java: `Type...`. Python: `*args`. C#: `params`.
-    pub is_rest: bool,
+    pub optional: bool,                  // Whether optional (`param?: Type`)
+    pub has_default: bool,               // Whether has a default value
+    pub default_value: Option<String>,   // Actual default expression (e.g., "10", "'hello'")
+    pub is_variadic: bool,               // Rest/variadic parameter (`...args`) -- NOT `is_rest`
 }
 ```
 
 ### `TypeParameter`
 
+Generic type parameter declaration.
+
 ```rust
+// surface.rs:293
 pub struct TypeParameter {
-    /// Name of the type parameter (e.g., "T").
-    pub name: String,
-
-    /// Constraint. TS/Java: `extends Foo`. Go: implicit. C#: `where T : Foo`.
-    pub constraint: Option<String>,
-
-    /// Default type. TS: `T = unknown`. C#: possible. Go/Java: always None.
-    pub default: Option<String>,
+    pub name: String,                // e.g., "T"
+    pub constraint: Option<String>,  // e.g., "Serializable" from `T extends Serializable`
+    pub default: Option<String>,     // e.g., "unknown" from `T = unknown`
 }
 ```
 
 ---
 
-## Diff Output Types
+## Module: `report` (`crates/core/src/types/report.rs`)
 
-These types represent the output of the diff engine. They are language-agnostic
-in structure -- the language-specific semantics are already applied during
-diff computation (via `LanguageSemantics`) and description formatting
-(via `MessageFormatter`).
+### `EmptyExtensions`
+
+Empty analysis extensions for languages without extended analysis. Serializes
+as `{}`.
+
+```rust
+// report.rs:39
+pub struct EmptyExtensions {}
+```
+
+### `AnalysisReport<L>`
+
+Top-level analysis report (v2 harness format). 11 fields.
+
+```rust
+// report.rs:45
+pub struct AnalysisReport<L: Language> {
+    pub repository: PathBuf,
+    pub comparison: Comparison,
+    pub summary: Summary,
+    pub changes: Vec<FileChanges<L>>,
+    pub manifest_changes: Vec<ManifestChange<L>>,
+    pub added_files: Vec<PathBuf>,
+    pub packages: Vec<PackageChanges<L>>,
+    pub member_renames: HashMap<String, String>,
+    pub inferred_rename_patterns: Option<InferredRenamePatterns>,
+    pub extensions: L::AnalysisExtensions,       // #[serde(flatten)]
+    pub metadata: AnalysisMetadata,
+}
+```
+
+`extensions` is flattened into the parent JSON object.
+
+### `Comparison`
+
+Git comparison metadata.
+
+```rust
+// report.rs:113
+pub struct Comparison {
+    pub from_ref: String,
+    pub to_ref: String,
+    pub from_sha: String,
+    pub to_sha: String,
+    pub commit_count: usize,
+    pub analysis_timestamp: String,
+}
+```
+
+### `Summary`
+
+```rust
+// report.rs:124
+pub struct Summary {
+    pub total_breaking_changes: usize,
+    pub breaking_api_changes: usize,
+    pub breaking_behavioral_changes: usize,
+    pub files_with_breaking_changes: usize,
+}
+```
+
+### `FileChanges<L>`
+
+All breaking changes within a single file.
+
+```rust
+// report.rs:134
+pub struct FileChanges<L: Language> {
+    pub file: PathBuf,
+    pub status: FileStatus,
+    pub renamed_from: Option<PathBuf>,
+    pub breaking_api_changes: Vec<ApiChange>,
+    pub breaking_behavioral_changes: Vec<BehavioralChange<L>>,
+    pub container_changes: Vec<ContainerChange>,
+}
+```
+
+### `FileStatus`
+
+```rust
+// report.rs:160
+pub enum FileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+```
+
+### `ApiChange`
+
+A breaking API change detected by structural analysis (TD pipeline).
+
+```rust
+// report.rs:174
+pub struct ApiChange {
+    pub symbol: String,                         // "TypeName" or "TypeName.memberName"
+    pub qualified_name: String,                 // Fully qualified
+    pub kind: ApiChangeKind,
+    pub change: ApiChangeType,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub description: String,
+    pub migration_target: Option<MigrationTarget>,
+    pub removal_disposition: Option<RemovalDisposition>,
+}
+```
+
+### `ApiChangeKind`
+
+```rust
+// report.rs:214
+pub enum ApiChangeKind {
+    Function,
+    Method,
+    Class,
+    Struct,          // #[serde(rename = "struct")]
+    Interface,
+    Trait,           // #[serde(rename = "trait")]
+    TypeAlias,
+    Constant,
+    Enum,            // #[serde(rename = "enum")]
+    Constructor,
+    Field,
+    Property,
+    ModuleExport,
+}
+```
+
+Serde: `#[serde(rename_all = "snake_case")]` with manual renames for Rust keywords.
+
+### `ApiChangeType`
+
+```rust
+// report.rs:257
+pub enum ApiChangeType {
+    Removed,
+    SignatureChanged,
+    TypeChanged,
+    VisibilityChanged,
+    Renamed,
+}
+```
+
+### `BehavioralChange<L>`
+
+A behavioral change detected by BU analysis.
+
+```rust
+// report.rs:268
+pub struct BehavioralChange<L: Language> {
+    pub symbol: String,
+    pub kind: BehavioralChangeKind,
+    pub category: Option<L::Category>,
+    pub description: String,
+    pub source_file: Option<String>,            // #[serde(skip)]
+    pub confidence: Option<f64>,                // NOT bare f64
+    pub evidence_type: Option<EvidenceType>,    // NOT `evidence: L::Evidence`
+    pub referenced_symbols: Vec<String>,
+    pub is_internal_only: Option<bool>,          // NOT bare bool
+}
+```
+
+### `BehavioralChangeKind`
+
+```rust
+// report.rs:312
+pub enum BehavioralChangeKind {
+    Function,
+    Method,
+    Class,
+    Module,
+}
+```
+
+### `ContainerChange`
+
+Containment/nesting structure change between versions.
+
+```rust
+// report.rs:325
+pub struct ContainerChange {
+    pub symbol: String,
+    pub old_container: Option<String>,
+    pub new_container: Option<String>,
+    pub description: String,
+}
+```
+
+### `PackageChanges<L>`
+
+All changes within a single package.
+
+```rust
+// report.rs:345
+pub struct PackageChanges<L: Language> {
+    pub name: String,
+    pub old_version: Option<String>,
+    pub new_version: Option<String>,
+    pub type_summaries: Vec<TypeSummary<L>>,
+    pub constants: Vec<ConstantGroup>,
+    pub added_exports: Vec<AddedExport>,
+}
+```
+
+### `TypeSummary<L>`
+
+Pre-aggregated summary of all changes to a single type.
+
+```rust
+// report.rs:378
+pub struct TypeSummary<L: Language> {
+    pub name: String,
+    pub definition_name: String,
+    pub status: TypeStatus,
+    pub member_summary: MemberSummary,
+    pub removed_members: Vec<RemovedMember>,
+    pub type_changes: Vec<TypeChange>,
+    pub migration_target: Option<MigrationTarget>,
+    pub behavioral_changes: Vec<BehavioralChange<L>>,
+    pub language_data: L::ReportData,            // #[serde(flatten)]
+    pub source_files: Vec<PathBuf>,
+}
+```
+
+### `TypeStatus`
+
+```rust
+// report.rs:423
+pub enum TypeStatus {
+    Modified,
+    Removed,
+    Added,
+}
+```
+
+### `MemberSummary`
+
+Aggregated member-level change counts for a type.
+
+```rust
+// report.rs:435
+pub struct MemberSummary {
+    pub total: usize,
+    pub removed: usize,
+    pub renamed: usize,
+    pub type_changed: usize,
+    pub added: usize,
+    pub removal_ratio: f64,     // 0.0 to 1.0
+}
+```
+
+### `RemovedMember`
+
+```rust
+// report.rs:454
+pub struct RemovedMember {
+    pub name: String,
+    pub old_type: Option<String>,
+    pub removal_disposition: Option<RemovalDisposition>,
+}
+```
+
+### `RemovalDisposition`
+
+Why a member was removed and where its functionality went. Internally tagged
+with `#[serde(tag = "type", rename_all = "snake_case")]`.
+
+```rust
+// report.rs:469
+pub enum RemovalDisposition {
+    MovedToRelatedType {
+        target_type: String,
+        mechanism: String,       // e.g., "prop", "children", "parameter", "field"
+    },
+    ReplacedByMember {
+        new_member: String,
+    },
+    MadeAutomatic,
+    TrulyRemoved,
+}
+```
+
+### `TypeChange`
+
+A property whose type changed.
+
+```rust
+// report.rs:492
+pub struct TypeChange {
+    pub property: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+```
+
+### `ExpectedChild`
+
+An expected direct child type, derived from LLM hierarchy inference.
+
+```rust
+// report.rs:513
+pub struct ExpectedChild {
+    pub name: String,
+    pub required: bool,
+    pub mechanism: String,           // "child" (default) or "prop"
+    pub prop_name: Option<String>,   // When mechanism is "prop"
+}
+```
+
+### `HierarchyDelta`
+
+A change in the component hierarchy between versions.
+
+```rust
+// report.rs:558
+pub struct HierarchyDelta {
+    pub component: String,
+    pub added_children: Vec<ExpectedChild>,
+    pub removed_children: Vec<String>,
+    pub migrated_members: Vec<MigratedMember>,
+    pub source_package: Option<String>,
+    pub migration_target: Option<MigrationTarget>,
+}
+```
+
+### `MigratedMember`
+
+A member that migrated from a parent type to a child type.
+
+```rust
+// report.rs:586
+pub struct MigratedMember {
+    pub member_name: String,
+    pub target_child: String,
+    pub target_member_name: Option<String>,
+}
+```
+
+### `FamilyHierarchy`
+
+```rust
+// report.rs:602
+pub struct FamilyHierarchy {
+    pub components: HashMap<String, Vec<ExpectedChild>>,
+}
+```
+
+### `ConstantGroup`
+
+Pre-grouped bulk constant/token changes within a package.
+
+```rust
+// report.rs:613
+pub struct ConstantGroup {
+    pub change_type: ApiChangeType,
+    pub count: usize,
+    pub symbols: Vec<String>,
+    pub common_prefix_pattern: String,
+    pub strategy_hint: String,
+    pub suffix_renames: Vec<SuffixRename>,
+}
+```
+
+### `SuffixRename`
+
+```rust
+// report.rs:634
+pub struct SuffixRename {
+    pub from: String,
+    pub to: String,
+}
+```
+
+### `AddedExport`
+
+A symbol that was added (newly exported) in the new version.
+
+```rust
+// report.rs:642
+pub struct AddedExport {
+    pub name: String,
+    pub qualified_name: String,
+    pub package: String,
+}
+```
 
 ### `StructuralChange`
 
-The result of comparing a symbol between two API surface versions.
+A structural change detected by the diff engine. Internal representation
+converted to `ApiChange` for output.
 
 ```rust
+// report.rs:662
 pub struct StructuralChange {
-    /// The affected symbol name.
     pub symbol: String,
-
-    /// Fully qualified symbol name.
     pub qualified_name: String,
-
-    /// Symbol kind.
     pub kind: SymbolKind,
-
-    /// What happened and to what.
+    pub package: Option<String>,
     pub change_type: StructuralChangeType,
-
-    /// Value before the change (type string, visibility level, etc.).
     pub before: Option<String>,
-
-    /// Value after the change.
     pub after: Option<String>,
-
-    /// Whether this change is breaking.
-    pub is_breaking: bool,
-
-    /// Human-readable description, populated by MessageFormatter.
     pub description: String,
-
-    /// Migration target if a replacement was detected.
+    pub is_breaking: bool,
+    pub impact: Option<ImpactAnalysis>,
     pub migration_target: Option<MigrationTarget>,
 }
 ```
 
 ### `StructuralChangeType`
 
-Collapsed from 37 variants to 5. The change type says **what happened**. The
-`ChangeSubject` says **what it happened to**. The `before`/`after` fields say
-**what the values were**.
+5 lifecycle variants, each carrying a `ChangeSubject`.
 
 ```rust
+// report.rs:709
 pub enum StructuralChangeType {
     Added(ChangeSubject),
     Removed(ChangeSubject),
@@ -302,242 +573,218 @@ pub enum StructuralChangeType {
 }
 ```
 
-**Why collapse from 37 to 5?**
-
-The old 37-variant enum encoded the **what happened**, **what it happened to**,
-and sometimes **presentation hints** (e.g., `MadeAsync` vs `ReturnTypeChanged`)
-all in one variant name. With the `MessageFormatter` owning all descriptions,
-the presentation hints are no longer needed in the enum. And with `ChangeSubject`
-carrying the "what it happened to," the change type only needs to express the
-lifecycle event.
-
-**`Renamed` has `from` and `to` as separate `ChangeSubject` values** to support
-cross-type renames. In React, a prop can become children (`Member { name: "title" }`
-renamed to `Member { name: "children" }`). In Go, an options struct field could
-become a functional option function. Keeping `from` and `to` as independent
-subjects preserves this expressiveness.
-
-### `ChangeSubject`
-
-What aspect of a symbol was affected. The `symbol`/`qualified_name` on the
-parent `StructuralChange` identifies the top-level symbol; the `ChangeSubject`
-adds the specific sub-element context.
+### `MemberMapping`
 
 ```rust
-pub enum ChangeSubject {
-    /// The symbol itself (added, removed, renamed, relocated).
-    Symbol { kind: SymbolKind },
-
-    /// A member of a container (property on interface, method on class,
-    /// field on struct, variant on enum).
-    Member { name: String, kind: SymbolKind },
-
-    /// A parameter on a function/method.
-    Parameter { name: String },
-
-    /// The return type of a function/method.
-    ReturnType,
-
-    /// The visibility of a symbol.
-    Visibility,
-
-    /// A modifier on a symbol (readonly, abstract, static, accessor kind).
-    Modifier { modifier: String },
-
-    /// A generic type parameter.
-    TypeParameter { name: String },
-
-    /// The base class (`extends` clause).
-    BaseClass,
-
-    /// An interface implementation.
-    InterfaceImpl { interface_name: String },
-
-    /// A value in a union/constrained type.
-    UnionValue { value: String },
-}
-```
-
-**How the old 37 variants map:**
-
-| Old variant | New representation |
-|---|---|
-| `SymbolRemoved` | `Removed(Symbol { kind })` |
-| `SymbolRenamed` | `Renamed { from: Symbol { .. }, to: Symbol { .. } }` |
-| `PropertyAdded` | `Added(Member { name, kind: Property })` |
-| `EnumMemberRemoved` | `Removed(Member { name, kind: EnumMember })` |
-| `ParameterTypeChanged` | `Changed(Parameter { name })` |
-| `ReturnTypeChanged` | `Changed(ReturnType)` |
-| `MadeAsync` | `Changed(ReturnType)` -- formatter decides description |
-| `VisibilityReduced` | `Changed(Visibility)` |
-| `ReadonlyAdded` | `Added(Modifier { modifier: "readonly" })` |
-| `AbstractRemoved` | `Removed(Modifier { modifier: "abstract" })` |
-| `BaseClassChanged` | `Changed(BaseClass)` |
-| `InterfaceImplementationAdded` | `Added(InterfaceImpl { interface_name })` |
-| `UnionMemberRemoved` | `Removed(UnionValue { value })` |
-| `MigrationSuggested` | Metadata on `Removed(Symbol { .. })` via `migration_target` field |
-
-### `MigrationTarget`
-
-Detected when a removed symbol has a likely replacement in the same family,
-based on member overlap analysis.
-
-```rust
-pub struct MigrationTarget {
-    /// The symbol that was removed.
-    pub removed_symbol: String,
-    pub removed_qualified_name: String,
-
-    /// The symbol that replaces it.
-    pub replacement_symbol: String,
-    pub replacement_qualified_name: String,
-
-    /// Members that match between old and new.
-    pub matching_members: Vec<MemberMapping>,
-
-    /// Members from the removed symbol that have no match in the replacement.
-    pub removed_only_members: Vec<String>,
-
-    /// Ratio of matching members to total removed members.
-    pub overlap_ratio: f64,
-}
-
+// report.rs:747
 pub struct MemberMapping {
     pub old_name: String,
     pub new_name: String,
 }
 ```
 
----
+### `MigrationTarget`
 
-## Report Types (Generic over Language)
-
-These types carry language-specific data through the analysis pipeline.
-They are parameterized by `L: Language` and use its associated types.
-
-### `BehavioralChange<L>`
-
-A behavioral change detected by the BU (bottom-up) pipeline.
+A structural migration target detected by same-directory member overlap.
 
 ```rust
-pub struct BehavioralChange<L: Language> {
-    /// The function/method/class where the change occurs.
-    pub symbol: String,
-
-    /// The kind of symbol.
-    pub kind: BehavioralChangeKind,
-
-    /// Sub-category of the change. Language-defined.
-    /// TS: DomStructure, CssClass, etc. Go: ErrorHandling, Concurrency, etc.
-    pub category: Option<L::Category>,
-
-    /// What changed and why it breaks consumers.
-    pub description: String,
-
-    /// Confidence score (0.0 to 1.0).
-    pub confidence: f64,
-
-    /// How the change was detected. Language-defined.
-    /// TS: JsxDiff data, CSS scan, LLM analysis.
-    /// Go: interface satisfaction, test delta, LLM analysis.
-    pub evidence: L::Evidence,
-
-    /// Whether this change only affects internal rendering.
-    pub is_internal_only: bool,
+// report.rs:759
+pub struct MigrationTarget {
+    pub removed_symbol: String,
+    pub removed_qualified_name: String,
+    pub removed_package: Option<String>,
+    pub replacement_symbol: String,
+    pub replacement_qualified_name: String,
+    pub replacement_package: Option<String>,
+    pub matching_members: Vec<MemberMapping>,
+    pub removed_only_members: Vec<String>,
+    pub overlap_ratio: f64,
+    pub old_extends: Option<String>,
+    pub new_extends: Option<String>,
 }
+```
 
-pub enum BehavioralChangeKind {
-    Function,
-    Method,
-    Class,
-    Module,
+### `ImpactAnalysis`
+
+```rust
+// report.rs:793
+pub struct ImpactAnalysis {
+    pub internal_dependents: Vec<Dependent>,
+    pub transitive_dependents: Vec<Dependent>,
+}
+```
+
+### `Dependent`
+
+```rust
+// report.rs:805
+pub struct Dependent {
+    pub file: PathBuf,
+    pub line: usize,
+    pub symbol: String,
 }
 ```
 
 ### `ManifestChange<L>`
 
-A change in the package manifest file.
+A breaking change in a package manifest.
 
 ```rust
+// report.rs:814
 pub struct ManifestChange<L: Language> {
-    /// What field changed (e.g., "peerDependencies.react", "go 1.21").
     pub field: String,
-
-    /// What kind of manifest change. Language-defined.
-    /// TS: PeerDependencyAdded, ModuleSystemChanged, etc.
-    /// Go: GoVersionChanged, RequireAdded, etc.
     pub change_type: L::ManifestChangeType,
-
-    /// Value before the change.
     pub before: Option<String>,
-
-    /// Value after the change.
     pub after: Option<String>,
-
-    /// Human-readable description.
     pub description: String,
-
-    /// Whether this change is breaking.
     pub is_breaking: bool,
+    pub source_package: Option<String>,
 }
 ```
 
-### `LanguageReport<L>`
-
-The language-specific section of the report, deserialized only by consumers
-that know the language.
+### `AnalysisMetadata`
 
 ```rust
-pub struct LanguageReport<L: Language> {
-    /// Behavioral changes with language-specific categories and evidence.
+// report.rs:843
+pub struct AnalysisMetadata {
+    pub call_graph_analysis: String,
+    pub tool_version: String,
+    pub llm_usage: Option<LlmUsage>,
+}
+```
+
+### `LlmUsage`
+
+```rust
+// report.rs:857
+pub struct LlmUsage {
+    pub total_calls: usize,
+    pub spec_inference_calls: usize,
+    pub comparison_calls: usize,
+    pub propagation_calls: usize,
+    pub total_input_tokens: usize,
+    pub total_output_tokens: usize,
+    pub estimated_cost_usd: f64,
+    pub circuit_breaker_triggered: bool,
+}
+```
+
+### `InferredRenamePatterns`
+
+Rename patterns discovered by the LLM rename inference phase.
+
+```rust
+// report.rs:873
+pub struct InferredRenamePatterns {
+    pub constant_patterns: Vec<InferredConstantPattern>,
+    pub interface_mappings: Vec<InferredInterfaceMapping>,
+    pub metadata: InferenceMetadata,
+}
+```
+
+### `InferredConstantPattern`
+
+```rust
+// report.rs:890
+pub struct InferredConstantPattern {
+    pub match_regex: String,
+    pub replace: String,
+    pub hit_count: usize,
+    pub total_removed: usize,
+}
+```
+
+### `InferredInterfaceMapping`
+
+```rust
+// report.rs:902
+pub struct InferredInterfaceMapping {
+    pub old_name: String,
+    pub new_name: String,
+    pub confidence: String,          // "high", "medium", or "low"
+    pub reason: String,
+    pub member_overlap_ratio: f64,
+}
+```
+
+### `LlmApiChange`
+
+An API change detected by LLM file-level analysis.
+
+```rust
+// report.rs:918
+pub struct LlmApiChange {
+    pub file_path: String,
+    pub symbol: String,
+    pub change: String,
+    pub description: String,
+    pub removal_disposition: Option<RemovalDisposition>,
+}
+```
+
+### `InferenceMetadata`
+
+```rust
+// report.rs:929
+pub struct InferenceMetadata {
+    pub llm_calls: usize,
+    pub constant_hit_rate: f64,
+    pub interface_mappings_found: usize,
+}
+```
+
+### `AnalysisResult<L>`
+
+Results from the full analysis pipeline. Produced by the orchestrator,
+consumed by `Language::build_report()`. Not serialized to JSON output.
+
+```rust
+// report.rs:948
+pub struct AnalysisResult<L: Language> {
+    pub structural_changes: Arc<Vec<StructuralChange>>,
     pub behavioral_changes: Vec<BehavioralChange<L>>,
-
-    /// Manifest changes with language-specific change types.
     pub manifest_changes: Vec<ManifestChange<L>>,
-
-    /// Framework-specific analysis data.
-    /// TS: ComponentSummary, HierarchyDelta, CompositionPatternChange, etc.
-    /// Go: PackageSummary, InterfaceSatisfactionReport, etc.
-    pub data: L::ReportData,
+    pub llm_api_changes: Vec<LlmApiChange>,
+    pub old_surface: Arc<ApiSurface<L::SymbolData>>,
+    pub new_surface: Arc<ApiSurface<L::SymbolData>>,
+    pub inferred_rename_patterns: Option<InferredRenamePatterns>,
+    pub container_changes: Vec<(String, Vec<ContainerChange>)>,
+    pub extensions: L::AnalysisExtensions,
+    pub degradation: Arc<DegradationTracker>,
 }
 ```
 
 ---
 
-## BU Pipeline Types (Unchanged)
+## Module: `bu` (`crates/core/src/types/bu.rs`)
 
-These types are used internally by the bottom-up analysis pipeline. They are
-language-agnostic (the `BehaviorAnalyzer` trait works with function bodies as
-strings and produces generic specs).
+### `ChangedFunction`
+
+A function whose body changed between two git refs. Produced by
+`Language::parse_changed_functions()`.
 
 ```rust
+// bu.rs:26
 pub struct ChangedFunction {
     pub qualified_name: String,
     pub name: String,
     pub file: PathBuf,
-    pub line: usize,
+    pub line: usize,                     // Line number in NEW version (1-indexed)
     pub kind: SymbolKind,
     pub visibility: Visibility,
-    pub old_body: String,
-    pub new_body: String,
-    pub old_signature: String,
-    pub new_signature: String,
+    pub old_body: Option<String>,        // None if function was added -- NOT bare String
+    pub new_body: Option<String>,        // None if function was removed
+    pub old_signature: Option<String>,   // None if function was added
+    pub new_signature: Option<String>,   // None if function was removed
 }
+```
 
-pub struct FunctionSpec {
-    pub preconditions: Vec<Precondition>,
-    pub postconditions: Vec<Postcondition>,
-    pub error_behavior: Vec<ErrorBehavior>,
-    pub side_effects: Vec<SideEffect>,
-    pub notes: Vec<String>,
-}
+### `TestDiff`
 
-pub struct BreakingVerdict {
-    pub is_breaking: bool,
-    pub reasons: Vec<String>,
-    pub confidence: f64,
-}
+Diff of a test file between two refs. Uses text-based assertion detection.
 
+```rust
+// bu.rs:71
 pub struct TestDiff {
     pub test_file: PathBuf,
     pub removed_assertions: Vec<String>,
@@ -546,3 +793,317 @@ pub struct TestDiff {
     pub full_diff: String,
 }
 ```
+
+### `FunctionSpec`
+
+Inferred behavioral specification for a function. Template-constrained LLM
+output.
+
+```rust
+// bu.rs:102
+pub struct FunctionSpec {
+    pub preconditions: Vec<Precondition>,
+    pub postconditions: Vec<Postcondition>,
+    pub error_behavior: Vec<ErrorBehavior>,
+    pub side_effects: Vec<SideEffect>,
+    pub notes: Vec<String>,
+}
+```
+
+### `Precondition`
+
+```rust
+// bu.rs:127
+pub struct Precondition {
+    pub parameter: String,
+    pub condition: String,
+    pub on_violation: String,
+}
+```
+
+### `Postcondition`
+
+```rust
+// bu.rs:140
+pub struct Postcondition {
+    pub condition: String,
+    pub returns: String,
+}
+```
+
+### `ErrorBehavior`
+
+```rust
+// bu.rs:150
+pub struct ErrorBehavior {
+    pub trigger: String,
+    pub error_type: String,
+    pub message_pattern: Option<String>,
+}
+```
+
+### `SideEffect`
+
+```rust
+// bu.rs:163
+pub struct SideEffect {
+    pub target: String,
+    pub action: String,
+    pub condition: Option<String>,
+}
+```
+
+### `EvidenceType`
+
+How a behavioral change was detected. 4 variants.
+
+```rust
+// bu.rs:180
+pub enum EvidenceType {
+    TestDelta,
+    LlmAnalysis,
+    BodyAnalysis,
+    CallGraphPropagation,
+}
+```
+
+Serde: `#[serde(rename_all = "snake_case")]`.
+
+### `BehavioralBreak<L>`
+
+A detected behavioral breaking change. Produced by the BU pipeline.
+
+```rust
+// bu.rs:215
+pub struct BehavioralBreak<L: Language> {
+    pub symbol: String,                      // Affected PUBLIC symbol
+    pub caused_by: String,                   // Function that actually changed
+    pub call_path: Vec<String>,              // Call path from symbol to caused_by
+    pub evidence_description: String,
+    pub confidence: f64,                     // Bare f64 (unlike BehavioralChange)
+    pub description: String,
+    pub category: Option<L::Category>,
+    pub evidence_type: EvidenceType,         // Bare EvidenceType (unlike BehavioralChange)
+    pub is_internal_only: Option<bool>,
+}
+```
+
+### `BodyAnalysisResult`
+
+A single result from deterministic body analysis. Not serializable (no Serialize/Deserialize).
+
+```rust
+// bu.rs:263
+pub struct BodyAnalysisResult {
+    pub description: String,
+    pub category_label: Option<String>,
+    pub confidence: f64,
+}
+```
+
+### `Caller`
+
+A function that calls another (for call graph walking). Not serializable.
+
+```rust
+// bu.rs:273
+pub struct Caller {
+    pub qualified_name: String,
+    pub file: PathBuf,
+    pub line: usize,
+    pub visibility: Visibility,
+    pub body: String,
+    pub signature: String,
+}
+```
+
+### `Reference`
+
+A reference to a symbol found by cross-file search. Not serializable.
+
+```rust
+// bu.rs:296
+pub struct Reference {
+    pub file: PathBuf,
+    pub line: usize,
+    pub local_binding: String,
+    pub enclosing_symbol: Option<String>,
+}
+```
+
+### `TestFile`
+
+A test file associated with a source file. Not serializable.
+
+```rust
+// bu.rs:311
+pub struct TestFile {
+    pub path: PathBuf,
+    pub convention: TestConvention,
+}
+```
+
+### `TestConvention`
+
+How a test file is associated with its source file. Not serializable.
+
+```rust
+// bu.rs:322
+pub enum TestConvention {
+    DotTest,                // e.g., `foo.test.ts`
+    DotSpec,                // e.g., `foo.spec.ts`
+    TestsDir,               // e.g., `__tests__/foo.ts`
+    Suffix(String),         // e.g., Go `_test.go`
+    MirrorTree(String),     // e.g., Java `src/test/java/...`
+}
+```
+
+### `BreakingVerdict`
+
+Verdict from spec comparison.
+
+```rust
+// bu.rs:342
+pub struct BreakingVerdict {
+    pub is_breaking: bool,
+    pub reasons: Vec<String>,
+    pub confidence: f64,
+}
+```
+
+---
+
+## Module: `change_subject` (`crates/core/src/types/change_subject.rs`)
+
+### `ChangeSubject`
+
+What aspect of a symbol was affected by a change. Internally tagged with
+`#[serde(tag = "type", rename_all = "snake_case")]`. 10 variants.
+
+```rust
+// change_subject.rs:22
+pub enum ChangeSubject {
+    Symbol { kind: SymbolKind },
+    Member { name: String, kind: SymbolKind },
+    Parameter { name: String },
+    ReturnType,
+    Visibility,
+    Modifier { modifier: String },
+    TypeParameter { name: String },
+    BaseClass,
+    InterfaceImpl { interface_name: String },
+    UnionValue { value: String },
+}
+```
+
+---
+
+## Module: `envelope` (`crates/core/src/types/envelope.rs`)
+
+### `ReportEnvelope`
+
+Self-describing container for an analysis report. Language-agnostic fields
+are always accessible; `language_report` requires knowing the concrete
+`Language` to deserialize.
+
+```rust
+// envelope.rs:21
+pub struct ReportEnvelope {
+    pub language: String,                              // Matches L::NAME
+    pub version: String,                               // Tool version
+    pub summary: AnalysisSummary,
+    pub structural_changes: Vec<StructuralChange>,
+    pub language_report: serde_json::Value,             // Call .language_report::<L>() to deserialize
+}
+```
+
+### `AnalysisSummary`
+
+Aggregate statistics readable without language knowledge.
+
+```rust
+// envelope.rs:59
+pub struct AnalysisSummary {
+    pub total_structural_breaking: usize,
+    pub total_structural_non_breaking: usize,
+    pub total_behavioral_changes: usize,
+    pub total_manifest_changes: usize,
+    pub packages_analyzed: usize,
+    pub files_changed: usize,
+    pub by_change_type: ChangeTypeCounts,
+}
+```
+
+### `ChangeTypeCounts`
+
+Breakdown of structural changes by lifecycle type.
+
+```rust
+// envelope.rs:78
+pub struct ChangeTypeCounts {
+    pub added: usize,
+    pub removed: usize,
+    pub changed: usize,
+    pub renamed: usize,
+    pub relocated: usize,
+}
+```
+
+### `LanguageReport<L>`
+
+Language-specific section of the report.
+
+```rust
+// envelope.rs:91
+pub struct LanguageReport<L: Language> {
+    pub behavioral_changes: Vec<LanguageBehavioralChange<L>>,
+    pub manifest_changes: Vec<LanguageManifestChange<L>>,
+    pub data: L::ReportData,
+}
+```
+
+### `LanguageBehavioralChange<L>`
+
+A behavioral change with language-specific types. Used in the envelope layer.
+
+```rust
+// envelope.rs:105
+pub struct LanguageBehavioralChange<L: Language> {
+    pub symbol: String,
+    pub category: Option<L::Category>,
+    pub description: String,
+    pub confidence: f64,              // Bare f64 (unlike report::BehavioralChange)
+    pub evidence: L::Evidence,        // Language-typed evidence
+    pub is_internal_only: bool,       // Bare bool (unlike report::BehavioralChange)
+}
+```
+
+### `LanguageManifestChange<L>`
+
+A manifest change with language-specific types. Used in the envelope layer.
+
+```rust
+// envelope.rs:117
+pub struct LanguageManifestChange<L: Language> {
+    pub field: String,
+    pub change_type: L::ManifestChangeType,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub description: String,
+    pub is_breaking: bool,
+}
+```
+
+---
+
+## Re-exports (`crates/core/src/types/mod.rs`)
+
+```rust
+pub use bu::*;
+pub use change_subject::*;
+pub use envelope::*;
+pub use report::*;
+pub use surface::*;
+```
+
+All public types from all submodules are re-exported from `crates::core::types`.

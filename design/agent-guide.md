@@ -130,9 +130,11 @@ migration.rs)
    - DOM structure, ARIA, role, data attribute changes
    - CSS token usage, prop-style bindings
    - Portal usage, context dependencies
-   - Forward ref, memo, composition
+   - Forward ref, memo, composition, rendered component changes
    - Prop defaults, children slot path
    - Managed attribute overrides (prop-overrides-attribute)
+   - Attribute conditionality changes (unconditional to conditional rendering)
+   - Prop deprecation detection (`@deprecated` JSDoc)
 3. Build composition trees and conformance checks
 4. Extract CSS profiles for class/variable removal detection
 
@@ -194,6 +196,29 @@ Without this, renamed props with trivially-different generic parameters (e.g.,
 rename passes and are emitted as separate Removed + Added entries instead of
 a single Renamed.
 
+### SourceLevelCategory Variants
+
+The `SourceLevelCategory` enum in `crates/ts/src/sd_types.rs` defines all
+categories of source-level changes detected by the SD pipeline:
+
+| Variant | Description |
+|---------|-------------|
+| `DomStructure` | Root/wrapper element changed (e.g., div -> section) |
+| `AriaChange` | ARIA attribute added, removed, or changed |
+| `RoleChange` | `role` attribute added, removed, or changed |
+| `DataAttribute` | `data-*` attribute added, removed, or changed |
+| `CssToken` | CSS/BEM token added, removed, or changed |
+| `PropDefault` | Prop default value changed |
+| `PortalUsage` | `createPortal` usage added or removed |
+| `ContextDependency` | `useContext` dependency added, removed, or changed |
+| `Composition` | Component composition structure changed |
+| `ForwardRef` | `forwardRef` wrapper added or removed |
+| `Memo` | `memo` wrapper added or removed |
+| `RenderedComponent` | Rendered child component added or removed |
+| `PropAttributeOverride` | Prop overrides consumer-provided HTML attribute via helper function spread |
+| `AttributeConditionality` | Attribute rendering changed from unconditional to conditional (or vice versa) |
+| `PropDeprecated` | Prop marked as `@deprecated` in the new version's JSDoc |
+
 ### Source Profile Extraction
 
 Source profiles are extracted in `crates/ts/src/source_profile/`. Submodules:
@@ -220,25 +245,30 @@ from structural evidence.**
 
 | Step | Signal | Strength | Rationale |
 |------|--------|----------|-----------|
-| 1 | Internal rendering | Required | Component renders the child (JSX body + prop-default JSX) |
-| 1.5 | Delegate tree projection | Allowed | Wrapper family inherits edges from delegate family tree |
-| 2 | CSS direct-child `>` | Required* | Styles require exact parent-child DOM |
-| 3 | CSS grid parent-child | Required* | Layout breaks without grid container |
-| 3b | CSS implicit grid child | Required* | Same — grid layout dependency |
+| 1 | Internal rendering | `Wrapper` (unconditional) / `Allowed` (conditional) | Unconditional: parent always renders child (PMC=YES, CHP=NO). Conditional: rendering depends on props/state |
+| 1.5 | Delegate tree projection | Inherited from delegate edge | Wrapper family inherits the delegate edge's strength directly |
+| 2 | CSS direct-child `>` | `Structural` / `Allowed`* | Styles require exact parent-child DOM (CHP=YES, PMC=NO) |
+| 3 | CSS grid parent-child | `Structural` / `Allowed`* | Layout breaks without grid container (CHP=YES, PMC=NO) |
+| 3b | CSS implicit grid child | `Structural` / `Allowed`* | Same — grid layout dependency |
+| 3c | CSS display:contents re-parenting | `Structural` | Re-parents grid children through mode-switcher intermediaries |
 | 4 | CSS flex context | Allowed | Layout preference, not strict |
 | 5 | CSS descendant ` ` | Allowed | Works at any depth |
 | 5.5 | CSS layout children | Allowed | Shared CSS rule with flex-wrap/gap implies containment |
-| 6 | React context | Required | Null context = crash/broken behavior |
+| 6 | React context | `Structural` | Context dependency (CHP=YES, PMC=NO) — child needs provider but provider doesn't require specific consumers |
 | 7 | DOM nesting | Required | Invalid HTML without correct parent |
-| 8 | cloneElement | Structural | Child relies on injected props from parent (CHP=YES), but parent doesn't demand specific child (PMC=NO) |
-| 8 | cloneElement (ReactElement children) | Wrapper | Parent types `children` as `ReactElement` (purpose-built wrapper). PMC=YES, CHP=NO. |
+| 8 | cloneElement (ReactNode children) | `Structural` | Child relies on injected props from parent (CHP=YES), but parent doesn't demand specific child (PMC=NO) |
+| 8 | cloneElement (ReactElement children) | `Wrapper` | Parent types `children` as `ReactElement` (purpose-built wrapper). PMC=YES, CHP=NO. |
 | 8.5 | BEM element orphan fallback | Allowed | Orphan BEM elements connected to root as last resort |
-| 8.6 | Secondary BEM block sub-root | Structural | BEM element CSS classes are designed to be styled inside their block's container (CHP=YES, PMC=NO) |
+| 8.6 | Secondary BEM block sub-root | `Structural` | BEM element CSS classes are designed to be styled inside their block's container (CHP=YES, PMC=NO) |
 | 8.7 | Prop-passed detection | Allowed | ReactNode/ReactElement prop name matches child component name |
+| 8.8 | Bidirectional CHP cycle downgrade | Downgrades weaker direction to `Allowed` | When A->B and B->A both have CHP=YES, the weaker direction is downgraded — recursive nesting is optional |
+| 9.5 | Pure composition wrapper PMC upgrade | Combines with `Wrapper` | Pure layout containers (grid/DOM nesting, no Internal edges) gain PMC=YES on Structural edges |
+| 9.6 | Suppress root shortcuts | (removes edges) | Must run after Step 9.5; suppresses root->child edges when an intermediate parent exists |
 
-*Steps 2, 3, 3b use `Allowed` instead of `Required` when the child component
-equals the family root — this indicates recursive/self-nesting (e.g., DataList
-inside DataListContent, Menu inside MenuItem) which is optional, not required.
+*Steps 2, 3, 3b use `Allowed` instead of `Structural` when the child component
+equals the family root, the CSS element is ambiguous (maps to multiple
+components), or a reverse edge already exists — these indicate
+recursive/self-nesting or ambiguous CSS that is optional, not required.
 
 Step 1 detects JSX elements in **parameter destructuring defaults**
 (`({ bar = <Bar /> }) => ...`) and **variable destructuring defaults**
@@ -314,7 +344,8 @@ may differ when the dominant block wins by vote), Step 8.6:
 2. Finds the **sub-root**: the component mapping to element `""` (root) of
    that block with `has_children_prop` (e.g., ModalBox, TabContent).
 3. Connects orphan members whose `bem_block` matches the secondary block
-   to the sub-root via `Allowed` edges.
+   to the sub-root via `Structural` edges (CHP=YES, PMC=NO — BEM element
+   CSS classes are designed to be styled inside their block's container).
 After `collapse_internal_nodes`, if the sub-root is internal (non-exported),
 edges propagate to the family root (e.g., `ModalBox → ModalBody` becomes
 `Modal → ModalBody`).
@@ -422,7 +453,8 @@ parent requires the child to be present at all).
 | cloneElement prop injection | YES | NO (parent processes whatever children it has) |
 | `children` prop is `*required` | N/A | YES |
 | Docs say "not required"/"may omit" | N/A | NO |
-| Internal rendering | YES | YES |
+| Internal rendering (unconditional) | NO | YES (Wrapper) |
+| Internal rendering (conditional) | NO | NO (Allowed) |
 | CSS descendant ` ` (no `>`) | Weak (Allowed) | NO |
 | BEM CSS-only (no structural signal) | NO | NO |
 
@@ -441,8 +473,14 @@ is valid.
 (`children` is `*required` on Tabs and only accepts Tab components). Both
 `requiresChild` and `notParent` are correct.
 
-Collapsed edges (from `collapse_internal_nodes`) inherit the **stronger** of
-the two edges in the chain.
+Collapsed edges (from `collapse_internal_nodes`) use three-branch strength
+logic based on the outer edge (A -> internal):
+1. **Outer is Wrapper** (PMC=YES, CHP=NO): passthrough — inherit inner
+   edge's strength directly (the internal node is a transparent wrapper)
+2. **Outer is Allowed** (PMC=NO, CHP=NO): conditional — transitive edge
+   is always `Allowed` (the internal node may not be rendered)
+3. **Otherwise** (Structural or Required outer): use `collapse_chain()` —
+   CHP = inner.CHP AND outer.PMC, PMC = outer.PMC AND inner.PMC
 
 See the **Edge Ground Truth** section below for the complete two-dimensional
 classification of every non-internal edge verified against upstream PF6
@@ -550,6 +588,33 @@ Structural, so CardBody IS a valid direct child of Card.
 This suppression eliminates ~24 false rules across Card (3), DataList (3),
 DescriptionList (4), Menu (4), Nav (6), Page (1), Table (1), and
 DualListSelector (2).
+
+**Three-layer invalidDirectChild filtering:**
+
+The `generate_conformance_checks()` function in `sd_pipeline.rs` uses a
+three-layer filtering mechanism to eliminate false `invalidDirectChild` rules:
+
+1. **Back-edge filtering** -- Edges pointing upward or sideways in the BFS
+   depth tree (child depth <= parent depth) are skipped. These represent
+   optional recursive nesting (e.g., WizardNavItem -> WizardNav), not mandatory
+   containment constraints.
+
+2. **Allowed-edge exclusion** -- Only `Required` and `Structural` strength
+   edges generate conformance checks. `Allowed` edges from CSS descendant
+   selectors and flex context document valid placements but do not enforce
+   nesting.
+
+3. **CHP suppression at grandparent level** -- Before emitting an
+   `invalidDirectChild` rule, the generator checks whether the child
+   already has a CHP=YES edge (Required or Structural) to the grandparent.
+   If so, the rule is suppressed because the child IS a valid direct child
+   of that grandparent.
+
+The depth computation itself uses a three-pass BFS: Pass 1 follows non-Internal
+edges for consumer-facing depths, Pass 2 fills remaining nodes via Internal
+edges, and Pass 3 deepens children of Pass-2 nodes via Required edges to
+handle cases like WizardNav -> WizardNavItem where both were initially at the
+same depth.
 
 **Remaining edge accuracy issues:**
 
@@ -738,7 +803,9 @@ transitive edges reference nodes that haven't been collapsed yet, and
 removing all internal edges destroys the chain.
 
 Collapsed edges inherit:
-- The **stronger** `EdgeStrength` of the two edges in the chain
+- The `EdgeStrength` computed via three-branch logic (see above: Wrapper
+  outer = passthrough, Allowed outer = always Allowed, otherwise
+  `collapse_chain()`)
 - The child edge's `relationship` type
 - The child edge's `prop_name` (propagated through transitive edges)
 - The child edge's `"BEM element"` marker in `bem_evidence` (appended as
@@ -773,12 +840,15 @@ this:
    collisions (e.g., `labelGroup` from `label-group` appearing to be element
    `Group` of block `label`).
 
-2. **`infer_ownership_by_name_prefix()` in `composition/mod.rs`** — Uses strict
-   block equality (`child_block_lower == root_name_lower`). Only proceeds when
-   the child's dominant BEM block is the SAME as the root's name. Rejects all
-   cases where they differ, because BEM blocks are stored in camelCase
-   (`kebab_to_camel_case` at extraction time), making it impossible to
-   distinguish separate blocks from sub-elements by name alone.
+2. **Step 8.5 Guard 3 and Step 8.6 Guard 3 in `composition/mod.rs`** —
+   Step 8.5 Guard 3 (~line 969) checks `member_bem != root_block` — if a
+   member's BEM block differs from the root's block, it is skipped as an
+   independent component (e.g., LabelGroup has block `"labelGroup"` which
+   differs from Label's `"label"`). Step 8.6 Guard 3 (~line 1111) checks
+   `member_bem != sec_block` — for secondary BEM block sub-root fallback,
+   a member's BEM block must match the specific secondary block being
+   processed. Both guards use direct string equality on the BEM block
+   values from the source profile.
 
 **Known collision families** (upstream-verified as independent):
 - `label` vs `label-group` (Label / LabelGroup — LabelGroup CONTAINS Labels)
@@ -912,6 +982,17 @@ Git utilities: `find_deprecation_commits()`, `commit_co_changed_families()`
   in `crates/core/src/git.rs`
 Tests: `deprecated_replacements::tests` module (18 tests + 1 integration test)
 
+#### Prop Default Tracking Across Renames
+
+The SD pipeline tracks default prop value changes (`PropDefault` category in
+`SourceLevelCategory`) via `diff_prop_defaults()` in `source_profile/diff.rs`.
+When a deprecated component is renamed (e.g., Chip -> Label), the cross-component
+migration diff compares the old deprecated component's profile against the new
+replacement's profile. This means prop default changes between the deprecated
+and replacement components are detected and surfaced as `PropDefault`
+source-level changes with a `migration_from` field set, enabling rule
+generation that specifically targets the renamed component's changed defaults.
+
 ### Konveyor Rules
 
 - `crates/ts/src/konveyor.rs` — v1 rule generation (TD pipeline)
@@ -942,7 +1023,8 @@ catch-all since no per-value discrimination is possible.
 
 **Every generated rule must be idempotent — it must NOT fire on code that
 is already correct.** The `FrontendReferencedFields` struct (defined in
-`konveyor-core/src/rule.rs`, re-exported through `crates/konveyor-core/`)
+the external `konveyor-core` crate v0.0.5 dependency, re-exported through
+`crates/konveyor-core/src/lib.rs`)
 provides discriminator fields to scope rules precisely. Use them to avoid
 false positives on already-migrated code.
 
@@ -988,7 +1070,7 @@ Import-level rules fire on every file that imports the component, creating
 false positives on files that have already been migrated.
 
 Key files:
-- Struct definition: `konveyor-core/src/rule.rs` (`FrontendReferencedFields`)
+- Struct definition: external `konveyor-core` crate (re-exported via `crates/konveyor-core/src/lib.rs`)
 - New-sibling rule generation: `crates/ts/src/konveyor.rs` (search "new sibling")
 - Conformance rule generation: `crates/ts/src/konveyor_v2.rs`
   (`generate_conformance_rules`)
@@ -1067,19 +1149,20 @@ user sees must answer: What happened? Why? What can I do about it?**
 #### Three Layers
 
 1. **Fatal errors** — propagate via `anyhow::Result` with tips attached via
-   the `Diagnosed` wrapper. Rendered by `src/diagnostics.rs::render_error()`
+   the `DiagnosedError` wrapper. Rendered by `src/diagnostics.rs::render_error()`
    with colored output (red error, dimmed chain, cyan tips).
 2. **Non-fatal degradation** — recorded via `DegradationTracker` on
    `SharedFindings`, summarized at end of run with `print_degradation_summary()`.
 3. **Best-effort operations** — logged at `trace` level, return
    `None`/default (e.g., `read_git_file()` in `crates/ts/src/git_utils.rs`).
 
-#### ErrorTip Trait and Diagnosed Wrapper
+#### ErrorTip Trait and DiagnosedError Wrapper
 
 `ErrorTip` (in `crates/core/src/error.rs`) is the contract for errors that
-carry user-facing remediation tips. `Diagnosed` is a marker type that carries
-tips through the `anyhow` error chain. The CLI extracts tips via a single
-`downcast_ref::<Diagnosed>()` — no per-language-type dispatch needed.
+carry user-facing remediation tips. `DiagnosedError` is the wrapper type that
+carries tips through the `anyhow` error chain. The CLI extracts tips via a
+single `downcast_ref::<DiagnosedError>()` — no per-language-type dispatch
+needed.
 
 **When adding a new error type:**
 
@@ -1101,7 +1184,7 @@ tips through the `anyhow` error chain. The CLI extracts tips via a single
 - Return a bare `anyhow::bail!()` for errors caused by user input or
   environment issues — always attach a tip via `.with_diagnosis()` or
   `.diagnose()`
-- Add `downcast_ref` calls in the CLI's `extract_tip()` — the `Diagnosed`
+- Add `downcast_ref` calls in the CLI's `extract_tip()` — the `DiagnosedError`
   wrapper handles dispatch for all languages automatically
 - Use `eprintln!` directly for error output in production code — all
   user-facing errors flow through `render_error()` or
@@ -1127,7 +1210,7 @@ impl ErrorTip for GoBuildError {
     }
 }
 
-// At boundary — .diagnose() captures the tip into Diagnosed
+// At boundary — .diagnose() captures the tip into DiagnosedError
 fn extract(&self, repo: &Path, git_ref: &str) -> Result<ApiSurface> {
     let guard = WorktreeGuard::new(repo, git_ref, cmd).diagnose()?;
     // ...
@@ -1222,7 +1305,7 @@ previously 4+ copies across the codebase.
 The CLI renderer (`src/diagnostics.rs::render_error()`) handles all error
 formatting. It:
 
-1. Walks the `anyhow` chain for `Diagnosed` markers (single downcast)
+1. Walks the `anyhow` chain for `DiagnosedError` markers (single downcast)
 2. Renders colored output: red `error:`, dimmed `caused by:`, cyan `tip:`
 3. Falls back to pattern-matching on error text for undiagnosed errors
 
@@ -1234,7 +1317,7 @@ from `main()`.
 
 | File | Purpose |
 |------|---------|
-| `crates/core/src/error.rs` | `ErrorTip` trait, `Diagnosed` wrapper, `DiagnoseWithTip` / `DiagnoseExt` |
+| `crates/core/src/error.rs` | `ErrorTip` trait, `DiagnosedError` wrapper, `DiagnoseWithTip` / `DiagnoseExt` |
 | `crates/core/src/diagnostics.rs` | `DegradationTracker`, `DegradationIssue` |
 | `crates/core/src/shared.rs` | `SharedFindings::degradation()` accessor |
 | `crates/ts/src/worktree/error.rs` | `WorktreeError` + `ErrorTip` impl with tips for all variants |

@@ -22,16 +22,38 @@ Every edge in the tree must have structural evidence from one of 10 signals
 (8 structural + 2 fallback). Components with zero edges are dropped from the
 tree entirely — no "default to root" guessing.
 
-### EdgeStrength: Required vs Allowed
+### EdgeStrength: Four Variants (Two-Dimensional)
 
-Every `CompositionEdge` has a `strength` field:
+Every `CompositionEdge` has a `strength` field encoding two independent
+constraint dimensions:
 
-- **`Required`** — Rendering breaks without this nesting (CSS layout, context
-  null crash, invalid HTML, missing cloneElement props). Generates conformance
-  rules (`notParent` checks).
+- **CHP (child-must-have-parent)**: Does the child break outside the parent?
+- **PMC (parent-must-have-child)**: Does the parent need this child?
+
+| Strength | CHP | PMC | Rule types generated |
+|------------|-----|-----|------------------------------|
+| `Required` | YES | YES | `notParent` + `requiresChild` |
+| `Structural` | YES | NO | `notParent` only |
+| `Wrapper` | NO | YES | `requiresChild` only |
+| `Allowed` | NO | NO | Neither (regex inclusion only) |
+
+- **`Required`** — Both directions enforced. Rendering breaks without this
+  nesting AND parent is meaningless without the child. Generates both
+  `notParent` and `requiresChild` conformance rules.
+- **`Structural`** — Child must be inside this parent when used, but the parent
+  can exist without the child. CSS `>`, CSS grid, React context, DOM nesting
+  (non-container tags). Generates `notParent` rules only.
+- **`Wrapper`** — Parent must contain this child, but the child works
+  standalone. cloneElement with ReactElement children, unconditional internal
+  rendering. Generates `requiresChild` rules only.
 - **`Allowed`** — Valid placement documented in CSS descendant selectors or flex
   context heuristics, but not the only valid placement. Stays in the tree for
   migration guidance but produces zero conformance rules.
+
+Strengths are combined via `EdgeStrength::combine()` which ORs each dimension
+independently: if ANY signal says CHP=YES, the result has CHP=YES; if ANY
+signal says PMC=YES, the result has PMC=YES. For example,
+`Structural.combine(Wrapper) = Required`.
 
 This distinction is critical: a CSS descendant selector `.toolbar .group` proves
 that ToolbarGroup can appear somewhere inside Toolbar, but it doesn't prove
@@ -46,21 +68,25 @@ steps in order:
 
 | Step | Signal | Strength | What It Detects |
 |------|--------|----------|----------------|
-| 1 | Internal rendering | Required | Component A renders component B in its JSX (including prop-default JSX) |
-| 1.5 | Delegate tree projection | Allowed | Wrapper family inherits edges from delegate family's tree via `extends_props` |
-| 2 | CSS direct-child `>` | Required | `.block__A > .block__B` selector in CSS |
-| 3 | CSS grid parent-child | Required | A has `grid-template-*`, B has `grid-column`/`grid-row` |
-| 3b | CSS implicit grid child | Required | B is in same block as non-root grid container A, has no grid positioning |
+| 1 | Internal rendering | `Wrapper` (unconditional) / `Allowed` (conditional) | Component A renders component B in its JSX (including prop-default JSX). Unconditional = always rendered (PMC=YES). Conditional = may not render (PMC=NO, CHP=NO). |
+| 1.5 | Delegate tree projection | Inherited from delegate edge | Wrapper family inherits edges from delegate family's tree via `extends_props`. Each projected edge clones the delegate edge's strength (`edge.strength.clone()`). |
+| 2 | CSS direct-child `>` | `Structural` (normal) / `Allowed` (recursive, ambiguous, or has-reverse) | `.block__A > .block__B` selector in CSS. Downgraded to `Allowed` when child=root (recursive nesting), parent or child is ambiguous (multiple components share CSS element), or reverse edge already exists. |
+| 3 | CSS grid parent-child | `Structural` (normal) / `Allowed` (child=root or ambiguous) | A has `grid-template-*`, B has `grid-column`/`grid-row` |
+| 3b | CSS implicit grid child | `Structural` (normal) / `Allowed` (child=root or ambiguous) | B is in same block as non-root grid container A, has no grid positioning |
+| 3c | CSS display:contents re-parenting | `Structural` (grid-column-reverts) / `Allowed` (variable-child-refs) | Mode-switcher element (display:contents <-> flex) re-parents grid children with reverting grid-column and variable-ref children to the mode-switcher component instead of root |
 | 4 | CSS flex context | Allowed | Root is grid, A wraps children in flex, B has no grid positioning |
 | 5 | CSS descendant | Allowed | `.block__A .block__B` selector in CSS |
 | 5.5 | CSS layout children | Allowed | Shared CSS rule with flex-wrap/gap implies containment |
-| 6 | React context | Required | A provides XContext, B consumes XContext |
+| 6 | React context | `Structural` | A provides XContext, B consumes XContext (CHP=YES: child crashes without context, PMC=NO: parent can exist without consumers) |
 | 7 | DOM nesting | Required | A wraps children in `<ul>`, B renders `<li>` |
-| 8 | cloneElement | Structural | A uses `Children.map + cloneElement({ prop })`, B declares `prop` (CHP=YES, PMC=NO) |
+| 8 | cloneElement | `Wrapper` (ReactElement children) / `Structural` (ReactNode children) | A uses `Children.map + cloneElement({ prop })`, B declares `prop`. ReactElement children: parent is purpose-built wrapper (PMC=YES, CHP=NO). ReactNode children: generic container (CHP=YES, PMC=NO). |
 | 8.5 | BEM element orphan fallback | Allowed | Orphan BEM elements connected to root as last resort |
+| 8.8 | Bidirectional CHP cycle downgrade | Downgrades weaker direction to `Allowed` | When A->B and B->A both have CHP=YES (Required or Structural), the weaker direction (lower EdgeStrength ordinal) is downgraded to `Allowed`. Equal strengths use incoming-edge-count tiebreaker. |
+| 9.5 | Pure composition wrapper PMC upgrade | `Structural` -> `Required` (via combine with `Wrapper`) | Parents with no Internal edges AND structural evidence (CSS grid-template or pure container DOM tag like `<ul>`, `<table>`, `<dl>`) get PMC=YES added to their Structural DirectChild edges. |
+| 9.6 | Suppress root shortcuts | Removes edge | Root->grandchild edges are removed when an intermediate path exists through a non-root parent. Runs after Step 9.5 so Required wrappers are available. |
 
-After all steps: deduplicate, suppress root edges when intermediate exists,
-drop members with zero edges. Members with outgoing edges but no incoming
+After all steps: deduplicate (Step 9), suppress root shortcuts (Step 9.6),
+drop members with zero edges (Step 10). Members with outgoing edges but no incoming
 edges are retained as **secondary roots** — top-level containers within the
 family (e.g., JumpLinksList wraps `<ul>` containing JumpLinksItem `<li>`
 children, but nothing is above JumpLinksList in the hierarchy). Non-exported
@@ -166,8 +192,23 @@ The pipeline:
 ### Collapsed Edges
 
 `collapse_internal_nodes` removes non-exported internal components and creates
-transitive edges. Collapsed edges inherit the **stronger** strength of the two
-edges in the chain (`Required > Allowed`).
+transitive edges. The collapsed edge strength is computed with three-branch
+logic (not simply "the stronger strength"):
+
+1. **Outer is `Wrapper`** (PMC=YES, CHP=NO): The internal node is a
+   passthrough for `{children}` — it doesn't make rendering decisions, it
+   just wraps content. The transitive edge **inherits the inner edge's
+   strength directly**. The internal node is transparent.
+
+2. **Outer is `Allowed`** (PMC=NO, CHP=NO): The conditionality is real — the
+   internal node may not be rendered at all. The transitive edge is **always
+   `Allowed`** regardless of the inner edge's strength.
+
+3. **Outer is `Structural` or `Required`**: Falls back to the standard
+   `collapse_chain()` AND logic:
+   - CHP = inner.CHP AND outer.PMC (child must be inside intermediate AND
+     intermediate is guaranteed inside parent)
+   - PMC = outer.PMC AND inner.PMC (both links require parent-has-child)
 
 **Cycle detection**: The collapse loop tracks which internal nodes have been
 processed in a `collapsed_set`. When creating a transitive edge, if the target
@@ -340,7 +381,7 @@ contain Labels" (constraint on the parent, not the child). This requires a new
 
 | File | Purpose |
 |------|---------|
-| `crates/core/src/types/sd.rs` | `CompositionEdge`, `EdgeStrength`, `CompositionTree` types |
+| `crates/ts/src/sd_types.rs` | `CompositionEdge`, `EdgeStrength`, `CompositionTree` types |
 | `crates/ts/src/composition/mod.rs` | `build_composition_tree_v2` — the v2 builder |
 | `crates/ts/src/css_profile/mod.rs` | CSS profile extraction, `CssBlockProfile`, `CssElementInfo` |
 | `crates/ts/src/source_profile/mod.rs` | Source profile extraction (JSX walk, cloneElement detection, prop-default JSX) |

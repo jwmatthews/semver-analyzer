@@ -13,7 +13,7 @@ crates/ts/src/
   symbol_data.rs            TsSymbolData (rendered_components, css)
   report.rs                 build_report() -- groups changes, discovers child components
   extract/
-    mod.rs                  OxcExtractor -- multi-pass .d.ts API extraction (~2000 lines)
+    mod.rs                  OxcExtractor -- multi-pass .d.ts API extraction (~4100 lines)
   canon/
     mod.rs                  Type canonicalization (7 normalization rules, ~1600 lines)
   source_profile/
@@ -27,9 +27,9 @@ crates/ts/src/
     clone_element.rs        cloneElement prop injection detection
     react_api.rs            Portal, context, forwardRef, memo detection
   sd_pipeline.rs            Source-level diff pipeline orchestrator
-  sd_types.rs               All SD pipeline types (~50 structs/enums)
+  sd_types.rs               All SD pipeline types (~18 structs/enums)
   composition/
-    mod.rs                  build_composition_tree_v2() -- 10-step evidence-based tree builder
+    mod.rs                  build_composition_tree_v2() -- ~20-step evidence-based tree builder
   diff_parser/
     mod.rs                  Git diff -> ChangedFunction parser
   test_analyzer/
@@ -53,7 +53,7 @@ crates/ts/src/
   worktree/
     mod.rs                  Exports, RefBuildConfig
     guard.rs                WorktreeGuard RAII lifecycle
-    error.rs                WorktreeError (14 variants with tips)
+    error.rs                WorktreeError (16 variants with tips)
     tsc.rs                  TypeScript compilation (3 strategies)
     package_manager.rs      npm/yarn/pnpm detection
     nvm.rs                  Node.js version resolution via nvm
@@ -64,7 +64,9 @@ crates/ts/src/
 
 OXC-based multi-pass extraction from `.d.ts` files. This is the entry point for the TD pipeline.
 
-### 6 Extraction Phases
+### 7 Extraction Phases
+
+**Phase -1 (Reachability filtering)**: Before any extraction, filter the set of `.d.ts` files down to those reachable from package entry points (`index.d.ts`). Uses `filter_to_reachable()` which traces `export * from` re-export chains. Unreachable files are excluded from all subsequent phases. Also builds a provenance map recording which entry point exports each file.
 
 **Phase 0**: Scan `@types` packages for namespace declarations and `export as namespace` directives.
 
@@ -74,7 +76,7 @@ OXC-based multi-pass extraction from `.d.ts` files. This is the entry point for 
 
 **Phase 3**: Set package names from `package.json` files found in the directory tree.
 
-**Phase 4**: Set `import_path` from entry point provenance. BFS from `index.d.ts` through `export * from` re-export chains to determine which subpath export each symbol belongs to. Files unreachable from any entry point are filtered out (non-public API).
+**Phase 4**: Set `import_path` via `set_import_paths()` using the provenance map built in Phase -1. Each symbol's import path is derived from which subpath export its file belongs to. This does not filter symbols (filtering happened in Phase -1).
 
 **Phase 5**: Populate `rendered_components` and CSS tokens. For each `.d.ts` symbol, find the matching `.tsx` source file, parse its JSX, and extract: (a) rendered component names from JSX elements, (b) `styles.xxx` CSS token references.
 
@@ -122,10 +124,29 @@ When a package has multiple dist variants (ESM, CJS, etc.), the extractor keeps 
 | `deprecated_props` | Props with `@deprecated` JSDoc |
 | `clone_element_injections` | `Children.map + cloneElement` patterns |
 | `managed_attributes` | Prop-to-HTML-attribute overrides |
+| `has_children_prop` | Whether the component accepts `children` at all |
+| `children_slot_detail` | Enhanced children slot path with CSS token info per wrapper element |
 
 ### Profile Diffing (`source_profile/diff.rs`)
 
 `diff_profiles()` compares old and new profiles across 17 dimensions, producing `SourceLevelChange` entries with categories like `DomStructure`, `AriaChange`, `CssToken`, `PropDefault`, `Composition`, etc.
+
+## SD Pipeline (`sd_pipeline.rs`)
+
+The pipeline orchestrator runs phases in an interleaved order (not grouped by letter). The execution order is:
+
+**A** -> **B** -> **A.5** -> **B.5** -> **B.5b** -> **B.5c** -> **A.7a** -> **A.7b** -> **B1** -> **B3**
+
+- **A**: For each changed component file, extract profiles at both refs and diff them.
+- **B**: Extract source profiles for ALL components at the to-ref (full extraction, not just changed files). Does NOT build composition trees — that happens in B1.
+- **A.5**: Deprecated migration diffing — diff deprecated components against their non-deprecated replacements (detected via `deprecated_replacements.rs`). Runs after B because it needs the full `new_profiles` map.
+- **B.5**: Extends resolution — enrich `all_props` from inherited interfaces (`extends_props`). Needed before transitive analysis so delegating components have complete prop lists.
+- **B.5b**: Enrich `overridden_attributes` from helper function source — resolve managed attribute bindings that delegate to external helper functions by parsing those functions' source.
+- **B.5c**: Re-diff `PropAttributeOverride` with enriched profiles — Phase A emitted `PropAttributeOverride` changes before B.5b enrichment, so re-diff with the now-complete `overridden_attributes`.
+- **A.7a**: Transitive behavioral change detection — detect changes in managed attribute helper functions that propagate to all components importing them. Runs after B.5 enrichment so `all_props` includes inherited props.
+- **A.7b**: Transitive rendered-component change propagation — propagate source-level changes (DOM structure, ARIA, CSS token, etc.) through `rendered_components` chains.
+- **B1**: Build composition trees per family (dependency-aware, ~20-step signal algorithm via `build_composition_tree_v2()`).
+- **B3**: Composition diff + conformance checks — diff old vs new composition trees for changed families, generate conformance checks from all trees.
 
 ## Composition Tree Builder (`composition/mod.rs`)
 
@@ -138,7 +159,7 @@ The core algorithm for inferring React component hierarchy relationships.
 - CSS profiles (`CssBlockProfile` per BEM block)
 - Delegate contexts (for wrapper families that wrap another family)
 
-### 10 Signal Steps
+### ~20 Signal Steps
 
 Each step can add edges or strengthen existing ones. Multiple signals for the same edge are combined via `EdgeStrength::combine()`.
 
@@ -148,45 +169,65 @@ Each step can add edges or strengthen existing ones. Multiple signals for the sa
 | 1.5 | Delegate projection | Wrapper family inherits delegate family edges |
 | 2 | CSS direct-child | `.parent > .child` selectors |
 | 3 | CSS grid | `grid-template` on parent, `grid-column` on child |
+| 3b | Implicit grid children | Elements inside non-root grid containers that lack explicit `grid-column` |
+| 3c | Re-parent through `display:contents` | Intermediaries with `display:contents` act as transparent wrappers; their children are re-parented to the actual layout ancestor |
 | 4 | CSS flex | `display: flex` on parent |
 | 5 | CSS descendant | `.parent .child` descendant selectors |
 | 5.5 | CSS layout | Shared flex-wrap/gap rules |
 | 6 | Context | Provider/consumer React context relationships |
 | 7 | DOM nesting | HTML semantic nesting (`<ul>` -> `<li>`, `<table>` -> `<tr>`) |
 | 8 | cloneElement | `Children.map + cloneElement` prop threading |
-| 8.5-8.7 | BEM/prop cleanup | Orphan fallback, secondary blocks, prop-passed detection |
-| 9 | Intermediate suppression | Remove root->leaf when root->mid->leaf exists |
+| 8.5 | BEM element orphan fallback | Connect orphan members whose BEM element matches the root's BEM block |
+| 8.6 | Secondary BEM block sub-root | Re-run orphan logic using secondary BEM block owners as sub-roots |
+| 8.7 | Prop-passed detection | Detect components passed via ReactNode/ReactElement props |
+| 8.8 | Downgrade bidirectional CHP cycles | When two components each claim CHP on the other, downgrade the weaker edge to Allowed |
+| 9 | Dedup | `deduplicate_edges()` — remove duplicate edges between the same pair |
+| 9.5 | Pure composition wrapper PMC upgrade | Upgrade edges to wrappers that exist solely to compose children |
+| 9.6 | Suppress root shortcuts | Remove root->leaf when root->mid->leaf exists (runs after 9.5 so Required wrappers are respected) |
 | 10 | Prune disconnected | Remove members with no edges |
 
 ### EdgeStrength Collapse
 
-`collapse_chain()` determines the effective strength of a chain A -> B -> C:
-- If the intermediate edge (A -> B) is `Required` or `Structural`, the transitive edge (A -> C) inherits the child's CHP requirement
-- Used in step 9 to decide whether to suppress direct edges
+`collapse_chain()` determines the effective strength of a transitive chain A -> B -> C, where `self` is the outer edge (A -> B) and `child_edge` is the inner edge (B -> C):
+- **CHP** (C must be inside A) = `inner.CHP AND outer.PMC` — the child must need its intermediate parent AND the intermediate must be guaranteed present (parent always renders it)
+- **PMC** (A must contain C) = `outer.PMC AND inner.PMC` — both links must say "parent requires child"
+- Used in step 9.6 to decide whether to suppress direct root->leaf edges
 
 ## Konveyor Rule Generation
 
 ### TD Rules (`konveyor.rs`)
 
-Generated from `AnalysisReport<TypeScript>`:
+Generated from `AnalysisReport<TypeScript>` via `generate_rules()`. Covers structural API changes detected by the top-down pipeline:
 - Component renamed/removed/relocated rules
 - Prop removed/type-changed/renamed rules
 - Signature changed rules
 - Import path change rules
 - Manifest change rules
+- CSS variable prefix change rules
 
 ### SD Rules (`konveyor_v2.rs`)
 
-Generated from `SdPipelineResult`:
-- Composition change rules (new required children, prop-to-child migrations)
-- Conformance rules (notParent, invalidDirectChild, requiresChild, exclusiveWrapper)
-- Context dependency rules
-- Deprecated migration rules
-- Required prop added rules
-- Test impact rules
-- Portal prop rules
-- CSS token/class change rules
-- Deprecated prop rules
+Generated from `SdPipelineResult` via `generate_sd_rules()`. Contains 17 generator functions:
+
+| Generator | What It Produces |
+|-----------|-----------------|
+| `generate_composition_change_rules` | New required children, prop-to-child migrations |
+| `generate_conformance_rules` | `notParent`, `invalidDirectChild`, `requiresChild`, `exclusiveWrapper` |
+| `generate_context_rules` | Context dependency changes |
+| `generate_prop_child_migration_rules` | Props migrated to child component slots |
+| `generate_cross_family_child_to_prop_rules` | Cross-family child-to-prop migrations |
+| `generate_deprecated_migration_rules` | Deprecated-to-replacement migration guidance |
+| `generate_prop_value_conformance_rules` | Prop value constraints from conformance checks |
+| `generate_required_prop_added_rules` | Newly required props |
+| `generate_test_impact_rules` | Test selector/assertion changes |
+| `generate_portal_prop_rules` | Portal target prop changes |
+| `generate_composition_inversion_rules` | Parent/child relationship inversions |
+| `generate_prop_attribute_override_rules` | Managed HTML attribute override changes |
+| `generate_deprecated_prop_rules` | Newly deprecated props |
+| `generate_css_class_removal_rules` | Removed CSS BEM blocks |
+| `generate_removed_css_file_rules` | Entirely removed CSS files |
+| `generate_dead_css_class_rules` | CSS classes no longer referenced by any component |
+| `generate_enumerated_css_class_rules` | Enumerated CSS class value changes |
 
 ## Deprecated Replacement Detection (`deprecated_replacements.rs`)
 
@@ -207,4 +248,4 @@ RAII lifecycle for git worktrees:
 5. Run `tsc --declaration` (3 strategies: root tsconfig, solution tsconfig with `--build`, per-package)
 6. On drop: `git worktree remove`
 
-`WorktreeError` has 14 variants, each with a user-facing tip via the `ErrorTip` trait.
+`WorktreeError` has 16 variants, each with a user-facing tip via the `ErrorTip` trait.

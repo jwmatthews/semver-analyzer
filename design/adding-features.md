@@ -42,30 +42,31 @@ The diff engine uses `StructuralChangeType` with 5 lifecycle variants and `Chang
 ## Adding a New Source-Level Category (TypeScript)
 
 1. Add variant to `SourceLevelCategory` in `crates/ts/src/sd_types.rs`
-2. Add detection logic in the appropriate `source_profile/` module
-3. Add diff logic in `source_profile/diff.rs` `diff_profiles()` function
-4. Add Konveyor rule generation in `konveyor_v2.rs` if the change should produce rules
-5. Add test assertions in `crates/ts/tests/baseline_behavioral.rs`
+2. Add a corresponding handler in `source_profile/diff.rs` (called from `diff_profiles()`)
+3. Add detection/extraction logic in the appropriate `source_profile/` module if the profile needs new fields
+4. Add a Konveyor v2 rule generator in `konveyor_v2.rs` (called from `generate_sd_rules()`) if the change should produce migration rules
+5. Wire the new detection into `sd_pipeline.rs` if it requires pipeline-level orchestration beyond profile diffing
+6. Add test assertions in `crates/ts/tests/baseline_behavioral.rs`
 
 ## Adding a New Source-Level Category (Java)
 
 1. Add variant to `JavaSourceCategory` in `crates/java/src/sd_types.rs`
-2. Add profile fields to `JavaClassProfile` or `MethodProfile` if needed
-3. Add extraction logic in `sd_pipeline.rs` profile extraction
+2. Add profile fields to `JavaClassProfile` or `MethodProfile` in `sd_types.rs` if the detection requires new extracted data
+3. Add extraction logic in `sd_pipeline.rs` profile extraction (the `extract_class_profile()` / `extract_method_profile()` functions)
 4. Add diff logic in `sd_pipeline.rs` `diff_class_profiles()` or `diff_method_profiles()`
-5. Add Konveyor rule generation in `konveyor.rs` `generate_sd_rules()`
-6. Add test in `crates/java/tests/baseline_sd.rs`
+5. Add Konveyor rule generation in `konveyor.rs` `generate_sd_rules()` to produce migration rules from the new category
+6. Add test in `crates/java/tests/baseline_sd.rs` with snapshot assertions
 
 ## Adding a New Composition Tree Signal (TypeScript)
 
-The composition tree builder (`crates/ts/src/composition/mod.rs`) has 10 numbered signal steps. To add a new signal:
+The composition tree builder (`crates/ts/src/composition/mod.rs`) has ~20 distinct signal steps (1, 1.5, 2, 3, 3b, 3c, 4, 5, 5.5, 6, 7, 8, 8.5, 8.6, 8.7, 8.8, 9, 9.5, 9.6, 10). To add a new signal:
 
 1. Identify where in the pipeline your signal should run (ordering matters -- earlier signals can be refined by later ones)
 2. Add your signal step after the appropriate existing step
 3. Your step should add or strengthen `CompositionEdge` entries in the edges collection
 4. Use `EdgeStrength::combine()` when strengthening an existing edge
 5. Add unit tests
-6. Validate against the PatternFly ground truth in `AGENTS.md` (78 known-correct edges)
+6. Validate against the PatternFly ground truth in `design/composition-ground-truth.md` (78 known-correct edges)
 
 ### EdgeStrength Selection Guide
 
@@ -77,6 +78,12 @@ The composition tree builder (`crates/ts/src/composition/mod.rs`) has 10 numbere
 | `Allowed` | Valid nesting but neither side strictly requires the other |
 
 ## Adding a New Konveyor Rule Type
+
+**v1 vs v2 split:** TypeScript Konveyor rule generation is split across two files:
+- `crates/ts/src/konveyor.rs` (v1) -- generates rules from **TD pipeline** results (structural API diff): removed/renamed symbols, type changes, removed union values, new-sibling rules, import-deprecated rules. Operates on `AnalysisReport<TypeScript>`.
+- `crates/ts/src/konveyor_v2.rs` (v2) -- generates rules from **SD pipeline** results: composition changes, conformance checks, context dependencies, prop-to-child migration, test impact, CSS removal, prop-attribute-override. Operates on `SdPipelineResult`.
+
+Some rules also require orchestration in `src/main.rs` where both TD and SD results are available (e.g., family strategy rules that combine structural changes with composition trees).
 
 ### For TypeScript SD rules (`crates/ts/src/konveyor_v2.rs`)
 
@@ -97,15 +104,20 @@ The composition tree builder (`crates/ts/src/composition/mod.rs`) has 10 numbere
 This is the largest possible change. Follow the `Language` trait contract:
 
 1. **Create new crate**: `crates/your_lang/` with `Cargo.toml`, `src/lib.rs`
-2. **Define symbol data**: `YourLangSymbolData` struct
-3. **Define associated types**: Category, ManifestChangeType, Evidence, ReportData, AnalysisExtensions
-4. **Implement extraction**: `extract()` method that produces `ApiSurface<YourLangSymbolData>`
-5. **Implement `LanguageSemantics`**: At minimum, `is_member_addition_breaking()`, `same_family()`, `visibility_rank()`
-6. **Implement `MessageFormatter`**: `describe()` for human-readable change descriptions
-7. **Implement remaining `Language` methods**: diff parsing, test discovery, manifest diffing, report building
-8. **Add CLI subcommand**: In `src/cli/mod.rs` and `src/main.rs`
-9. **Add Konveyor rule generation**: language-specific rule builder
-10. **Add to workspace**: In root `Cargo.toml`, behind a feature flag
+2. **Define the 6 associated types** on the `Language` trait:
+   - `SymbolData` — per-symbol metadata (e.g., `YourLangSymbolData` struct)
+   - `Category` — behavioral change categories
+   - `ManifestChangeType` — package manifest change types
+   - `Evidence` — evidence data for behavioral changes
+   - `ReportData` — language-specific report data
+   - `AnalysisExtensions` — pipeline extensions (e.g., SD results)
+3. **Implement extraction**: `extract()` method that produces `ApiSurface<YourLangSymbolData>`
+4. **Implement `LanguageSemantics`**: At minimum, `is_member_addition_breaking()`, `same_family()`, `visibility_rank()`
+5. **Implement `MessageFormatter`**: `describe()` for human-readable change descriptions
+6. **Implement remaining `Language` methods**: diff parsing, test discovery, manifest diffing, report building
+7. **Add CLI subcommand**: In `src/cli/mod.rs` and `src/main.rs`
+8. **Add Konveyor rule generation**: language-specific rule builder
+9. **Add to workspace**: In root `Cargo.toml`, behind a feature flag
 
 Reference: `crates/java/` is a good model (simpler than TypeScript, covers all the required trait methods).
 

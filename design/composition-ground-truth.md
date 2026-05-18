@@ -120,7 +120,16 @@ two constraint dimensions (CHP = child-must-have-parent, PMC =
 parent-must-have-child), verified against upstream PF6 documentation at
 v6.4.1. This is the definitive reference for conformance rule correctness.
 
-### Category A: Both Required (CHP=YES, PMC=YES) — 33 edges
+### Category-to-EdgeStrength Mapping
+
+| Category | EdgeStrength Variant | CHP | PMC |
+|----------|---------------------|-----|-----|
+| A | `Required` | YES | YES |
+| B | `Structural` | YES | NO |
+| C | `Wrapper` | NO | YES |
+| D | `Allowed` | NO | NO |
+
+### Category A: Both Required (CHP=YES, PMC=YES) — `Required` — 33 edges
 
 Both `notParent` and `requiresChild` rules are valid for these edges.
 All edges verified as `required` strength in the actual composition tree.
@@ -165,7 +174,7 @@ real defect; which specific child satisfies it is flexible.
 | Wizard | WizardNav | WizardNavItem | CSS + nav purpose |
 | deprecated/Wizard | WizardNav | WizardNavItem | Same as v6 |
 
-### Category B: CHP-only (CHP=YES, PMC=NO) — 32 edges
+### Category B: CHP-only (CHP=YES, PMC=NO) — `Structural` — 32 edges
 
 Only `notParent` is valid. `requiresChild` is **wrong** for these edges.
 The child must be inside the parent IF used, but the parent does NOT
@@ -178,13 +187,13 @@ require the child.
 | Card | Card | CardTitle | CSS `>` | PF docs: "may omit these components" |
 | Card | Card | CardBody | CSS `>` | PF docs: "recommended" but not required |
 | Card | Card | CardFooter | CSS `>` | PF docs: "may omit these components" |
-| ChartBullet | ChartBullet | ChartBulletComparativeErrorMeasure | Prop-passed | Internally rendered by default; prop is optional customization |
-| ChartBullet | ChartBullet | ChartBulletComparativeWarningMeasure | Prop-passed | Same |
-| ChartBullet | ChartBullet | ChartBulletGroupTitle | Prop-passed | Same |
-| ChartBullet | ChartBullet | ChartBulletPrimaryDotMeasure | Prop-passed | Same |
-| ChartBullet | ChartBullet | ChartBulletPrimarySegmentedMeasure | Prop-passed | Same |
-| ChartBullet | ChartBullet | ChartBulletQualitativeRange | Prop-passed | Same |
-| ChartBullet | ChartBullet | ChartBulletTitle | Prop-passed | Same |
+| ChartBullet | ChartBullet | ChartBulletComparativeErrorMeasure | Prop-passed | Internally rendered by default; prop is optional customization. **Note:** code currently produces `Wrapper` strength (wrong); should be `Structural` per this ground truth. No impact: rule gen filters prop-passed edges from PMC maps. |
+| ChartBullet | ChartBullet | ChartBulletComparativeWarningMeasure | Prop-passed | Same as above |
+| ChartBullet | ChartBullet | ChartBulletGroupTitle | Prop-passed | Same as above |
+| ChartBullet | ChartBullet | ChartBulletPrimaryDotMeasure | Prop-passed | Same as above |
+| ChartBullet | ChartBullet | ChartBulletPrimarySegmentedMeasure | Prop-passed | Same as above |
+| ChartBullet | ChartBullet | ChartBulletQualitativeRange | Prop-passed | Same as above |
+| ChartBullet | ChartBullet | ChartBulletTitle | Prop-passed | Same as above |
 | DataList | DataListItem | DataListItemCells | cloneElement + CSS `>` | Cells are common but not sole child type |
 | DataList | DataListItem | DataListItemRow | cloneElement + CSS `>` | Row is primary child but item has other children |
 | DataList | DataListItem | DataListToggle | CSS context | Only for expandable items |
@@ -206,7 +215,7 @@ require the child.
 | Tabs | Tab | TabAction | Prop-passed (`actions`) | Actions are optional on Tab |
 | ToggleGroup | ToggleGroup | ToggleGroupItem | CSS layout | Empty group is valid DOM |
 
-### Category C: PMC-only (CHP=NO, PMC=YES) — 1 edge
+### Category C: PMC-only (CHP=NO, PMC=YES) — `Wrapper` — 1 edge
 
 Only `requiresChild` is valid. `notParent` is wrong.
 
@@ -214,7 +223,7 @@ Only `requiresChild` is valid. `notParent` is wrong.
 |--------|--------|-------|--------|------------|
 | ChartDonutUtilization | ChartDonutThreshold | ChartDonutUtilization | JSX children | ChartDonutUtilization works standalone |
 
-### Category D: Both Allowed (CHP=NO, PMC=NO) — 12 edges
+### Category D: Both Allowed (CHP=NO, PMC=NO) — `Allowed` — 12 edges
 
 These edges have `allowed` strength in the tree. No conformance rules
 are generated. Some represent tree accuracy gaps where the edge SHOULD
@@ -273,7 +282,7 @@ the child and the wrong parent because it supports recursive nesting
 
 | Family | Rule | Status | Fix |
 |--------|------|--------|-----|
-| ChartBullet | ChartBullet must contain ChartBulletComparativeErrorMeasure (+ 6 more) | Not emitted — prop_passed edges are excluded from PMC maps in conformance rule generation | Edge strength is still Wrapper (wrong) but rule gen filters it correctly |
+| ChartBullet | ChartBullet must contain ChartBulletComparativeErrorMeasure (+ 6 more) | Not emitted — prop_passed edges are excluded from PMC maps in conformance rule generation | Code produces `Wrapper` strength (should be `Structural` per Cat B ground truth) but rule gen filters it correctly |
 | DescriptionList | DescriptionList must contain DescriptionListTerm | FIXED — Step 9.6 suppresses DOM shortcut edges | — |
 | DescriptionList | DescriptionList must contain DescriptionListTermHelpText | FIXED — same | — |
 

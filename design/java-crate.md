@@ -11,7 +11,7 @@ crates/java/src/
   cli.rs                  Java-specific CLI args
   types.rs                JavaSymbolData, JavaAnnotation, JavaCategory, etc.
   extensions.rs           JavaAnalysisExtensions wrapper
-  sd_types.rs             JavaClassProfile, JavaSourceChange, 22 categories
+  sd_types.rs             JavaClassProfile, JavaSourceChange, 23 categories
   sd_pipeline.rs          Java source-level diff pipeline
   report.rs               build_report() for Java
   extract/
@@ -53,7 +53,9 @@ Detects changes in Java-specific modifiers and metadata:
 - `synchronized`, `transient`, `volatile`, `native` modifier changes
 - `permits` clause changes
 
-Annotation removal breaking rules: `@Bean`, `@Service`, `@Component`, `@Repository`, `@Controller`, `@RestController`, `@Autowired`, `@Inject`, `@Override`, `@FunctionalInterface`, `@Deprecated`, `@Nullable`, `@NonNull`, `@NotNull` are considered breaking when removed.
+Annotation removal breaking rules: `@Bean`, `@Component`, `@Service`, `@Repository`, `@Controller`, `@RestController`, `@Configuration`, `@ConfigurationProperties`, `@Autowired`, `@ConditionalOnClass`, `@ConditionalOnMissingBean`, `@ConditionalOnProperty` are considered breaking when removed.
+
+Annotation attribute change breaking rules: `@ConfigurationProperties`, `@RequestMapping`, `@GetMapping`, `@PostMapping`, `@PutMapping`, `@DeleteMapping`, `@PatchMapping`, `@ConditionalOnProperty`, `@ConditionalOnClass` are considered breaking when attributes change.
 
 ## JavaSymbolData
 
@@ -80,7 +82,7 @@ JavaSymbolData
 Uses tree-sitter for Java source parsing (not compiled output like TS).
 
 ### Process
-1. Recursively find `.java` files (skips `target/`, `build/`, `test/`, `generated/`)
+1. Recursively find `.java` files (skips `target/`, `build/`, `generated/`, `generated-sources/`, `node_modules/`, `src/test/`, `test/` (unless under a `/java/` path), `tests/` (unless under a `/java/` path))
 2. For each file: parse with tree-sitter, extract package declaration and imports
 3. Walk top-level type declarations: classes, interfaces, enums, records, annotation types
 4. Extract members: methods, constructors, fields, annotation elements, nested types
@@ -112,7 +114,7 @@ Uses tree-sitter for Java source parsing (not compiled output like TS).
 - Compare `module-info.java` directives between refs
 - Track exports, requires, opens, provides changes
 
-### 22 Source-Level Change Categories
+### 23 Source-Level Change Categories
 
 `AnnotationRemoved`, `AnnotationAdded`, `AnnotationChanged`, `DelegationChanged`, `ExceptionAdded`, `ExceptionRemoved`, `SynchronizationRemoved`, `SynchronizationAdded`, `SerializationFieldAdded`, `SerializationFieldRemoved`, `SerializationFieldTypeChanged`, `TransientChanged`, `OverrideRemoved`, `OverrideAdded`, `ConstructorDependencyChanged`, `ModuleExportRemoved`, `ModuleExportAdded`, `ModuleRequiresChanged`, `FinalAdded`, `FinalRemoved`, `SealedChanged`, `InheritanceChanged`, `NativeRemoved`
 
@@ -135,7 +137,7 @@ Regex-based extraction of dependency declarations. Less precise than POM parsing
 ```
 JavaIndex
   types_by_name: HashMap<String, Vec<TypeInfo>>
-  imports_by_file: HashMap<PathBuf, ImportMap>
+  imports_by_file: HashMap<PathBuf, HashMap<String, String>>
   packages_by_file: HashMap<PathBuf, String>
   methods_by_name: HashMap<String, Vec<MethodInfo>>
 ```
@@ -147,17 +149,29 @@ JavaIndex
 ### TD Rules
 Generated from `AnalysisReport<Java>`:
 - Class/interface renamed, removed, relocated
-- Method signature changed, return type changed
+- Method return type changed (`TypeChanged`)
+- Method signature changed (`SignatureChanged`)
+- Visibility narrowed (`VisibilityChanged`)
 - Annotation removed (breaking ones only)
-- Dependency changes
+- Dependency changes (from manifest diff)
 
 ### SD Rules
-From `JavaSdPipelineResult`:
-- Annotation removed/changed rules
-- Synchronized removed rules
-- Module export/requires changed rules
-- Exception added rules
-- Final/sealed changed rules
+From `JavaSdPipelineResult` (only breaking changes generate rules):
+- `AnnotationRemoved` — annotation removal rules
+- `AnnotationChanged` — annotation attribute change rules
+- `SynchronizationRemoved` — synchronized modifier removal rules
+- `ExceptionAdded` — new checked exception rules
+- `SerializationFieldRemoved` — serializable field removal rules
+- `SerializationFieldTypeChanged` — serializable field type change rules
+- `TransientChanged` — transient modifier change rules
+- `OverrideRemoved` — override method removal rules
+- `ConstructorDependencyChanged` — constructor parameter change rules
+- `FinalAdded` — class became final rules
+- `SealedChanged` — sealed modifier change rules
+- `InheritanceChanged` — extends/implements change rules
+- `NativeRemoved` — native modifier removal rules
+- `DelegationChanged` — method delegation change rules
+- `ModuleExportRemoved` — module export removal rules
 
 ### Namespace Migration Rules
 Parse `"old.ns=new.ns"` or `"old.ns=new.ns@group:artifact:version"` format. Generate import relocation rules with optional dependency addition rules. Common use case: `javax.servlet=jakarta.servlet@jakarta.servlet:jakarta.servlet-api:6.0.0`
@@ -185,6 +199,22 @@ Checks suffixes: `Test`, `Tests`, `IT`, `ITCase`, `Spec`; and prefix: `Test`.
 
 ### Assertion Detection
 Matches patterns from: JUnit 4/5 (`assertEquals`, `assertThrows`), AssertJ (`assertThat`), Hamcrest (`assertThat` + matchers), TestNG, Mockito (`verify`, `when`), Google Truth (`assertThat` + `Truth`).
+
+## Test Infrastructure
+
+Integration tests live in `crates/java/tests/` with `insta` snapshot assertions:
+
+```
+crates/java/tests/
+  baseline_diff.rs       TD pipeline baseline tests (class add/remove/rename/relocate, method changes, annotations, throws, modifiers)
+  baseline_konveyor.rs   Konveyor rule generation tests (TD rules, SD rules, custom config)
+  baseline_manifest.rs   Manifest diffing tests (POM and Gradle dependency/version/parent changes)
+  baseline_sd.rs         SD pipeline tests (annotation, delegation, serialization, synchronized, sealed, final, override, constructor changes)
+  helpers.rs             Shared test fixtures and helper functions
+  snapshots/             42 insta snapshot files (.snap)
+```
+
+All snapshot tests use `insta::assert_yaml_snapshot!` for deterministic output verification.
 
 ## Diff Parser (`diff_parser/mod.rs`)
 

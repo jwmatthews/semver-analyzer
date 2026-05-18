@@ -4,17 +4,18 @@
 
 | Location | Type | Count | What It Tests |
 |----------|------|-------|---------------|
-| `crates/core/src/diff/tests.rs` | Unit | ~40 | Diff engine: all change types, renames, relocations, migrations |
-| `crates/ts/tests/baseline_diff.rs` | Integration | 51 | TypeScript structural diff with TS semantics |
-| `crates/ts/tests/baseline_manifest.rs` | Integration | 18 | package.json diffing |
-| `crates/ts/tests/baseline_behavioral.rs` | Integration | 15 | JSX diff and CSS scan |
+| `crates/core/src/diff/tests.rs` | Unit | ~65 | Diff engine: all change types, renames, relocations, migrations |
+| `crates/ts/tests/baseline_diff.rs` | Integration | 58 | TypeScript structural diff with TS semantics |
+| `crates/ts/tests/baseline_manifest.rs` | Integration | 20 | package.json diffing |
+| `crates/ts/tests/baseline_behavioral.rs` | Integration | 19 | JSX diff and CSS scan |
 | `crates/ts/tests/baseline_migration.rs` | Integration | 7 | Migration detection |
-| `crates/java/tests/baseline_diff.rs` | Integration | 12 | Java structural diff |
-| `crates/java/tests/baseline_konveyor.rs` | Integration | 8 | Java rule generation |
+| `crates/java/tests/baseline_diff.rs` | Integration | 15 | Java structural diff |
+| `crates/java/tests/baseline_konveyor.rs` | Integration | 9 | Java rule generation |
 | `crates/java/tests/baseline_manifest.rs` | Integration | 7 | pom.xml / build.gradle diffing |
-| `crates/java/tests/baseline_sd.rs` | Integration | 12 | Java SD pipeline profile diffing |
+| `crates/java/tests/baseline_sd.rs` | Integration | 11 | Java SD pipeline profile diffing |
 | `crates/konveyor-core/tests/token_rename_pipeline.rs` | Integration | 3 | Full rename pipeline with 4028 real entries |
 | `crates/ts/src/snapshots/` | Snapshot | 12 | Konveyor rule YAML output |
+| `crates/java/tests/snapshots/` | Snapshot | ~42 | Java structural diff, konveyor, manifest, and SD YAML output |
 | Inline `#[test]` across all crates | Unit | ~900+ | Individual function tests |
 
 ## Running Tests
@@ -64,10 +65,10 @@ surface(vec![sym1, sym2])
 mk_prop("name", "string")
 
 // Build enum member
-enum_member("name")
+enum_member("name", "value")
 
 // Build interface with members
-make_interface("InterfaceName", vec![mk_prop("x", "string")])
+make_interface("InterfaceName", "file.ts", &["x"])
 ```
 
 ### Java (`crates/java/tests/helpers.rs`)
@@ -90,6 +91,19 @@ with_extends(symbol, "BaseClass")
 with_implements(symbol, vec!["Serializable"])
 with_abstract(symbol)
 ```
+
+### Java Test Infrastructure (`crates/java/tests/`)
+
+The Java crate has four integration test files covering all analysis pipelines:
+
+- **`baseline_diff.rs`** (15 scenarios) — Structural diff: class/interface/enum changes, method signature changes, sealed permits, annotation diffs, overload disambiguation, generic type parameter changes.
+- **`baseline_konveyor.rs`** (9 scenarios) — Konveyor rule generation from both TD structural changes and SD pipeline results. Tests rule conditions, fix strategies, and effort classification.
+- **`baseline_manifest.rs`** (7 scenarios) — Maven `pom.xml` and Gradle `build.gradle` manifest diffing: dependency version changes, dependency additions/removals, plugin changes.
+- **`baseline_sd.rs`** (11 scenarios) — Java SD pipeline: annotation changes, serialization field changes, exception clause changes, synchronization changes, override detection, constructor dependency changes.
+
+**`helpers.rs`** provides `NormalizedChange` and `NormalizedManifestChange` structs for snapshot-friendly comparison. These strip non-deterministic fields (like internal IDs) and normalize enum variants to strings for readable YAML snapshots. Also provides construction helpers: `java_class`, `java_interface`, `java_enum`, `java_method`, `java_field`, `java_constant`, `with_annotation`, `with_sealed`, `with_throws`, etc.
+
+Snapshot files (~42) live in `crates/java/tests/snapshots/` and cover all four test suites.
 
 ### Core (`crates/core/src/lib.rs`)
 
